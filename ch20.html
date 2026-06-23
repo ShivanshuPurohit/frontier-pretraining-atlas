@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="robots" content="noindex, nofollow" />
+<title>The punch-list · The Frontier Pretraining Atlas</title>
+<meta name="description" content="The punch-list — a field manual for the 10-trillion-parameter MoE." />
+<meta name="color-scheme" content="light dark" />
+<meta name="theme-color" content="#f4f2ec" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232f6fba'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' fill='white' text-anchor='middle' font-weight='bold'%3EFP%3C/text%3E%3C/svg%3E" />
+<link rel="stylesheet" href="book.css" />
+</head>
+<body>
+<nav class="nav">
+  <a class="home" href="index.html">The Frontier Pretraining Atlas <small>· a field manual for the 10-trillion-parameter MoE</small></a>
+  <span class="spacer"></span>
+  <div class="chrail"><a href="index.html">Contents</a><a href="ch01.html" data-rail="ch01">01</a><a href="ch02.html" data-rail="ch02">02</a><a href="ch03.html" data-rail="ch03">03</a><a href="ch04.html" data-rail="ch04">04</a><a href="ch05.html" data-rail="ch05">05</a><a href="ch06.html" data-rail="ch06">06</a><a href="ch07.html" data-rail="ch07">07</a><a href="ch08.html" data-rail="ch08">08</a><a href="ch09.html" data-rail="ch09">09</a><a href="ch10.html" data-rail="ch10">10</a><a href="ch11.html" data-rail="ch11">11</a><a href="ch12.html" data-rail="ch12">12</a><a href="ch13.html" data-rail="ch13">13</a><a href="ch14.html" data-rail="ch14">14</a><a href="ch15.html" data-rail="ch15">15</a><a href="ch16.html" data-rail="ch16">16</a><a href="ch17.html" data-rail="ch17">17</a><a href="ch18.html" data-rail="ch18">18</a><a href="ch19.html" data-rail="ch19">19</a><a href="ch20.html" data-rail="ch20" class="cur">20</a><a href="apxA.html" data-rail="apxA">·A</a><a href="apxB.html" data-rail="apxB">·B</a><a href="apxC.html" data-rail="apxC">·C</a><a href="apxD.html" data-rail="apxD">·D</a></div>
+  <div class="progress-wrap"><div class="progress"></div></div>
+  <button class="theme-btn" aria-label="Toggle dark mode">◑ theme</button>
+</nav>
+<main class="wrap page">
+<p class="eyebrow">Chapter 20 · The payoff — what to actually change in your tree</p>
+<h1>The punch-list: fixing your codebase, data, and dataloader for a 10T/200B/100k-GB200 run</h1>
+<p class="lede">Every chapter before this argued the physics. This one is the field order of operations: in build order, exactly what to change in <em>your</em> tree — <a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/MaxText/configs/base.yml">MaxText</a>, JAX/Flax/XLA, HEAD 2026-06 — to take it from a TPU-first research framework to a thing that survives a 10T-total / 200B-active MoE on 100,000 NVIDIA GB200 GPUs.</p>
+<p class="byline"><span>~30 min read</span><span class="dot">5 figures</span><span class="dot">grounded in MaxText <code>base.yml</code>, <code>moe.py</code>, <code>optimizers.py</code></span></p>
+<hr />
+
+<p>This is the payoff chapter. The framing assumption is uncomfortable but load-bearing: MaxText was built for TPU pods, and almost every item below is a place where the GPU/NVLink/InfiniBand reality of an NVL72 fleet diverges from the ICI-mesh abstractions baked into <code>base.yml</code>. The punch-list is ordered so that <strong>each item de-risks the next</strong>; do not reorder it, because the framework decision (item 0) gates everything, and the fault-tolerance and dataloader items (8, 6) are the ones that quietly determine whether you ever finish.</p>
+
+<div class="pull">MaxText-on-GPU is a real option, not a TPU toy — but the bet is whether XLA:GPU plus the JAX MoE kernel zoo can hit the ~1,000+ TFLOPS/GPU that Megatron-Core demonstrably does on GB200, on your schedule. Gate the whole run on a 1,000-GPU bake-off.</div>
+
+<p>Throughout, I quote <em>dense</em> hardware numbers, not the marketing sparse ones. A GB200 NVL72 rack is <strong>360 PFLOP/s dense FP8 / 180 PFLOP/s dense BF16</strong> (the 720/360 on <a href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">NVIDIA's page</a> are 2:4-sparse figures; the page's own footnote says "Dense is one-half sparse spec shown"), i.e. ~4.5 dense PFLOP/s FP8 per B200 GPU, so 100k GPUs is <strong>~0.45 EFLOP/s dense FP8 peak</strong>, not 1.0. At a defensible 35–40% large-MoE FP8 MFU that is ~160–180 dense PFLOP/s of useful throughput — every percentage point of MFU you leave on the floor in the items below is <strong>~4 PFLOP/s</strong>, and every minute of badput is <strong>~10 EFLOP wasted</strong>.</p>
+
+<div class="stats">
+  <div class="stat" data-fam="compute"><div class="v">0.45<span class="u">EF/s</span></div><div class="l">dense FP8 peak, 100k GB200</div></div>
+  <div class="stat" data-fam="mem"><div class="v">120<span class="u">TB</span></div><div class="l">resident state, Muon (vs 160 Adam)</div></div>
+  <div class="stat" data-fam="comms"><div class="v">~30<span class="u">min</span></div><div class="l">extrapolated MTBF at 100k GB200</div></div>
+  <div class="stat" data-fam="moe"><div class="v">1.96<span class="u">×</span></div><div class="l">MegaMoE fused-kernel speedup (latency)</div></div>
+</div>
+
+<figure class="fig" data-fig="timeline">
+  <figcaption class="figcap"><b>Figure 1 — The build order, as one timeline.</b> The bake-off gates everything; FP8/DeepEP MFU work and optimizer/stability wiring run in parallel-ish; dataloader and offline data prep stand up next; and the fault-tolerance proof must land <em>before</em> you pass ~10k GPUs. Parallelism config comes last — cheapest to change, most expensive to debug at scale.
+    <span class="meta"><span>Regime · <b>10T/200B on 100k GB200</b></span><span>Evidence · <b>punch-list items 0–9</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "segments":[
+    {"label":"framework bake-off","frac":14,"fam":"compute","sub":"item 0 · 1,000 GPUs"},
+    {"label":"FP8 GEMM + DeepEP","frac":20,"fam":"comms","sub":"items 0/2/3 · MFU lives here"},
+    {"label":"Muon + stability","frac":14,"fam":"optim","sub":"items 4/5"},
+    {"label":"Grain + offline data","frac":18,"fam":"data","sub":"items 6/7"},
+    {"label":"fault tolerance proof","frac":20,"fam":"mem","sub":"item 8 · before 10k GPUs"},
+    {"label":"parallelism config","frac":14,"fam":"slate","sub":"item 1 · last"}
+  ] }</script>
+</figure>
+
+<h2 id="framework"><span class="sec-num">00</span>The framework decision: MaxText-on-GPU vs Megatron-Core / TorchTitan</h2>
+
+<p>Decide this first; it is the only <strong>irreversible</strong> item. The honest position: <strong>the most-proven 10T-MoE-on-GB200 stack today is Megatron-Core</strong>, which reports <strong>1,233 TFLOPS/GPU on GB200 for DeepSeek-V3-685B</strong> (vs 1,048 on H100) and 974 (GB200)/919 (H100) for Qwen3-235B — real, published, GB200 MFU envelopes you can design against (<a href="https://arxiv.org/abs/2603.07685">Megatron-Core MoE, arXiv 2603.07685</a>). It ships <span class="f-moe">Parallel Folding</span> (separate attention vs MoE meshes), the <span class="f-moe">Flex dispatcher</span> wired to DeepEP/HybridEP, <span class="k k-compute">TEGroupedMLP</span> grouped-GEMM, and — critically — it is what NVIDIA optimizes the GB200 software stack <em>for</em>. The DeepSeek lineage (DualPipe, DeepEP, DeepGEMM MegaMoE) is all CUDA/PTX and drops into the PyTorch world with zero impedance mismatch.</p>
+
+<p>MaxText's countervailing strengths are real and the reason you might stay: it already contains a <strong>Muon optimizer wired through <code>optax.contrib._muon</code></strong> (<a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/optimizers/optimizers.py">optimizers.py</a>, <code>opt_type: "muon"</code>), DeepSeek-V3/V4 routing variants in <code>moe.py</code>, MLA, Orbax emergency/multi-tier checkpointing, Grain elastic dataloading, and a TransformerEngine-JAX bridge that already exposes <span class="k k-prec">te_nvfp4</span>/<span class="k k-prec">te_mxfp8</span> recipes (<a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/layers/quantizations.py">quantizations.py</a>). NVIDIA actively co-develops NVFP4-on-Blackwell support for JAX/MaxText. So the framework decision is not "MaxText is a TPU toy" — it is <strong>"can XLA:GPU + the JAX MoE kernel zoo hit the same ~1,000+ TFLOPS/GPU that Megatron-Core demonstrably does on GB200, on your schedule?"</strong></p>
+
+<figure class="fig" data-fig="compare">
+  <figcaption class="figcap"><b>Figure 2 — The framework fork.</b> Megatron-Core is the proven, NVIDIA-tuned GB200 path with published MFU; MaxText/JAX-on-GPU keeps your Muon/routing/checkpoint investments but carries XLA:GPU schedule risk. TorchTitan is a parallelism-pattern reference, not a destination at this scale.
+    <span class="meta"><span>Regime · <b>irreversible item 0</b></span><span>Evidence · <b>arXiv 2603.07685 + MaxText HEAD</b></span></span></figcaption>
+  <script type="application/json" class="spec">{
+    "left":{"title":"Megatron-Core / TorchTitan","fam":"compute","items":[
+      "1,233 TFLOPS/GPU on GB200 (DeepSeek-V3-685B)",
+      "Parallel Folding + Flex dispatcher → DeepEP/HybridEP",
+      "TEGroupedMLP grouped-GEMM; CUDA/PTX, zero impedance",
+      "What NVIDIA tunes the GB200 stack for",
+      "TorchTitan: clean FSDP2/PP/TP reference, NOT hardened 10T"
+    ]},
+    "right":{"title":"MaxText / JAX-on-GPU","fam":"data","items":[
+      "Muon wired via optax.contrib._muon already",
+      "V3/V4 routing, MLA, Orbax multi-tier, Grain elastic",
+      "TE-JAX bridge: te_nvfp4 / te_mxfp8 recipes",
+      "Risk: FP8 accumulation fix inexpressible in stock XLA",
+      "Risk: no fused MegaMoE kernel; XLA:GPU overlap immaturity"
+    ]},
+    "rows":[
+      {"k":"Published GB200 MFU","left":"yes (~1,233 TFLOPS/GPU)","right":"unproven on GPU"},
+      {"k":"Fused MoE mega-kernel","left":"DeepGEMM MegaMoE","right":"none (multi-month Pallas effort)"},
+      {"k":"FP8 two-level accum","left":"native (TE/PTX)","right":"needs TE-JAX or Pallas:Mosaic"},
+      {"k":"Your existing investment","left":"low","right":"high (Muon/routing/ckpt)"}
+    ] }</script>
+</figure>
+
+<p>The concrete risks of staying on MaxText/JAX-on-GPU, in priority order:</p>
+
+<div class="tcards">
+  <div class="tcard" data-fam="prec"><div class="tn">1 · FP8 accumulation fix</div><div class="ts">inexpressible in stock XLA</div><div class="tm">V3 promotes WGMMA partials to FP32 every N<sub>C</sub>=128 — JAX can't natively express it; you depend on TE-JAX or Pallas:Mosaic-GPU and must verify it.</div></div>
+  <div class="tcard" data-fam="moe"><div class="tn">2 · No fused MegaMoE</div><div class="ts">unfused dispatch/GEMM/combine</div><div class="tm">MaxText is ragged_all_to_all then separate ragged_dot/gmm. You leave the 1.50–1.96× fusion win on the table without a multi-month Pallas kernel.</div></div>
+  <div class="tcard" data-fam="comms"><div class="tn">3 · XLA:GPU overlap</div><div class="ts">collective maturity</div><div class="tm">DualPipe-style comm-compute overlap (~20 SMs of warp-specialized a2a) is hand-tuned PTX; getting XLA to schedule EP a2a inside the GEMM window is not a flag.</div></div>
+</div>
+
+<p>The first risk is the most dangerous. DeepSeek-V3's recipe promotes WGMMA partial sums to FP32 CUDA-core registers every <code>N_C=128</code> elements (≈4 WGMMAs) to dodge Hopper/Blackwell tensor cores' ~14-bit accumulation and its <strong>up-to-2% GEMM error</strong> (<a href="https://arxiv.org/abs/2412.19437">DeepSeek-V3, arXiv 2412.19437</a>). JAX cannot natively express this two-level accumulation; you depend on TransformerEngine-JAX or a Pallas:Mosaic-GPU kernel to do it for you, and <em>you must verify it does</em> — this is the single most likely correctness/quality landmine in a JAX FP8 port. The second: DeepSeek-V4's MegaMoE fuses EP-dispatch → FP8×FP4 GEMM → SwiGLU+requant → FP8×FP4 GEMM → EP-combine into one SymmBuffer kernel for <strong>1.50–1.73× general / up to 1.96× latency speedup</strong> (<a href="https://arxiv.org/html/2606.19348v1">DeepSeek-V4, arXiv 2606.19348</a>). MaxText's path is <em>unfused</em>: <span class="k k-comms">jax.lax.ragged_all_to_all</span> for dispatch/combine, then a separate <code>tokamax.ragged_dot</code>/megablox <code>gmm</code> for the expert GEMM.</p>
+
+<div class="callout key"><div class="ct">The recommendation</div>
+  <p>If your team's center of mass is JAX and you already have MaxText running at scale on TPU, commit to <strong>MaxText-on-GPU but with a hard dependency on TransformerEngine-JAX for the FP8/NVFP4 GEMMs and DeepEP (via the NVIDIA <code>hybrid-ep</code> branch) for the all-to-all</strong> — do not try to ride pure XLA collectives for EP. Budget <strong>one senior kernel engineer for two quarters</strong> to land the FP8 accumulation path and the DeepEP binding, and <strong>gate the full-scale run on a 1,000-GPU bake-off</strong> against the Megatron-Core MFU numbers above. If that bake-off comes in <strong>below ~30% MFU, switch to Megatron-Core</strong>; the published GB200 evidence is on its side. TorchTitan is the wrong choice at this scale today — treat it as a parallelism-pattern reference, not a destination.</p></div>
+
+<h2 id="parallelism"><span class="sec-num">01</span>Parallelism config for 10T/200B on 100k GB200</h2>
+
+<p>The <strong>memory math, not the FLOPs, dictates the layout</strong>. With <strong>Muon as the primary optimizer</strong> (the right choice, see item 5), the per-parameter resident budget is ≈ 2 B bf16 compute weight + 4 B fp32 master + 2 B bf16 grad + 4 B fp32 Muon momentum ≈ <strong>12 B/param</strong>, vs ~16 B for AdamW. For 10T params that is <strong>120 TB (Muon) vs 160 TB (Adam)</strong> of resident, non-replication-shardable state (<a href="https://arxiv.org/html/2509.23106v2">Muon quantization, arXiv 2509.23106</a>). Against 100k×192 GB = ~19.2 PB aggregate HBM this is only ~0.6%, which is the whole point: <strong>this is a sharding-and-bandwidth problem, not a capacity problem.</strong> Pure FSDP/ZeRO-3 fails not on capacity but because its all-gather of the full 10–20 TB weight set is <em>batch-independent</em> and becomes the wall as the FSDP degree grows toward 100k, and because it replicates the all-to-all-bound expert FFNs instead of sharding experts (<a href="https://jax-ml.github.io/scaling-book/training/">JAX Scaling Book</a>).</p>
+
+<figure class="fig" data-fig="membar">
+  <figcaption class="figcap"><b>Figure 3 — Per-param resident state: Muon vs Adam.</b> Muon halves the optimizer momentum (4 B fp32 vs Adam's 8 B m+v), cutting resident state from ~16 B/param to ~12 B/param — 120 TB vs 160 TB at 10T params. Toggle the weight dtype; the point holds: this is a sharding problem against 19.2 PB of HBM, not a capacity one.
+    <span class="meta"><span>Regime · <b>10T params, 100k GB200</b></span><span>Evidence · <b>arXiv 2509.23106</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "paramsB":10000,"activGB":0,"optBytes":4,
+    "dtypes":[{"id":"bf16","w":2,"label":"BF16 compute"},{"id":"fp8","w":1,"label":"FP8 compute"}],
+    "parts":[
+      {"label":"Compute weight","perParam":"w","fam":"compute"},
+      {"label":"FP32 master","perParam":4,"fam":"optim"},
+      {"label":"BF16 grad","perParam":2,"fam":"comms"},
+      {"label":"Muon momentum (fp32)","perParam":"opt","fam":"mem"}
+    ] }</script>
+</figure>
+
+<p>The composition rule is a strict fabric hierarchy: <strong>keep every high-volume collective (TP, EP all-to-all) inside the 72-GPU NVLink domain (1.8 TB/s/GPU); let only PP and DP cross InfiniBand (~90 GB/s/GPU, the ~20:1 cliff)</strong> (<a href="https://github.com/deepseek-ai/DeepEP">DeepEP</a>, <a href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">GB200 NVL72</a>). 100k GPUs ≈ <strong>1,389 NVL72 racks</strong>. The target layout:</p>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Axis</th><th class="num">Degree</th><th>Fabric</th><th>What it shards</th><th>MaxText flag</th></tr></thead>
+  <tbody>
+    <tr><td>TP (attention/MLA/shared expert)</td><td class="num">8</td><td>NVLink (ICI)</td><td>model dim of dense parts</td><td><code>ici_tensor_parallelism=8</code></td></tr>
+    <tr><td>EP (routed experts)</td><td class="num">8</td><td>NVLink (ICI)</td><td>the 10T expert weights, no replication</td><td><code>ici_expert_parallelism=8</code></td></tr>
+    <tr><td>FSDP (intra-rack remainder)</td><td class="num">auto</td><td>NVLink (ICI)</td><td>optimizer/grad shard within rack</td><td><code>ici_fsdp_parallelism=-1</code></td></tr>
+    <tr><td>PP (stages across racks)</td><td class="num">16–32</td><td>InfiniBand (DCN)</td><td>layers; moves only stage-boundary acts</td><td><code>dcn_pipeline_parallelism=16..32</code></td></tr>
+    <tr><td>DP (replicas across islands)</td><td class="num">~43–87</td><td>InfiniBand (DCN)</td><td>replicates the unit; ZeRO-1 opt shard</td><td><code>dcn_data_parallelism=-1</code></td></tr>
+    <tr><td>CP (long-context phase only)</td><td class="num">2–8</td><td>NVLink (ICI)</td><td>sequence/KV at 64K→1M</td><td><code>ici_context_parallelism</code></td></tr>
+  </tbody>
+  <caption>EP×TP=64 ≤ 72 keeps the high-volume collectives inside one NVL72 rack; PP and DP cross InfiniBand only.</caption>
+</table></div>
+
+<p>With EP×TP=64 ≤ 72 inside a rack, PP=16–32 racks/replica, one replica is ~1,150–2,300 GPUs and 100k GPUs gives <strong>~43–87 DP replicas</strong>. This mirrors DeepSeek-V3's 2,048-H800 layout (PP=16, EP=64 across 8 nodes, ZeRO-1 DP, <strong>no TP during training</strong>) but collapses the 8-node EP domain into a single NVL72 rack because the 72-GPU NVLink domain <em>is</em> what 8 H800 nodes used to be (<a href="https://arxiv.org/html/2412.19437v1">DeepSeek-V3, arXiv 2412.19437</a>). For the dense parts you can run TP=8 where V3 ran TP=1, because NVL72 makes 8-way TP free of InfiniBand.</p>
+
+<figure class="fig" data-fig="meshlayout">
+  <figcaption class="figcap"><b>Figure 4 — The 100k-GB200 mesh factorization.</b> EP×TP=64 ≤ 72 is confined <em>inside</em> one NVL72 NVLink domain so the dominant all-to-all and TP ride the 1.8 TB/s fabric; PP and DP span the cluster over the ~20:1-slower InfiniBand DCN. 100k = 64 (in-rack) × 16 (PP) × ~87 (DP).
+    <span class="meta"><span>Regime · <b>strict fabric hierarchy</b></span><span>Evidence · <b>NVL72 domain + V3-shaped plan</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "deviceTotal":100000,
+    "axes":[
+      {"id":"EP","name":"expert (NVLink)","size":8,"fam":"moe"},
+      {"id":"TP","name":"tensor (NVLink)","size":8,"fam":"compute"},
+      {"id":"PP","name":"pipeline (IB)","size":16,"fam":"data"},
+      {"id":"DP","name":"data (IB)","size":98,"fam":"mem"}
+    ],
+    "note":"EP×TP = 64 ≤ 72 → inside one NVL72 NVLink domain; PP×DP span the cluster over InfiniBand" }</script>
+</figure>
+
+<p><strong>MaxText-specific gotchas you must get right:</strong></p>
+
+<p>The logical mesh is <code>['diloco','data','stage','fsdp','fsdp_transpose','context','context_autoregressive','tensor','tensor_transpose','tensor_sequence','expert','autoregressive']</code> and <strong>DCN axes must appear earlier in the list than ICI axes</strong> — your PP (<code>stage</code>) and DP (<code>data</code>) are DCN-mapped and must precede the ICI-mapped <code>tensor</code>/<code>expert</code>. The product of all <code>ici_*</code> must equal chips-per-slice (72). Map <strong>ICI → NVLink rack, DCN → InfiniBand</strong>.</p>
+
+<div class="callout warn"><div class="ct">Never shard experts or TP over DCN</div>
+  <p>Leave <code>dcn_expert_parallelism=1</code>. Sharding experts over DCN puts the EP all-to-all on InfiniBand — fatal. Likewise <code>dcn_tensor_*</code> and <code>dcn_sequence_*</code> stay 1; <code>base.yml</code> literally annotates them <strong>"never recommended,"</strong> and on a GB200 build TP/SP-over-DCN is a guaranteed comm-bound stall.</p></div>
+
+<p><strong>Pipeline schedule.</strong> MaxText's <code>layers/pipeline.py</code> does circular pipelining (<code>num_pipeline_microbatches</code>, <code>pipeline_delay_activation_forwarding</code>, <code>num_layers_per_pipeline_stage</code>) but does <strong>not</strong> ship DualPipe/DualPipeV. For a 10T run where the EP all-to-all crosses NVL72 boundaries during the long-context phase, DualPipe's native comm-compute overlap — bubble <strong>(PP/2−1)(F&amp;B+B−3W)</strong>, cost 2× param copies (+20 TB, absorbable) — is worth it, and <strong>DualPipeV</strong> halves the activation cost (PP/2 devices, PP/2 stages) (<a href="https://github.com/deepseek-ai/DualPipe">DualPipe</a>). This is a real engineering item: either implement a DualPipeV schedule in <code>pipeline.py</code> or accept the 1F1B bubble <strong>(PP−1)(F+B)</strong> plus zero-bubble <strong>ZB-H1</strong> (~1/3 bubble at equal memory, <a href="https://arxiv.org/abs/2401.10241">arXiv 2401.10241</a>) as a stopgap. If you stay 1F1B, run <strong>PipeOffload</strong>-style activation offloading (<a href="https://arxiv.org/html/2503.01328v1">arXiv 2503.01328</a>) to keep PP=16–32 of a 10T model memory-feasible.</p>
+
+<div class="callout miss"><div class="ct">Watch the vocab/output-head imbalance</div>
+  <p>A 10T model's vocab projection is large and will unbalance any zero-bubble or DualPipe schedule unless you apply <strong>vocabulary parallelism</strong> (<a href="https://arxiv.org/pdf/2411.05288">arXiv 2411.05288</a>). MaxText keeps <code>logits_dense</code> on AdamW (item 5) but does not balance its PP-stage cost.</p></div>
+
+<h2 id="moe-kernels"><span class="sec-num">02</span>MoE kernels, all-to-all, and comms overlap</h2>
+
+<p>MaxText's MoE substrate lives in <a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/layers/moe.py"><code>moe.py</code></a> (<code>RoutedMoE</code>, <code>sparse_matmul</code>, <code>permute</code>/<code>unpermute</code>/<code>get_all_to_all_params</code>). The defaults in <code>base.yml</code> are <code>megablox: true</code>, <code>sparse_matmul: true</code>, <code>capacity_factor: -1.0</code> (dropless), <code>ragged_buffer_factor: -1.0</code>, <code>use_tokamax_gmm: false</code>, <code>use_ring_of_experts: false</code>, <code>use_ragged_sort: false</code>. Here is what to change.</p>
+
+<h3 id="ragged-buffer">Ragged buffer sizing — the dropless-vs-memory knob</h3>
+
+<p>With <code>ragged_buffer_factor ≤ 0</code> MaxText computes the worst-case dropless size as <code>min(ep_degree, global_experts/top_k) * balanced_size</code>; for a DeepSeek-style 256-expert/top-8 config imbalance is <strong>never worse than 256/8 = 32×</strong>, and once EP&gt;32 the bound is <code>global_exp/top_k</code> independent of EP. The worst-case dropless buffer is a real activation-memory tax at 32×.</p>
+
+<div class="formula"><span class="lbl">moe</span>
+  <span class="eq">worst_case_factor = min( |EP| , global_exp / top<sub>k</sub> )</span>
+  <span class="note">Once |EP| &gt; global_exp/top<sub>k</sub> the bound stops growing — for 256/8 it is 32×, independent of EP.</span></div>
+
+<div class="callout do"><div class="ct">Set ragged_buffer_factor ≈ 3.0</div>
+  <p><strong>Set <code>ragged_buffer_factor ≈ 3.0</code></strong> — the in-code recommended near-dropless, memory-bounded compromise — and accept rare token drops, which are quality-neutral once the load balancer converges (<a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/layers/moe.py">moe.py</a>). You trade a vanishingly small (un-guaranteed) drop probability for ~10× less activation memory than the 32× worst-case buffer.</p></div>
+
+<h3 id="gemm-backend">Grouped-GEMM backend</h3>
+
+<p>Three dispatch paths in <code>gmm()</code>: <span class="k k-compute">jax.lax.ragged_dot</span>, forked megablox <code>mblx.gmm</code> (quantized, gmm-v2), and <span class="k k-compute">tokamax.ragged_dot</span> (Mosaic). On GB200 the Mosaic-GPU path via <strong><code>use_tokamax_gmm: true</code></strong> is the JAX-native ragged-GEMM you want for the expert FFN, but note <code>use_gmm_v2: true</code> <strong>"Currently incompatible with quantization"</strong> — so if you need <span class="f-prec">FP4</span> experts you are on the megablox quantized <code>gmm</code> path, not tokamax. Benchmark both against the published Hopper/GB200 numbers from MegaBlocks (<strong>1.38–4.35× over Tutel, 1.8–2.4× over dense Megatron-LM</strong>, <a href="https://ar5iv.labs.arxiv.org/html/2211.15841">arXiv 2211.15841</a>) and <strong>read <a href="https://arxiv.org/pdf/2512.14080">SonicMoE, arXiv 2512.14080</a></strong> — the freshest IO/tile-aware grouped-GEMM design, benchmarked on H100 <em>and</em> GB200 — before locking a kernel.</p>
+
+<div class="codecard">
+  <div class="src-meta"><span class="file">src/maxtext/layers/moe.py</span><span class="tag">RoutedMoE.sparse_matmul → gmm()</span><span class="tag">three-way dispatch</span><span class="tag">trimmed</span></div>
+  <div class="annot-grid">
+<pre class="code"><code>def gmm(self, lhs, rhs, group_sizes):                          # [1]
+    gs = RaggedDotGroupSizes(real=group_sizes,
+        even_split=(lhs.shape[0] // self.num_experts,) * self.num_experts)
+    if self.config.use_tokamax_gmm:                            # [2]  GB200 JAX-native
+        return tokamax.ragged_dot(lhs, rhs, gs.real, implementation="mosaic")
+    if self.config.megablox:                                   # [3]  base.yml default
+        return mblx.gmm(lhs, rhs, gs.real,                     # quantized FP4/INT8 path
+                        lhs_quantize_dtype=self.config.lhs_quantize_dtype,
+                        rhs_quantize_dtype=self.config.rhs_quantize_dtype)
+    with set_xla_metadata(ragged_dot_tiling=self.wi_tile_fwd): # [4]
+        return jax.lax.ragged_dot(lhs, rhs, gs.real)           # XLA-native ragged
+</code></pre>
+    <div class="annot-list">
+      <div class="annot"><p><span class="badge">1</span><span class="anh">Grouped, not batched.</span> <code>group_sizes</code> carries per-expert run lengths; <code>RaggedDotGroupSizes</code> also holds an <code>(n//G,)*G</code> even-split fallback for shape inference.</p></div>
+      <div class="annot"><p><span class="badge">2</span><span class="anh">Tokamax Mosaic.</span> The GB200 JAX-native ragged-GEMM — but <code>use_gmm_v2</code> is incompatible with quantization, so it is not the FP4 path.</p></div>
+      <div class="annot"><p><span class="badge">3</span><span class="anh">Quantized megablox.</span> The <code>base.yml</code> default; the only path that takes <code>lhs/rhs_quantize_dtype</code>, so FP4 experts ride here.</p></div>
+      <div class="annot"><p><span class="badge">4</span><span class="anh">Tile hints.</span> <code>ragged_dot_tiling</code> passes the <code>wi_tile_fwd_*</code>/<code>wo_tile_*</code> knobs through to XLA.</p></div>
+    </div>
+  </div>
+</div>
+
+<h3 id="all-to-all">All-to-all</h3>
+
+<p>MaxText uses <span class="k k-comms">jax.lax.ragged_all_to_all</span> (not dense a2a) with offsets/sizes from <code>get_all_to_all_params</code>. The ragged Pallas kernels (<code>a2a_ragged_sort</code>/<code>ring_ragged_sort</code> under <code>use_ragged_sort</code>/<code>use_ring_of_experts</code>) gather only the <em>valid prefix</em> rather than the padded buffer — <strong>enable these at EP in the hundreds</strong>, where padded sort is pure waste. But the harder truth: at 100k-GB200 scale the right all-to-all substrate is <strong>DeepEP V2 / the NVIDIA <code>hybrid-ep</code> branch</strong>, which measures <strong>726/740 GB/s NVLink dispatch/combine at EP8 on SM100/Blackwell</strong> (max-perf) and reduces SM consumption to <strong>4–6 SMs</strong>, with <strong>FP8 dispatch + BF16 combine</strong> halving the dispatch leg (<a href="https://github.com/deepseek-ai/DeepEP/blob/main/README.md">DeepEP README</a>). <strong>MaxText has no binding to DeepEP today; writing one is the highest-leverage MoE-systems item after the FP8 GEMM.</strong> Two systems landmines: low-latency RDMA dispatch sags to <strong>194µs/39 GB/s at 256 experts</strong> (per-token RDMA bandwidth <em>falls</em> as expert count grows), and <strong>DeepEP issue #427</strong> reports low-latency dispatch can corrupt under heavily imbalanced expert load — exactly the early-training regime before your bias balancer converges (<a href="https://github.com/deepseek-ai/DeepEP/issues/427">DeepEP #427</a>).</p>
+
+<div class="callout warn"><div class="ct">Step-0 hazard — #427 imbalance corruption <span class="conf conf-confirmed">filed upstream</span></div>
+  <p>Run the high-throughput dispatch path (not low-latency) until the bias balancer converges, or use hash-routed early layers (which cannot hit #427) as a clean warm-up. And treat the <strong>39 GB/s low-latency RDMA floor at ≥128 experts</strong> as a hard design constraint — per-token RDMA bandwidth structurally falls as expert count rises.</p></div>
+
+<h3 id="routing-balancing">Routing and balancing</h3>
+
+<p>MaxText's <code>get_topk()</code> already implements DeepSeek-V3 sigmoid + learnable-bias <span class="f-moe">aux-loss-free balancing</span> (<code>routed_bias_update_rate</code>, default 0.0, feeding <code>calculate_load_balance_updates</code>, applied post-optimizer via <code>update_state_param</code>), DeepSeek-V4 hash routing (<code>tid2eid</code> lookup, <code>is_hash_routing</code> gating lb-loss off), and <code>expert_group_mask</code>/<code>deepseek_routing</code> for node-limited (group-limited) routing. <strong>Set <code>routed_bias_update_rate</code> on a decay schedule</strong> mirroring V3: <strong>γ=0.001 for the bulk of training, then 0.0 for the final ~500B tokens</strong> (<a href="https://arxiv.org/html/2412.19437v1">DeepSeek-V3</a>). Configure node-limited routing so each token reaches <strong>≤2–4 racks</strong> (the GB200 analog of M=4 node-limited routing) and an expert group fits one NVL72 domain, so the RDMA leg only carries cross-group traffic. At deployment you will need <strong>EPLB-style redundant-expert replication</strong> of the hottest experts (essentially mandatory at 100k GPUs); <strong>LPLB</strong> — per-batch dynamic redistribution as an LP solved single-SM in ~100µs — is the research-frontier online variant (<a href="https://github.com/deepseek-ai/LPLB/blob/main/README.md">LPLB</a>). The decisive ratio to remember when deciding whether comm hides under compute is <strong>~6,144 FLOPs/Byte</strong> (V4's framing): below it the all-to-all is exposed.</p>
+
+<div class="callout do"><div class="ct">Map one routing group to one NVL72 domain</div>
+  <p>Set the group structure so an expert group fits one NVL72 rack and node-limited M=2–4 routing keeps the dominant traffic on NVLink — the RDMA leg then carries only cross-group tokens, and you live on the high-throughput curve rather than the 39 GB/s low-latency floor.</p></div>
+
+<h2 id="precision"><span class="sec-num">03</span>Precision: FP8 now, FP4 QAT path</h2>
+
+<p><strong>Ship FP8 first.</strong> The reference floor is the DeepSeek-V3 recipe: <strong>per-tile 1×128 activations, per-block 128×128 weights, E4M3 on all forward/dgrad/wgrad operands</strong>, power-of-two scales, with the FP32-promotion accumulation fix (item 0) (<a href="https://arxiv.org/abs/2412.19437">arXiv 2412.19437</a>). The non-negotiable <strong>"precision breaks"</strong> map — <strong>keep router/gating, all norms, attention operators, embeddings, and output head in BF16/FP32; FP32 master weights + FP32 grad accumulators</strong> — is invariant across every FP4 paper since, because a single mis-quantized gate flips an expert assignment.</p>
+
+<p>In MaxText, the modern path is <strong>Qwix</strong> (<code>use_qwix_quantization: true</code>; AQT is deprecated, per <code>base.yml</code>). The <code>get_quantization_rule</code> rules scope quantization to <code>decoder/.*layers.*</code> and route over op_names <code>("dot_general","gmm","ragged_dot")</code> — note <strong><code>gmm</code>/<code>ragged_dot</code> are precisely the MoE expert grouped/ragged GEMMs</strong>, which is exactly where you want low precision and where the router/norms are automatically excluded (<a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/layers/quantizations.py">quantizations.py</a>). Set <code>quantization: "fp8_full"</code> for static-scaling FP8, or wire the <code>TransformerEngineQuantization</code> recipe <span class="k k-prec">te_mxfp8</span> (block_size=32) for MX-FP8.</p>
+
+<div class="callout note"><div class="ct">Why NVFP4 over MXFP4 — the data-efficiency gap is concrete</div>
+  <p>NVFP4 uses <strong>16-element micro-blocks with a per-block E4M3 scale + FP32 per-tensor scale</strong>, preserving the ±4/±6 FP4 points that MXFP4's power-of-two E8M0 scale clips. The cost of getting this wrong: <strong>MXFP4 needs 36% more tokens (1.36T vs 1.0T) to match NVFP4 loss</strong> — at a 10T budget that is the difference between a 10T and a 13.6T run (<a href="https://arxiv.org/abs/2509.25149">NVFP4 pretraining, arXiv 2509.25149</a>).</p></div>
+
+<p><strong>The FP4 path is a sequenced upgrade, not a day-1 commit.</strong> NVFP4 <em>pretraining</em> (the 12B Mamba-Transformer to 10T tokens, the longest public 4-bit run) requires <strong>all four</strong> of: ~16% of linear layers in BF16 (first 2 + final 8 blocks), a <strong>16×16 Random Hadamard Transform on Wgrad inputs only</strong> (fixed ±1 sign vector shared across all layers), <strong>2D 16×16 block scaling on weights</strong>, and <strong>stochastic rounding on gradients only</strong> (SR on forward weights/acts is <em>detrimental</em>). End-game: switch <strong>NVFP4→BF16 at ~82% of tokens</strong> to cut LR-decay-phase loss error from 1.5% to 0.5% at ~6% high-precision compute.</p>
+
+<p>MaxText already wires these toggles: <span class="k k-prec">te_nvfp4</span> (<code>NVFP4BlockScaling</code>) and <span class="k k-prec">te_nvfp4_no_rht</span>, with a code TODO confirming <strong>NVFP4's native 16-block needs fused RHT</strong> (currently <code>block_size=128</code> until unfused RHT lands). The AQT/Qwix <code>vjp_*_stochastic_rounding</code> is per-tensor configurable — <strong>set SR on the gradient tensors only</strong>. The mixed-precision regex JSON (<code>dense_llm_subchannel.json</code>, per-layer <code>w_bits/a_bits/tile_size</code>) is the machinery that expresses "experts FP4, router/attention/norms high-precision." <strong>Follow DeepSeek-V4's production pattern: FP4 QAT on MoE expert weights (the parameter bulk) + the lightning indexer, FP8 everywhere else, FP8 KV with BF16 only on RoPE dims</strong>, with a lossless FP4→FP8 dequant reusing the FP8 pipeline (<a href="https://huggingface.co/blog/deepseekv4">DeepSeek-V4 blog</a>).</p>
+
+<div class="callout warn"><div class="ct">FP4×FP8 runs at FP8 speed on today's silicon <span class="conf conf-confirmed">stated in V4</span></div>
+  <p><strong>FP4×FP8 currently runs at FP8×FP8 speed on existing silicon</strong> — on GB200 today FP4 experts are a <em>memory/comms</em> win (smaller weights, smaller all-to-all), <strong>not a compute win</strong>. And heed the precision scaling-law warning: <strong>more pretraining tokens makes a model <em>more</em> fragile to post-hoc quantization (δ<sub>PTQ</sub> ∝ D<sup>γ</sup>/N<sup>γ</sup>)</strong>, which is precisely why V4 went QAT, not PTQ (<a href="https://arxiv.org/abs/2411.04330">Scaling Laws for Precision, arXiv 2411.04330</a>).</p></div>
+
+<h2 id="optimizer"><span class="sec-num">04</span>Optimizer: Muon is already in the repo — finish wiring it</h2>
+
+<p>MaxText already has Muon (<code>opt_type: "muon"</code> via <code>optax.contrib._muon.muon</code>, with <code>get_muon_weight_dimension_numbers</code> emitting bespoke reduction/output-axis tuples for MoE expert weights, attention out-proj, and QKV). The matrix-only / AdamW-for-the-rest split is correct and matches the field consensus (embeddings, unembed, RMSNorm gains, biases → AdamW). Take Muon: it halves the optimizer state (<strong>4 B vs 8 B/param</strong>), and — the real reason at 100k-GPU width — <strong>its data-efficiency advantage persists and even grows into the over-large-batch regime up to 16M-token batches</strong>, exactly where AdamW falls off its critical-batch cliff (<a href="https://arxiv.org/html/2505.02222v1">Essential AI, arXiv 2505.02222</a>). Be honest about the headline: the <strong>"2× FLOPs" claim shrinks to ~10–15% fewer tokens</strong> once AdamW is well-tuned; you adopt Muon for batch-scaling robustness and the memory halving, not a 2× miracle.</p>
+
+<p><strong>Punch-list for the optimizer block:</strong></p>
+
+<div class="code-cap">yaml — MaxText Muon block (the settings that are traps if left default)</div>
+<pre class="code"><code>opt_type: "muon"
+muon_consistent_rms: 0.2      # Moonlight RMS≈0.2 rescale; None falls back to width scaling
+                              #   (DeepSeek-V4 uses 0.18 — either defensible)
+muon_weight_decay: 0.1        # default 0 is a TRAP — Muon needs decoupled WD to scale
+# Newton-Schulz: stock optax = 5 steps @ (3.4445, -4.7750, 2.0315)
+#   V4 remedy for under-polished output projections: two-stage NS
+#     8 steps @ (3.4445, -4.7750, 2.0315)  then  2 steps @ (2, -1.5, 0.5)
+#   optax `muon` does NOT expose a two-stage schedule — small worthwhile patch
+</code></pre>
+
+<div class="callout do"><div class="ct">Three Muon settings, in order</div>
+  <p><strong>Set <code>muon_consistent_rms: 0.2</code></strong> (the Moonlight rule: rescale every matrix's update to RMS≈0.2 so a shared LR works across shapes; <a href="https://arxiv.org/html/2502.16982v1">Moonlight, arXiv 2502.16982</a>; V4 uses 0.18). <strong>Set <code>muon_weight_decay: 0.1</code></strong> (default 0 is a trap — out-of-the-box Muon needs decoupled WD to scale). And patch in V4's <strong>two-stage Newton-Schulz</strong>: the stock 5 steps at (3.4445,−4.7750,2.0315) under-polishes final-layer projections, which <strong>degrade as steeply as M<sup>−0.96</sup></strong> in singular-value quantiles at 10T scale (<a href="https://arxiv.org/html/2606.04058">Spectral Scaling Laws, arXiv 2606.04058</a>).</p></div>
+
+<p><strong>Distributed Muon at 10T.</strong> Even bf16 momentum is <strong>~20 TB</strong> and must be ZeRO-1 sharded across DP; Moonlight's Distributed Muon all-gathers the full matrix transiently for the NS iteration (overhead in <strong>(1, 1.25]×</strong> of distributed AdamW). At 100k-GB200 the all-gather of full momentum is the bottleneck — evaluate <strong>Dion</strong> (amortized rank-r power iteration, exchanges only <strong>O((m+n)r)</strong>, never unshards the full matrix, composes with FSDP+TP) as the scalable alternative if you become DP-sync-bound (<a href="https://arxiv.org/html/2504.05295v3">Dion, arXiv 2504.05295</a>).</p>
+
+<div class="callout note"><div class="ct">Hyperparameter transfer — and do not double-apply µP</div>
+  <p>For width/batch HP transfer, adopt <strong>u-µP</strong> (fuses Unit Scaling with µP, collapses the sweep to ~9 LR-only runs, and <strong>trains stably in FP8 at 7B where standard µP diverges</strong> from gradient underflow — directly relevant on GB200 FP8/FP4 tensor cores, <a href="https://arxiv.org/html/2407.17465v1">arXiv 2407.17465</a>). Note Muon's √max(A,B)/RMS scaling already implements much of µP's per-layer LR scaling, so do <em>not</em> naively double-apply. Pick batch size and weight decay from <strong>Power Lines</strong>: τ<sub>opt</sub> ∝ (D/N)<sup>−0.52</sup>, B<sub>crit</sub> ∝ D<sup>0.5</sup>. At 10T tokens B<sub>crit</sub> lands in the tens-of-millions, consistent with K2/V4 peak batches of 75–94M; running at B=B<sub>crit</sub> costs 2× minimum tokens, so size below it (<a href="https://arxiv.org/html/2505.13738v2">arXiv 2505.13738</a>).</p></div>
+
+<h2 id="stability"><span class="sec-num">05</span>Stability: the guards are present — tune them, don't add them</h2>
+
+<p>MaxText already ships the three stability primitives you need, and the lesson is to <em>configure</em> them, not write new ones.</p>
+
+<div class="tcards">
+  <div class="tcard" data-fam="optim"><div class="tn">skip_step_on_spikes</div><div class="ts">rolling mean ± 6σ</div><div class="tm">Zeros the update and freezes momentum on a loss/grad spike; preserves optimizer state. Ported from OLMo-core. Turn it on.</div></div>
+  <div class="tcard" data-fam="optim"><div class="tn">z_loss_multiplier</div><div class="ts">default 0.0 → ~1e-4</div><div class="tm">Keeps logits from drifting; aggregated in train_step alongside the MoE lb-loss.</div></div>
+  <div class="tcard" data-fam="attn"><div class="tn">use_qk_norm</div><div class="ts">default false → true</div><div class="tm">V4's structural fix: RMSNorm on Q and KV to bound attention logits. Chosen over QK-Clip; delivered spike-free training.</div></div>
+</div>
+
+<p><strong><code>skip_step_on_spikes</code></strong> (<code>train.py</code> wrapper, <code>skip_step_interval: 128</code>, <code>skip_step_scaling_factor: 6.0</code>): a rolling Bessel-corrected mean ± 6σ guard that zeros the update and freezes momentum when loss/grad_norm spikes, preserving optimizer state — ported from OLMo-core. <strong>Turn it on</strong> (<code>skip_step_on_spikes: true</code>). It is the practical spike guard that layers under any schedule and prevents a single bad batch from poisoning the Muon momentum. <strong>z-loss</strong> (<code>z_loss_multiplier</code>, default 0.0): set it (~1e-4) to keep logits from drifting; it is aggregated in the train_step alongside the MoE lb-loss.</p>
+
+<div class="callout warn"><div class="ct">Muon excites exploding attention logits — enable use_qk_norm</div>
+  <p>Muon <em>excites</em> exploding attention logits (<strong>Kimi-K2 saw max logits &gt;1000</strong>). MaxText has <code>use_qk_norm</code> (default false) and <code>attn_logits_soft_cap</code> (default 0.0). <strong>Enable <code>use_qk_norm: true</code></strong> — this is DeepSeek-V4's structural fix (RMSNorm on Q and KV entries to bound logits), which V4 chose <em>over</em> QK-Clip and which delivered spike-free training. If you instead want Kimi-K2's <strong>QK-Clip</strong> (per-head conditional rescale by min(1, τ/S<sub>max</sub>) with τ=100), that is not in the repo and would need adding; for a V4-shaped MLA model, <code>use_qk_norm</code> is the lower-effort, proven path. The <strong>Qwen3-480B config in-repo already sets <code>use_qk_norm</code></strong> — a working reference.</p></div>
+
+<h2 id="dataloader"><span class="sec-num">06</span>Dataloader: Grain at 100k-host scale</h2>
+
+<p>At ~12,500 hosts the dataloader stops being a per-host concern and becomes a <em>distributed storage</em> problem governed by object-store <strong>request</strong> ceilings, not bandwidth. A 10T-token corpus at 4 B/token read at 2e7–1e8 tok/s is only <strong>80–400 GB/s</strong> — trivial bandwidth — but <strong>12,500 hosts × even 10 reads/s = 125k req/s</strong>, far past a flat GCS bucket's ~5,000-reads/s cold-start ceiling (S3: 5,500 GET/prefix), guaranteeing <code>503 SlowDown</code>/<code>429</code> storms at launch and after every preemption (<a href="https://docs.cloud.google.com/storage/docs/request-rate">GCS request rate</a>, <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html">S3 performance</a>). MaxText's <code>input_pipeline/*</code> routes <code>dataset_type → grain | hf | olmo_grain | tfds | c4_mlperf | synthetic</code>; use <strong>Grain + ArrayRecord</strong> (the only Grain format supporting true global shuffle via Riegeli random-access). The fixes, in priority order:</p>
+
+<div class="callout do"><div class="ct">The single highest-leverage knob: expansion_factor_real_data</div>
+  <p>Set <strong><code>expansion_factor_real_data &gt; 1</code></strong> so only <code>jax.process_count()/factor</code> hosts read GCS and broadcast batches over the device mesh (<code>get_process_loading_real_data</code> + <code>PlaceHolderDataIterator</code>). A factor of 8 turns <strong>12,500 readers into ~1,560</strong> — cutting the object-store fanout directly.</p></div>
+
+<ol>
+  <li><strong>Cut the object-store fanout directly.</strong> <code>expansion_factor_real_data &gt; 1</code> (above) is the single highest-leverage knob.</li>
+  <li><strong>Colocate the loader.</strong> <code>colocated_python_data_input: true</code> runs Grain on the accelerator host so shard decode/collation use host CPU/RAM with NVLink-adjacent transfer, eliminating PCIe-roundtrip host stalls.</li>
+  <li><strong>Use the elastic/pure-function resume path.</strong> Per-host <code>process_{i}-of-{N}.json</code> checkpoints break on resize and create N reads on restart. Prefer <strong><code>grain_use_elastic_iterator: true</code></strong>, whose <code>ElasticIterator</code> state is a <em>single global scalar</em> — only process 0 writes <code>process_0.json</code> and every process reads it, so the iterator survives a change in <code>jax.process_count()</code> (<a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/input_pipeline/multihost_dataloading.py">multihost_dataloading.py</a>). The in-repo <strong>OLMo Grain loader</strong> (<code>olmo_data_grain.py</code>) is the even cleaner pattern: a pure-function <code>OlmoIndexSampler</code> keyed by SHA-256(seed,epoch) Fisher-Yates needing <strong>zero serialized iterator state</strong> — you pass <code>initial_step = train_step * per_host_batch</code> at construction. Note its documented scaling defect: <code>shuffled_global_indices</code> materializes a full numpy permutation (<strong>~5.8 GB at uint64 for 724M instances</strong>) per epoch per host; at trillions of instances <strong>move to OLMo-core's on-disk <code>build_and_save_global_indices</code> memmap</strong> (compute once, mmap-share, <code>uint32</code> — switch to <code>uint64</code>/block-structured above 4.29B instances).</li>
+  <li><strong>Storage layout.</strong> HNS buckets (up to 8× initial QPS), <strong>≥256 MB ArrayRecord shards</strong> (one GET amortizes thousands of samples), thousands of <strong>name-hashed prefixes</strong> to partition the keyspace, and a <strong>staggered exponential-backoff ramp</strong> so 12,500 hosts don't cold-start the same prefix simultaneously.</li>
+  <li><strong>Mixtures.</strong> Use <code>grain.IterDataset.mix(weights)</code> (not <code>MapDataset.mix</code>) so each component checkpoints independently and the curriculum can be re-weighted after a restart — critical for long curricula (<a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/input_pipeline/grain_data_processing.py">grain_data_processing.py</a>).</li>
+  <li><strong>Determinism as run identity.</strong> Pin <code>data_shuffle_seed</code> and treat it (plus the elastic global-scalar state) as part of run identity so any elastic resize stays bit-deterministic.</li>
+</ol>
+
+<h2 id="data-pipeline"><span class="sec-num">07</span>Data pipeline: offline prep, taxonomy curation, and the scaling-law campaign</h2>
+
+<p>The discipline at this scale: <strong>do all heavy work offline, keep the training loader a dumb deterministic index→fetch→collate function.</strong> The proof point is Essential-Web v1.0 — <strong>24T tokens / 23.6B docs processed in a 7-day window with "0 crashes"</strong> on a Daft pipeline sustaining 32k req/s/VM (<a href="https://www.eventual.ai/blog/how-essential-ai-built-essential-web-v1-with-daft">Eventual/Daft</a>). Concretely:</p>
+
+<div class="callout do"><div class="ct">Pre-tokenize and pre-pack offline, always</div>
+  <p><strong>Pre-tokenize offline.</strong> HF Rust tokenizers do ~12.5M tok/s/core, so 10T tokens is ~10<sup>6</sup> core-seconds — a few-thousand-core-hours embarrassingly-parallel job. Store as <code>uint32</code> token IDs in ArrayRecord; online tokenization would burn the host CPU the loader needs for shard decode. <strong>Pre-pack offline with best-fit-decreasing bin-packing</strong> (sort docs descending, place in tightest bin) so packing is deterministic and checkpointable; MaxText's <code>packing/sequence_packing.py</code> produces <code>inputs_segmentation</code>/<code>inputs_position</code> consumed by flash-attention varlen for intra-document masking.</p></div>
+
+<p>Decide the masking question deliberately: intra-doc masking gives a real perplexity win (<a href="https://arxiv.org/pdf/2402.13991">arXiv 2402.13991</a>), but <strong>DeepSeek-V3 deliberately declined cross-sample masking during pretraining</strong> (only at SFT) as an efficiency choice — weigh the splash/flash-varlen kernel cost against the win. Note the splash-attention constraint visible in the OLMo loader: <code>q_seq_len</code> must be divisible by 512, so mask the boundary position rather than emitting <code>L-1</code>.</p>
+
+<p><strong>Taxonomy curation.</strong> A 200B-active model is data-bound; the curation taxonomy (domain mix, dedup aggressiveness, quality-classifier thresholds, code/math/multilingual ratios) is set offline and re-weighted live via the <code>IterDataset.mix</code> per-component checkpointing above. This decoupling — heavy global shuffle/dedup/classification in Daft/Ray/Spark, emit large shards, re-weight at runtime — is the pattern.</p>
+
+<div class="callout note"><div class="ct">Run the scaling-law campaign on WSD — the switch points are outputs, not guesses</div>
+  <p>Run the campaign on a <strong>WSD</strong> schedule (warmup-stable-decay): a constant stable phase lets you branch short decays to probe the loss frontier continuously without committing the full run, and the river-valley analysis explains why the sharp final decay works. Fit the precision (item 3), batch/WD (item 4), and Muon-vs-Adam iso-loss curves on <strong>399M–4B proxies</strong> before the 10T commit. The <strong>NVFP4→BF16 switch point (~82%)</strong> and the <strong>routed-bias γ decay (~95%)</strong> are campaign outputs, not guesses.</p></div>
+
+<h2 id="fault-tolerance"><span class="sec-num">08</span>Fault tolerance: the item that determines whether you finish</h2>
+
+<p>At 100k GB200 the MTBF is brutal. Llama-3 405B logged <strong>419 unexpected interruptions in 54 days on 16,384 H100 (~1 every ~3 hours)</strong>; linearly extrapolating the per-GPU rate to 100k GB200 gives an interruption <strong>every ~25–35 minutes</strong>, likely worse given Blackwell's power density and the immature NVL72 copper backplane (<a href="https://arxiv.org/abs/2407.21783">Llama-3, arXiv 2407.21783</a>). The governing identity is <strong>goodput ≈ MTBF/(MTBF+MTTR)</strong>, and <strong>you cannot raise MTBF at this scale — every technique is an MTTR-reduction</strong>. If MTTR is 20 min against a 30-min MTBF, goodput collapses to ~60%; cutting MTTR to 1 min restores ~97%.</p>
+
+<div class="formula"><span class="lbl">mem</span>
+  <span class="eq">goodput ≈ MTBF / (MTBF + MTTR)</span>
+  <span class="note">MTBF ~30 min is fixed; MTTR=20 min → ~60% goodput, MTTR=1 min → ~97%. Every item below is an MTTR cut.</span></div>
+
+<p><strong>MaxText already has the machinery in <a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/common/checkpointing.py"><code>common/checkpointing.py</code></a>; wire it correctly:</strong></p>
+
+<div class="callout do"><div class="ct">Enable multi-tier checkpointing — peer-RAM restore, not GCS</div>
+  <p>Set <code>enable_multi_tier_checkpointing: true</code>, <code>local_checkpoint_directory=/local</code>, <code>local_checkpoint_period=20</code>, <code>multi_tier_checkpointing_backup_interval_minutes=20</code>. This writes frequent checkpoints to a per-process local dir (the EmergencyCheckpointManager appends the distributed <code>process_id</code> to the path on GPU) and flushes rarely to GCS (<code>PersistentCheckpointOptions</code>). On restore, <code>SingleReplicaArrayHandler</code> / <code>enable_single_replica_ckpt_restoring</code> broadcasts a single surviving replica across the replica mesh — <strong>a swapped-in node pulls weights from a healthy replica's RAM, not from GCS</strong> (cf. Gemini SOSP'23) — converting a minutes-scale GCS restore into a seconds-scale broadcast.</p></div>
+
+<p><strong>Set the optimal interval by Young/Daly:</strong> interval ≈ √(2·ckpt_cost·MTBF). At 100k where MTBF shrinks, the cheap local checkpoints must be <em>frequent</em> and the durable GCS ones <em>rare</em> — exactly the two-tier split. CheckFreq-style adaptive tuning bounds overhead to <strong>~3.5%</strong> (<a href="https://www.usenix.org/conference/fast21/presentation/mohan">CheckFreq, FAST'21</a>). <strong>Async + OCDBT:</strong> <code>save_checkpoint</code> issues <code>ocp.args.PyTreeSave</code> with OCDBT + Zarr3 and explicit <code>chunk_byte_size</code> (<code>target_data_file_size</code> 2 GB, concurrent 96 GB) for parallel I/O; it <code>block_until_ready</code>s only to clean the <em>measurement</em>. Keep <code>enable_autocheckpoint</code> so a preemption signal forces a save (<code>PreemptionCheckpointingPolicy</code> composed with <code>FixedIntervalPolicy</code> via <code>AnySavePolicy</code>); <code>maybe_save_checkpoint</code> drains the async save via <code>wait_until_finished()</code> before exit. <strong>Grain checkpoint</strong> via <code>GrainCheckpointHandler</code>, using the elastic global-scalar state (item 6) so data position is invariant under rescale.</p>
+
+<div class="callout key"><div class="ct">Make DP the elastic outer axis — and measure goodput, not MFU</div>
+  <p>The layout in item 1 deliberately confines a failure's blast radius to one PP-stage rack inside one DP replica; <strong>DP is the only axis you can elastically resize</strong> without re-laying-out EP/TP/PP. MaxText's Pathways elastic path (<code>utils/elastic_utils.py</code>, <code>pathwaysutils.elastic.manager.Manager</code>, <code>maybe_elastic_scale_up</code>) implements shrink-the-world-and-continue. Adopt <strong>load-time resharding</strong> (ByteCheckpoint-style, <strong>54× stall reduction</strong>) so you resume on fewer GPUs after losing racks without a conversion job (<a href="https://arxiv.org/abs/2407.20143">ByteCheckpoint, arXiv 2407.20143</a>). And <strong>measure goodput, not MFU</strong>: adopt Google's ML-Goodput-Measurement badput taxonomy (<code>WASTED_PROGRESS</code>, <code>INFRASTRUCTURE_RECOVERY</code>, <code>CHECKPOINT_SAVE/RESTORE</code>, <code>step_time_deviation</code>) as the run's primary KPI — MaxText already wires <code>record_custom_badput_event_start/end</code> into elastic events (<a href="https://docs.cloud.google.com/tpu/docs/goodput">ML-Goodput</a>). The bar is Llama-3's <strong>&gt;90% effective training time</strong>.</p></div>
+
+<div class="callout warn"><div class="ct">SDC and stragglers — the failures with no error signal</div>
+  <p><strong>Silent data corruption</strong> poisons checkpoints with no error signal — keep enough checkpoint history to roll back past a corrupted save, add NaN/Inf + grad-norm guards (item 5 covers the spike side), and sample-recompute a subset of collectives (<a href="https://arxiv.org/abs/2102.11245">Meta SDC, arXiv 2102.11245</a>). For hangs, the slowest of 100k ranks sets the pace and a hung rank deadlocks the collective; on the JAX side rely on coordination-service heartbeats and the goodput jitter metric, escalating to kill+elastic-excise.</p></div>
+
+<h2 id="networking"><span class="sec-num">09</span>Networking assumptions: MRC and Spectrum-X</h2>
+
+<p>The network is a first-class failure source, and MaxText assumes nothing about it — the assumptions are operational, not code, but they gate the items above. Two to lock:</p>
+
+<div class="callout note"><div class="ct">Microsecond path failover (MRC) — assume it</div>
+  <p><strong>Multipath Reliable Connection (MRC)</strong> (OpenAI + AMD/Broadcom/Intel/Microsoft/NVIDIA via OCP, open-sourced May 2026) spreads one RDMA connection over multiple SRv6-source-routed paths and <strong>blacklists a failed path within tens of microseconds</strong> (vs <em>seconds</em> of RoCE routing convergence), handling loss via selective-ACK + packet trimming (<a href="https://www.opencompute.org/">OCP</a>). This converts transient link flaps — which would otherwise time out NCCL and trigger a full job restart costing minutes of MTTR — into <strong>training-transparent reroutes</strong>. If your fabric supports MRC, your <em>perceived</em> MTBF improves because the synchronous collective never observes the flap. Design the InfiniBand/Spectrum-X scale-out (~800 Gb/s/GPU per-GPU scale-out network) around it.</p></div>
+
+<div class="callout warn"><div class="ct">NVL72 is the new blast radius — keep TP modest</div>
+  <p>A single GPU failure now jeopardizes a whole 72-GPU NVLink domain because TP groups live inside it. For TP=64, <strong>0.1% of GPUs failed drops fleet availability to 94%</strong> (<a href="https://arxiv.org/pdf/2504.06095">NTP, arXiv 2504.06095</a>). This is the systems argument for keeping <strong>TP modest (8, not 64)</strong> and leaning on MoE expert-parallel sharding — a lost EP rank degrades fewer collectives than a lost TP rank. Pair with NTP-style degraded (nonuniform) TP groups so a domain loss is a soft event. The copper backplane remains a 2025–26 reliability weak point with immature diagnostics; budget for it.</p></div>
+
+<h2 id="build-order"><span class="sec-num">10</span>Build order, in one paragraph</h2>
+
+<figure class="fig" data-fig="flow">
+  <figcaption class="figcap"><b>Figure 5 — The dependency order of the build.</b> The bake-off gates everything; FP8/DeepEP MFU work and Muon/stability wiring proceed in parallel-ish; the dataloader and offline data pipeline stand up next; the fault-tolerance proof must land before ~10k GPUs; and the parallelism config comes last because it is cheapest to change, most expensive to debug.
+    <span class="meta"><span>Regime · <b>each item de-risks the next</b></span><span>Evidence · <b>punch-list 0→9</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "cols":5,"rows":2,"anim":true,
+    "nodes":[
+      {"id":"bake","label":"0 · bake-off\n(1,000 GPU)","fam":"compute","col":0,"row":0},
+      {"id":"fp8","label":"3 · FP8 GEMM\n+ accum fix","fam":"prec","col":1,"row":0},
+      {"id":"ep","label":"2 · DeepEP\nall-to-all","fam":"comms","col":2,"row":0},
+      {"id":"muon","label":"4/5 · Muon\n+ stability","fam":"optim","col":1,"row":1},
+      {"id":"data","label":"6/7 · Grain\n+ offline prep","fam":"data","col":2,"row":1},
+      {"id":"ft","label":"8 · fault\ntolerance","fam":"mem","col":3,"row":0},
+      {"id":"par","label":"1 · parallelism\nconfig (last)","fam":"slate","col":4,"row":0}
+    ],
+    "edges":[
+      {"from":"bake","to":"fp8"},
+      {"from":"bake","to":"muon"},
+      {"from":"fp8","to":"ep"},
+      {"from":"ep","to":"ft"},
+      {"from":"muon","to":"data"},
+      {"from":"data","to":"ft"},
+      {"from":"ft","to":"par"}
+    ] }</script>
+</figure>
+
+<p>Do the framework bake-off (0) on 1,000 GPUs first — it gates everything. Then, in parallel-ish: land the FP8 GEMM with the accumulation fix and the DeepEP all-to-all binding (0/2/3), because <strong>MFU lives there</strong>; wire Muon fully (<code>consistent_rms=0.2</code>, <code>weight_decay=0.1</code>, two-stage NS, <code>use_qk_norm=true</code>, <code>skip_step_on_spikes=true</code>) (4/5); stand up the offline Daft pre-tokenize/pre-pack pipeline and the Grain elastic dataloader with <code>expansion_factor_real_data</code> and <code>colocated_python_data_input</code> (6/7); and <em>before</em> you go past ~10k GPUs, <strong>prove multi-tier emergency checkpointing + DP-elastic resize + goodput measurement end-to-end (8)</strong>, because at 100k the MTTR term — not the MFU term — is what decides whether the run converges. Set the parallelism config (1) <strong>last</strong>, after the kernels and checkpointing are proven, because it is the cheapest thing to change and the most expensive thing to debug at scale.</p>
+
+<div class="callout key"><div class="ct">The one ordering to remember</div>
+  <p>Item 0 (framework) is irreversible — do it first. Item 8 (fault tolerance) determines whether you finish — prove it before 10k GPUs. Item 1 (parallelism) is cheapest to change — do it last. Everything in between is MFU work that only pays off once those three bookends hold.</p></div>
+
+<div class="sources"><h3>Sources</h3><ul>
+  <li>MaxText base.yml (MoE/optimizer/precision/checkpoint defaults): <a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/configs/base.yml">maxtext/configs/base.yml</a></li>
+  <li>MaxText moe.py (sparse_matmul, ragged buffer, routing, all-to-all): <a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/layers/moe.py">maxtext/layers/moe.py</a></li>
+  <li>MaxText quantizations.py (Qwix rules, te_nvfp4/te_mxfp8 recipes): <a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/layers/quantizations.py">maxtext/layers/quantizations.py</a></li>
+  <li>MaxText optimizers.py (Muon via optax.contrib._muon): <a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/optimizers/optimizers.py">maxtext/optimizers/optimizers.py</a></li>
+  <li>MaxText checkpointing.py (multi-tier emergency checkpoint, OCDBT): <a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/common/checkpointing.py">maxtext/common/checkpointing.py</a></li>
+  <li>MaxText olmo_data_grain.py (pure-function index sampler): <a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/input_pipeline/olmo_data_grain.py">maxtext/input_pipeline/olmo_data_grain.py</a></li>
+  <li>MaxText multihost_dataloading.py (elastic global-scalar iterator): <a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/input_pipeline/multihost_dataloading.py">maxtext/input_pipeline/multihost_dataloading.py</a></li>
+  <li>DeepSeek-V3 (DualPipe, node-limited routing, aux-loss-free bias, FP8 recipe): <a href="https://arxiv.org/html/2412.19437v1">arxiv.org/html/2412.19437v1</a></li>
+  <li>Megatron-Core MoE on GB200 (1,233 TFLOPS/GPU envelopes): <a href="https://arxiv.org/abs/2603.07685">arxiv.org/abs/2603.07685</a></li>
+  <li>DeepEP README (V2/hybrid-ep, SM100 bandwidth, FP8 dispatch): <a href="https://github.com/deepseek-ai/DeepEP/blob/main/README.md">github.com/deepseek-ai/DeepEP</a></li>
+  <li>DualPipe / DualPipeV (bidirectional PP schedule): <a href="https://github.com/deepseek-ai/DualPipe">github.com/deepseek-ai/DualPipe</a></li>
+  <li>DeepSeek-V4 (MegaMoE fused kernel, FP4 QAT, two-stage NS, 6,144 FLOPs/Byte): <a href="https://arxiv.org/html/2606.19348v1">arxiv.org/html/2606.19348v1</a></li>
+  <li>NVFP4 pretraining (16-block, RHT, 36% MXFP4 token penalty, 82% switch): <a href="https://arxiv.org/abs/2509.25149">arxiv.org/abs/2509.25149</a></li>
+  <li>DeepSeek-V4 blog (production FP4 QAT pattern): <a href="https://huggingface.co/blog/deepseekv4">huggingface.co/blog/deepseekv4</a></li>
+  <li>Scaling Laws for Precision (δ<sub>PTQ</sub> ∝ D<sup>γ</sup>/N<sup>γ</sup>): <a href="https://arxiv.org/abs/2411.04330">arxiv.org/abs/2411.04330</a></li>
+  <li>Moonlight (muon_consistent_rms, Distributed Muon): <a href="https://arxiv.org/html/2502.16982v1">arxiv.org/html/2502.16982v1</a></li>
+  <li>Essential AI Muon (batch-scaling robustness, 16M-token batches): <a href="https://arxiv.org/html/2505.02222v1">arxiv.org/html/2505.02222v1</a></li>
+  <li>Spectral Scaling Laws (M<sup>−0.96</sup> projection degradation): <a href="https://arxiv.org/html/2606.04058">arxiv.org/html/2606.04058</a></li>
+  <li>u-µP (Unit Scaling + µP, FP8-stable at 7B): <a href="https://arxiv.org/html/2407.17465v1">arxiv.org/html/2407.17465v1</a></li>
+  <li>Dion (rank-r distributed orthonormalization): <a href="https://arxiv.org/html/2504.05295v3">arxiv.org/html/2504.05295v3</a></li>
+  <li>Power Lines (B<sub>crit</sub> ∝ D<sup>0.5</sup>, τ<sub>opt</sub> scaling): <a href="https://arxiv.org/html/2505.13738v2">arxiv.org/html/2505.13738v2</a></li>
+  <li>Muon quantization (12 B/param Muon vs 16 B Adam): <a href="https://arxiv.org/html/2509.23106v2">arxiv.org/html/2509.23106v2</a></li>
+  <li>Llama-3 (419 interruptions / 54 days, &gt;90% goodput bar): <a href="https://arxiv.org/abs/2407.21783">arxiv.org/abs/2407.21783</a></li>
+  <li>ML-Goodput-Measurement (badput taxonomy): <a href="https://docs.cloud.google.com/tpu/docs/goodput">docs.cloud.google.com/tpu/docs/goodput</a></li>
+  <li>ByteCheckpoint (load-time resharding, 54× stall reduction): <a href="https://arxiv.org/abs/2407.20143">arxiv.org/abs/2407.20143</a></li>
+  <li>NTP (0.1% fail → 94% availability at TP=64): <a href="https://arxiv.org/pdf/2504.06095">arxiv.org/pdf/2504.06095</a></li>
+  <li>Open Compute Project (MRC multipath RDMA): <a href="https://www.opencompute.org/">opencompute.org</a></li>
+  <li>Essential-Web v1.0 via Daft (24T tokens, 7 days, 0 crashes): <a href="https://www.eventual.ai/blog/how-essential-ai-built-essential-web-v1-with-daft">eventual.ai/blog</a></li>
+  <li>GCS request rate (~5,000 reads/s cold ceiling): <a href="https://docs.cloud.google.com/storage/docs/request-rate">docs.cloud.google.com/storage/docs/request-rate</a></li>
+  <li>S3 performance (5,500 GET/prefix): <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html">docs.aws.amazon.com/AmazonS3</a></li>
+  <li>NVIDIA GB200 NVL72 (dense vs sparse peak FLOPs): <a href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">nvidia.com/en-us/data-center/gb200-nvl72</a></li>
+  <li>JAX Scaling Book (FSDP/ZeRO-3 all-gather wall): <a href="https://jax-ml.github.io/scaling-book/training/">jax-ml.github.io/scaling-book/training</a></li>
+  <li>DeepSeek LPLB (online LP load balancer): <a href="https://github.com/deepseek-ai/LPLB/blob/main/README.md">github.com/deepseek-ai/LPLB</a></li>
+  <li>MegaBlocks dropless dMoE (1.8–2.4× over dense Megatron-LM): <a href="https://ar5iv.labs.arxiv.org/html/2211.15841">ar5iv.labs.arxiv.org/html/2211.15841</a></li>
+  <li>SonicMoE (IO/tile-aware grouped GEMM, H100 + GB200): <a href="https://arxiv.org/pdf/2512.14080">arxiv.org/pdf/2512.14080</a></li>
+  <li>Zero-bubble pipeline ZB-H1 (~1/3 bubble at equal memory): <a href="https://arxiv.org/abs/2401.10241">arxiv.org/abs/2401.10241</a></li>
+  <li>PipeOffload (activation offloading for deep PP): <a href="https://arxiv.org/html/2503.01328v1">arxiv.org/html/2503.01328v1</a></li>
+  <li>Vocabulary parallelism (output-head PP balance): <a href="https://arxiv.org/pdf/2411.05288">arxiv.org/pdf/2411.05288</a></li>
+  <li>Intra-document masking perplexity win: <a href="https://arxiv.org/pdf/2402.13991">arxiv.org/pdf/2402.13991</a></li>
+  <li>CheckFreq (adaptive checkpoint interval, ~3.5% overhead): <a href="https://www.usenix.org/conference/fast21/presentation/mohan">usenix.org/conference/fast21</a></li>
+  <li>Meta SDC (silent data corruption at fleet scale): <a href="https://arxiv.org/abs/2102.11245">arxiv.org/abs/2102.11245</a></li>
+</ul></div>
+
+<nav class="chnav"><a class="prev" href="ch19.html"><span class="dir">← Previous</span><span class="t">Public throughput signals</span></a><a class="next" href="apxA.html"><span class="dir">Next →</span><span class="t">Appendix A · Cheat-sheet</span></a></nav>
+</main>
+<script src="book.js"></script>
+</body>
+</html>

@@ -1,0 +1,438 @@
+<p class="eyebrow">Chapter 07 · The whiteboard arithmetic of the run</p>
+<h1>The Scaling Book, fully distilled — and applied to the 10T MoE on 100k GB200</h1>
+<p class="lede">Every parallelism decision for a 10T-total / 200B-active run on 100,000 GB200 GPUs collapses to one habit: compute <span class="f-compute">T<sub>math</sub></span> and <span class="f-comms">T<sub>comms</sub></span>, and ask which is larger. This chapter ports the JAX <em>How To Scale Your Model</em> rooflines to Blackwell, then sizes the run from scratch — the arithmetic you must be able to reproduce on a whiteboard.</p>
+<p class="byline"><span>~30 min read</span><span class="dot">6 figures</span><span class="dot">grounded in the Scaling Book + GB200 roofline</span></p>
+<hr />
+
+<p>The JAX <em>How To Scale Your Model</em> book (<a href="https://jax-ml.github.io/scaling-book/">landing</a>) is the most disciplined public treatment of accelerator rooflines for transformers. Its entire epistemology fits in one sentence from Part 0: <em>"Algorithms are bounded by three things: compute, communication, and memory."</em> Everything else — the <span class="f-compute">6ND</span> rule, the 240-token critical batch, the collective cost table, the four parallelism axes — is a corollary of computing two times, <span class="k k-compute">T_math</span> and <span class="k k-comms">T_comms</span>, and asking which is larger. This chapter walks the whole arc with the actual formulas and numbers, ports the TPU reasoning to GB200/Blackwell where the roofline crossovers move, and then does the load-bearing thing: a from-scratch worked sizing of a 10T-total / 200B-active MoE on 100,000 GB200 GPUs. If you are planning that run, the arithmetic below is the arithmetic you must be able to reproduce on a whiteboard.</p>
+
+<div class="pull">Algorithms are bounded by three things — compute, communication, and memory. At 100k GB200, all three are simultaneously live, and communication — the MoE all-to-all — is the binding constraint. The NVL72 domain is the architectural answer to it.</div>
+
+<div class="stats">
+  <div class="stat" data-fam="compute"><div class="v">6<span class="u">ND</span></div><div class="l">training FLOPs ≈ 6 · params · tokens</div></div>
+  <div class="stat" data-fam="compute"><div class="v">~280<span class="u">tok</span></div><div class="l">B200 critical batch (≈ TPU/H100)</div></div>
+  <div class="stat" data-fam="comms"><div class="v">1:4:4:8</div><div class="l">A2A : AG : RS : AllReduce cost</div></div>
+  <div class="stat" data-fam="comms"><div class="v">72<span class="u">GPU</span></div><div class="l">NVL72 flat NVLink domain</div></div>
+</div>
+
+<h2 id="roofline-core"><span class="sec-num">01</span>The roofline core (Parts 0–1)</h2>
+
+<p>The book's central object is the pair of lower-bound times. For any operation,</p>
+
+<div class="formula"><span class="lbl">compute</span>
+  <span class="eq">T<sub>math</sub> = (computation FLOPs) / (accelerator FLOPs/s) &nbsp;·&nbsp; T<sub>comms</sub> = (communication bytes) / (bandwidth bytes/s)</span>
+  <span class="note">Perfect overlap → runtime = max(T<sub>math</sub>, T<sub>comms</sub>); no overlap → T<sub>math</sub> + T<sub>comms</sub>. Good kernels approach the max, so the book reasons with max.</span></div>
+
+<p>If compute and comms overlap perfectly, runtime is <span class="k k-compute">T_lower = max(T_math, T_comms)</span>; with no overlap, <span class="k k-comms">T_upper = T_math + T_comms</span>. Good kernels approach the max, so the book reasons with <code>max</code>. The decision variable is <strong>arithmetic intensity</strong>, <code>Intensity = FLOPs / bytes</code>, compared against the hardware's critical intensity <code>peak FLOPs/s ÷ bandwidth</code>. An op is compute-bound iff <code>Intensity(op) &gt; Intensity(accelerator)</code> (<a href="https://jax-ml.github.io/scaling-book/roofline/">Part 1</a>).</p>
+
+<p>The canonical worked case is a matmul <code>X[B,D]·Y[D,F]→Z[B,F]</code> in bf16: <code>2BDF</code> FLOPs against <code>2BD + 2DF + 2BF</code> bytes, giving intensity <code>BDF/(BD+DF+BF) ≈ B</code> when <code>B ≪ D,F</code>. So the <strong>critical batch</strong> — the per-replica token count above which a matmul is compute-bound — equals the hardware critical intensity. On TPU v5e that is <code>1.97e14 / 8.2e11 ≈ 240</code> FLOPs/byte, hence <strong>240 tokens</strong>. On H100, <code>9.89e14 / 3.35e12 ≈ 295</code>. The single most important subtlety: <code>B</code> is the <strong>per-replica token batch</strong>, not the number of sequences and not the global batch. Model sharding scales both FLOPs and bandwidth, so it does not move the ratio — only the per-replica token count does. 512 sequences × 4096 tokens = 2M tokens, but if sharded to ~1K tokens/replica, the relevant <code>B</code> is ~1K.</p>
+
+<div class="callout key"><div class="ct">The one number to remember</div>
+  <p>The critical batch <code>B</code> is the <em>per-replica token count</em> — not sequences, not the global batch. ~240 (TPU v5e), ~280 (B200), ~295 (H100). Sharding moves FLOPs and bandwidth together, so it never moves this ridge — only the per-replica token count does.</p></div>
+
+<p>Two quantization corollaries you will use constantly: <strong>weight-only int8</strong> (bf16 activations × int8 weights) loads <code>DF</code> weight bytes instead of <code>2DF</code> for the same <code>2BDF</code> FLOPs, halving the critical batch to <strong>120</strong>. <strong>Full int8</strong> (weights and activations) leaves it at <strong>240</strong>, because peak ops/s doubles to <code>3.94e14</code> <em>and</em> the intensity doubles — they cancel. This asymmetry is why lossless weight-only quantization is the default inference lever: it buys a 2× lower batch floor with no math-precision risk.</p>
+
+<p>Low-reuse ops are pathological and worth memorizing as anti-patterns: a dot product has intensity <code>(2N−1)/(4N+2) → 0.5</code>, and a per-example distinct-weight matmul <code>[B,D]·[B,D,F]</code> has constant intensity <code>≈ 2</code> regardless of <code>B</code>. Both are permanently memory-bound. Anything with no weight reuse will never see peak FLOPs.</p>
+
+<p>The roofline plot makes this geometric: x-axis = arithmetic intensity, y-axis = achievable FLOP/s <code>= total FLOPs / max(T_math, T_comms)</code>. Throughput rises linearly through the bandwidth-bound region until it hits the ridge point at the hardware critical intensity, then flattens at peak. Bigger hidden dims reach the ridge sooner — halving <code>D</code> and <code>F</code> roughly doubles the critical batch — which is one more reason wide models are easier to keep compute-bound. The two-chip sharded case sharpens the lesson: sharding <code>X</code> and <code>Y</code> along <code>D</code> across two chips gives <code>T_math = BDF/1.97e14</code>, <code>T_comms = 2BF/4.5e10</code>, compute-bound iff <code>D/2 &gt; 4377</code>, i.e. <code>D &gt; 8755</code>. The bound now depends on the <em>contracted</em> dimension, not the batch — the seed of the tensor-parallel cap derived later.</p>
+
+<figure class="fig" data-fig="roofline">
+  <figcaption class="figcap"><b>Figure 1 — The GB200 roofline and where the ridge sits.</b> A B200 ridge of ≈281 FLOP/byte (bf16) is the same near-invariant batch as TPU and H100; matmuls clear it, the dot-product and distinct-weight ops never do. The all-to-all routing leg lives deep in the bandwidth-bound region.
+    <span class="meta"><span>Regime · <b>B200 bf16, 2.25 PFLOP/s ÷ 8 TB/s</b></span><span>Evidence · <b>Scaling Book Parts 1 & 12</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "peak":2.25e15,"bw":8e12,
+    "points":[
+      {"name":"MLP matmul (B≈3000)","ai":3000,"perf":2.25e15,"fam":"compute"},
+      {"name":"per-expert GEMM (B≈94)","ai":94,"perf":7.05e14,"fam":"moe"},
+      {"name":"MoE all-to-all","ai":2,"perf":1.6e13,"fam":"comms"},
+      {"name":"dot product → 0.5","ai":0.5,"perf":4e12,"fam":"norm"}
+    ] }</script>
+</figure>
+
+<h2 id="accelerators"><span class="sec-num">02</span>How accelerators actually work (Part 2)</h2>
+
+<p><a href="https://jax-ml.github.io/scaling-book/tpus/">Part 2</a> grounds the roofline in silicon. A TPU is an MXU (systolic array, 128×128 on most generations, 256×256 on v6e) fed from HBM through a small, fast, programmer-managed scratchpad (VMEM, 128 MiB on v5e). The load-bearing fact: <strong>VMEM bandwidth is ~22× HBM bandwidth</strong>, so an op whose operands already sit in VMEM needs an arithmetic intensity of only ~10–20 to hit peak FLOPs, versus ~240 from HBM. This is why weight-stationary serving and VMEM prefetch (load FFN weights during attention) matter — they relocate the roofline crossover by an order of magnitude. The book's Q4 makes it concrete: a v5e matmul that needs <code>B &gt; 267</code> from HBM needs only <code>B &gt; 11</code> (≈20 in practice) from VMEM.</p>
+
+<p>The bandwidth hierarchy, fastest to slowest, is <strong><span class="f-mem">HBM</span> &gt; <span class="f-comms">ICI</span> &gt; PCIe &gt; <span class="f-comms">DCN</span></strong>, and the engineering rule is to keep per-channel traffic proportional to channel speed. TPU networking is a 2D/3D torus with nearest-neighbor links and constant per-device bandwidth — that constancy is why TPU pods scale to thousands of chips cheaply, in contrast to GPU switch hierarchies (8 GPUs/node on H100, 72 on B200 NVL72) that need O(log N) hops. The v5p reference card: <code>4.59e14</code> bf16 FLOP/s, 96 GB HBM at <code>2.8e12</code> B/s, ICI <code>9e10</code> B/s/axis one-way (<code>1.8e11</code> bidi) across 3 axes, DCN <code>6.25e9</code> B/s/chip. An 8960-chip v5p pod is 4 bf16 exaFLOP/s.</p>
+
+<div class="callout note"><div class="ct">VMEM relocates the crossover by 10×</div>
+  <p>VMEM bandwidth is ~22× HBM, so an in-VMEM op hits peak at intensity ~10–20 versus ~240 from HBM. Weight-stationary serving and prefetching FFN weights during attention are how you exploit it — the same move on GB200 is keeping operands in SMEM/L1.</p></div>
+
+<h2 id="sharded-collectives"><span class="sec-num">03</span>Sharded matmuls and the cost of every collective (Part 3)</h2>
+
+<p><a href="https://jax-ml.github.io/scaling-book/sharding/">Part 3</a> gives the notation <code>A[I_X, J_Y]</code> (dim <code>I</code> over mesh axis <code>X</code>, <code>J</code> over <code>Y</code>; no subscript = replicated; <code>{U_X}</code> = unreduced partial sum) and the <strong>lemma</strong>: a sharded matmul needs no communication unless the contracting dimension is sharded or both inputs are sharded on the same axis. The four cases that follow — no-comms, AllGather-an-input, AllReduce-a-partial, AllGather-a-conflict — are the grammar of every parallelism strategy.</p>
+
+<p>The collective cost model is the part to burn in. On a bidirectional ring with total array bytes <code>V</code> and bidirectional bandwidth <code>W<sub>ici</sub></code>:</p>
+
+<div class="formula"><span class="lbl">comms</span>
+  <span class="eq">AllGather = ReduceScatter = V / W<sub>ici</sub> &nbsp;·&nbsp; AllReduce = 2V / W<sub>ici</sub> &nbsp;·&nbsp; AllToAll = V / (4 · W<sub>ici</sub>)</span>
+  <span class="note">Ring-collective time depends only on bytes and bandwidth — <em>not</em> on the number of chips on the ring. AllReduce = ReduceScatter + AllGather. Multi-axis divides cost by num_axes.</span></div>
+
+<figure class="fig narrow" data-fig="bars">
+  <figcaption class="figcap"><b>Figure 2 — The 1:4:4:8 collective cost ratio.</b> In units of <code>V/W<sub>ici</sub></code>, AllToAll is 4× cheaper than AllGather, which is why MoE token routing (two AllToAlls) is cheaper per byte than it looks — and why reshards are cheap.
+    <span class="meta"><span>Regime · <b>bidirectional ring, bytes V</b></span><span>Evidence · <b>Scaling Book Part 3</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "ylabel":"cost (× V/W_ici)","max":2.4,
+    "bars":[
+      {"label":"AllToAll","value":0.25,"fam":"comms"},
+      {"label":"AllGather","value":1,"fam":"comms"},
+      {"label":"ReduceScatter","value":1,"fam":"comms"},
+      {"label":"AllReduce","value":2,"fam":"comms"}
+    ] }</script>
+</figure>
+
+<p>The hierarchy is <strong>AllToAll (1/4) &lt; AllGather = ReduceScatter (1) &lt; AllReduce (2)</strong>, a 1:4:4:8 ratio. Two facts deserve emphasis. First, ring-collective time depends only on bytes and bandwidth, <strong>not</strong> on the number of chips on the ring — adding chips to a ring AllGather is free in time. Second, AllToAll is 4× cheaper than AllGather, which is why MoE token routing (two AllToAlls) is cheaper per byte than it looks, and why reshards are cheap. Multi-axis collectives divide cost by the number of axes: <code>bytes/(W_ici·num_axes)</code>. Latency floors matter at small sizes: each hop costs ~1 µs, so buffers under <code>W_unidir·T_min = 4.5e10·1e-6 = 45 kB</code>/device on v5e are latency-bound, not bandwidth-bound.</p>
+
+<p>The sharded-matmul roofline that governs tensor parallelism: for <code>X[B,D]·Y[D_X,F]</code>, the AllGather-then-matmul strategy is compute-bound only when <code>D/(2X) &gt; C/W_ici ≈ 2550</code>. With <code>D ≈ 8k</code> this needs <code>X &lt; 2</code> — for large models you are essentially always comms-bound when you shard the contracting dimension, which is precisely why the AllReduce/ReduceScatter strategy (and bounded TP degree) wins. Finally, AllGather and ReduceScatter are transposes (<code>AllGather<sup>T</sup> = ReduceScatter</code>): a forward-pass AllGather of weights becomes a ReduceScatter of gradients in backprop, so you pay both directions.</p>
+
+<h2 id="transformer-accounting"><span class="sec-num">04</span>Transformer FLOP / param / byte accounting (Part 4)</h2>
+
+<p><a href="https://jax-ml.github.io/scaling-book/transformers/">Part 4</a> reduces all transformer cost to contraction counting: a contraction costs <code>2 × (product of all input dims, batch and contracting dims counted once)</code>. Forward is <code>2NPM</code> per matmul; backward needs <code>dL/dB = A<sup>T</sup>(dL/dC)</code> and <code>dL/dA = (dL/dC)B<sup>T</sup></code>, each <code>2NPM</code>, so training is <code>6NPM</code>. Since <code>PM</code> = parameter count, this is the famous <strong>training FLOPs ≈ 6 × num_params × num_tokens</strong>, inference <code>2 × num_params × num_tokens</code>.</p>
+
+<div class="formula"><span class="lbl">compute</span>
+  <span class="eq">C<sub>train</sub> ≈ 6 · N<sub>params</sub> · N<sub>tokens</sub> &nbsp;(fwd 2 + bwd 4) &nbsp;·&nbsp; C<sub>infer</sub> ≈ 2 · N<sub>params</sub> · N<sub>tokens</sub></span>
+  <span class="note">With block rematerialization the multiplier rises 6 → ~8 (backward recomputes forward). This is a real MFU tax you must budget.</span></div>
+
+<p>Per-layer accounting (symbols: <code>D</code>=d_model, <code>F</code>=d_ff, <code>N</code>=query heads, <code>K</code>=KV heads, <code>H</code>=head dim, <code>L</code>=layers, <code>V</code>=vocab, <code>B</code>=batch, <code>T</code>=seq):</p>
+
+<ul>
+  <li><strong>MLP</strong> (gated/SwiGLU): <code>3DF</code> params, <code>18BTDF</code> training FLOPs. The 3 covers gate/up/down; non-gated is <code>2DF</code>.</li>
+  <li><strong>Attention QKVO</strong>: <code>2D(N+K)H</code> params, <code>12BTD(N+K)H</code> FLOPs.</li>
+  <li><strong>Dot-product attention</strong>: <code>≈ 12BT²NH</code> FLOPs (causal masking halves the useful half), and crucially <strong>zero params</strong> — attention FLOPs scale with <code>T²</code> but carry no weights.</li>
+  <li><strong>Unembedding</strong>: <code>6BTDV</code>, not per-layer.</li>
+</ul>
+
+<p>The fractional cost of attention, with <code>F=4D</code>, <code>D=NH</code>, <code>N=K</code>, is <code>12BT²NH / (18BTDF + 24BTDNH) = T/(8D)</code>. So dot-product attention overtakes the projections only once <strong><code>T &gt; 8D</code></strong> — ~64K tokens at <code>D=8k</code>. For nearly every pretraining regime, the MLP dominates and <code>6 × params × tokens</code> is accurate to a few percent. About <strong>1/4 of dense params live in attention</strong>, 3/4 in the MLP.</p>
+
+<p>The <strong>KV cache</strong> is <code>[2, S, L, K, H]</code>, size in int8 <code>= 2·S·L·K·H</code> bytes; per token <code>2·L·K·H</code>. This is the single architectural lever for inference memory — GQA/MQA shrink <code>K</code>, and the whole point of <code>K ≪ N</code> is to keep the cache from stacking past parameter memory at batch.</p>
+
+<div class="formula"><span class="lbl">mem</span>
+  <span class="eq">KV cache (int8) = 2 · S · L · K · H bytes &nbsp;·&nbsp; per token = 2 · L · K · H</span>
+  <span class="note">The single architectural lever for inference memory. GQA/MQA shrink K; decode is always HBM-bandwidth bound (intensity → 1).</span></div>
+
+<p><strong>Activation memory</strong> without rematerialization is <code>≈ 2·20·BTD·L</code> bytes in bf16 (~20 intermediate nodes/layer); for <code>BT=4M, L=64, D=8192</code> that is <strong>84 TB</strong>. Block remat (one checkpoint/layer) drops this to 4.2 TB but recomputes nearly all forward FLOPs in backward, lifting training from <code>6×</code> to <code>~8×</code> params·tokens. This 6→8 multiplier is a real MFU tax you must budget.</p>
+
+<p><strong>MoE</strong> adds <code>E</code> expert MLP blocks/layer, <code>k</code> active per token. Param count scales <code>×O(E)</code>, activated params/token <code>×k</code>, sparsity <code>E/k</code> is typically 8–64. The killer constraint for <em>inference</em> is the compute-bound batch: with int8 weights and bf16 FLOPs, each expert weight loads <code>EDF</code> bytes for <code>2kBDF</code> FLOPs, so intensity <code>&gt; 240</code> requires <code>kB/E &gt; 120</code>, i.e. <strong><code>B &gt; 120·E/k</code></strong>. DeepSeek-V3 (<code>E=256, k=8</code>) needs <code>B &gt; 3840</code> tokens/replica just to make its experts compute-bound — a sobering number for serving. MoE also introduces two AllToAlls (route to experts and back) when the data/sequence axis is sharded along experts; each costs 1/4 of a comparable AllGather.</p>
+
+<div class="callout warn"><div class="ct">The MoE serving trap — B &gt; 120·E/k</div>
+  <p>To make experts compute-bound you need <code>B &gt; 120·E/k</code> tokens/replica. For DeepSeek-V3's <code>E=256, k=8</code> that is <strong>3840 tokens/replica</strong>. Below it, individual expert matmuls are memory-bound — which is why grouped/ragged GEMM aggregating tokens across the whole EP group is mandatory at decode.</p></div>
+
+<h2 id="parallelism"><span class="sec-num">05</span>The four training parallelism strategies — and where each goes comms-bound (Part 5)</h2>
+
+<p><a href="https://jax-ml.github.io/scaling-book/training/">Part 5</a> derives all four axes through the same roofline test: compute-bound iff matmul time &gt; collective time. Per-layer MLP FLOPs are <code>4BDF</code> forward, <code>8BDF</code> backward (<code>6BDF</code> total, backward = 2× forward). Let <code>C</code> = per-chip FLOP/s, <code>W</code> = bidirectional bandwidth, <code>α = C/W_ici ≈ 2550</code> on v5p.</p>
+
+<div class="tcards">
+  <div class="tcard" data-fam="mem"><div class="tn">Data Parallelism</div><div class="ts">B/X &gt; 2550 tok/chip</div><div class="tm">Params + Adam = 10 B/param replicated → largest pure-DP model ≈ HBM/10 ≈ 9B on v5p.</div></div>
+  <div class="tcard" data-fam="data"><div class="tn">FSDP / ZeRO-3</div><div class="ts">B/X &gt; 2550 (~850 / 3 axes)</div><div class="tm">Weights AllGathered JIT (fwd 4DF), grads ReduceScattered (bwd 8DF) — same total comms as DP, all sharded.</div></div>
+  <div class="tcard" data-fam="compute"><div class="tn">Tensor / Sequence (Megatron)</div><div class="ts">F &gt; Y·(C/W) → cap 8–16</div><div class="tm">AllGather acts before, ReduceScatter after (4BD/layer fwd). Comms/compute ratio is precision-independent.</div></div>
+  <div class="tcard" data-fam="data"><div class="tn">Pipeline Parallelism</div><div class="ts">single-hop, cheap</div><div class="tm">Only adjacent-stage activations move; cost is the bubble. Divides the FSDP/DP AllReduce — its real value.</div></div>
+</div>
+
+<p><strong>Data Parallelism</strong>: <code>In[B_X,D]·W_in[D,F]·W_out[F,D]</code>. Params + optimizer replicated; backward AllReduces both weight grads (<code>8DF</code> bytes/layer). Compute-bound iff <strong><code>B/X &gt; C/W_ici ≈ 2550</code></strong> tokens/chip (single axis; ~850 over 3 axes). DP rarely stands alone: params + Adam = <strong>10 bytes/param</strong> (2 bf16 + 4 + 4 fp32 moments), so the largest model under pure DP is <code>HBM/10 ≈ 9B</code> params on v5p.</p>
+
+<p><strong>FSDP / ZeRO-3</strong>: <code>In[B_X,D]·W_in[D_X,F]·W_out[F,D_X]</code>. Weights AllGathered just-in-time (forward <code>4DF</code>), grads ReduceScattered (backward <code>8DF</code>) — <em>same total comms as DP's AllReduce</em> but everything sharded. Same compute-bound threshold, <code>B/X &gt; 2550</code> (~850 over 3 axes).</p>
+
+<p><strong>Tensor / Sequence Parallelism (Megatron)</strong>: <code>In[B,D_Y]·W_in[D,F_Y]·W_out[F_Y,D]</code>. AllGather activations before, ReduceScatter after (<code>4BD</code>/layer forward). Compute-bound iff <strong><code>F &gt; Y·(C/W_ici)</code></strong>, i.e. <code>Y &lt; M_Y·F/2550</code> — for most models TP caps at <strong>8–16-way</strong>. The comms/compute ratio is precision-independent (int8 vs bf16 cancels).</p>
+
+<p><strong>Pipeline Parallelism</strong>: only adjacent-stage activations move (single-hop, cheap). The cost is the <strong>bubble</strong>, killed by microbatching and zero-bubble schedules. Critically, PP across nodes <em>divides down</em> the FSDP/DP AllReduce cost, which is its real systems value.</p>
+
+<p><strong>Combined FSDP+TP</strong> is the workhorse: <code>In[B_X,D_Y]·W_in[D_X,F_Y]·W_out[F_Y,D_X]</code>, total comms <code>max(FSDP, TP)</code>. The optimal split is <code>X_opt = sqrt((B/F)·(M_X/M_Y)·N)</code>, and the compute-bound threshold drops to <strong><code>B/N &gt; α²/(M_X·M_Y·F) ≈ 100</code></strong> tokens/chip — roughly 8× lower than pure FSDP's 850. This is why every frontier run mixes the two. Across pods, DCN sets <code>C/W_dcn = 4.59e14/6.25e9 = 73,440</code> tokens/pod minimum to stay compute-bound over the slow link.</p>
+
+<div class="formula"><span class="lbl">data</span>
+  <span class="eq">X<sub>opt</sub> = √((B/F)·(M<sub>X</sub>/M<sub>Y</sub>)·N) &nbsp;·&nbsp; FSDP+TP floor: B/N &gt; α²/(M<sub>X</sub>·M<sub>Y</sub>·F) ≈ 100 tok/chip</span>
+  <span class="note">~8× lower than pure FSDP's 850 — why every frontier run mixes FSDP and TP. Across pods, C/W<sub>dcn</sub> ≈ 73,440 tok/pod to stay compute-bound over DCN.</span></div>
+
+<h2 id="applied-llama"><span class="sec-num">06</span>The applied LLaMA training example (Part 6)</h2>
+
+<p><a href="https://jax-ml.github.io/scaling-book/applied-training/">Part 6</a> is the canonical worked walkthrough. LLaMA-3 70B (<code>L=80, D=8192, F=28672, N=64, K=8, H=128, V=128256</code>): FFW <code>56.3e9</code> + attention <code>12e9</code> + vocab <code>2.1e9</code> = <code>70.4e9</code> params. Training is <code>6·70e9 = 4.2e11</code> FLOPs/token; over 15T tokens, <code>6.3e24</code> total. On one v5p that is 435 years; on an 8960-chip pod at 40% MFU, <code>T = 6.3e24/(8960·4.59e14·0.4) = 3.8e6 s ≈ 44 days</code>.</p>
+
+<p>The memory accounting at a 4M-token batch: params ~140 GB, optimizer ~560 GB, gradient checkpoints <code>2·8192·4e6·4·80 ≈ 20.9 TB</code> — <strong>checkpoints dominate</strong>, total ~21.6 TB, fitting in 225 chips. But 225 chips would take ~4 years; large clusters buy FLOPs, not memory. The sharding logic is instructive: pure DP caps at 1024-way (only 1024 sequences); 8960-way FSDP gives 468 tokens/chip &lt; 850 → comms-bound; FSDP+TP fits because 468 &gt; <code>2550²/(2·28672) = 113</code>. <code>X_opt = sqrt(2·4.19e6·8960/28672) ≈ 1618</code>, rounded to the final recommendation: <strong>1024-way DP × 2-way sequence × 4-way TP</strong>.</p>
+
+<div class="callout note"><div class="ct">Large clusters buy FLOPs, not memory</div>
+  <p>LLaMA-3 70B's whole training state (~21.6 TB) fits in 225 chips — but 225 chips would take ~4 years. You scale to 8960 chips for the FLOP/s, not because you need the memory. This recurs verbatim at 100k-GB200 scale: model+optimizer state is &lt;0.3% of HBM.</p></div>
+
+<h2 id="inference"><span class="sec-num">07</span>Inference roofline and the applied serving example (Parts 7–8)</h2>
+
+<p><a href="https://jax-ml.github.io/scaling-book/inference/">Part 7</a> splits inference into <strong>prefill</strong> (parallel over prompt, essentially always compute-bound, optimize MFU) and <strong>generation</strong> (one token/step, serial). Generation has two terms: the MLP, compute-bound only when per-replica batch <code>&gt; B_crit = (C/W_hbm)·(bits/param ÷ bits/act)</code> (240 bf16, 120 int8-weights, ~280 H100); and <strong>attention, which loads the entire KV cache for tiny FLOPs and is always memory-bandwidth bound</strong> (intensity <code>ST/(S+T) → 1</code> at decode). The general step time is</p>
+
+<div class="formula"><span class="lbl">mem</span>
+  <span class="eq">Step = (Batch · KVCache)/MemBW &nbsp;+&nbsp; max( 2·Batch·Params/FLOPs , Params/MemBW )</span>
+  <span class="note">Attention term (always memory-bound) plus an MLP term that switches at B<sub>crit</sub>. Generation throughput wants the largest per-chip batch possible.</span></div>
+
+<p>— attention term plus an MLP term that switches at <code>B_crit</code>. The takeaway: generation throughput wants the largest per-chip batch possible, and generation can model-parallelize <em>beyond</em> the training TP limit (up to <code>Y ≈ F/(B·β)</code>, <code>β = W_hbm/W_ici ≈ 8</code>) because it is memory-bound, not FLOP-bound.</p>
+
+<p><a href="https://jax-ml.github.io/scaling-book/applied-inference/">Part 8</a> serves LLaMA-3 70B on v5e (best FLOPs/$, <code>5.8e17</code>). KV/token int8 <code>= 2·8·128·80 = 160 kB</code>; BS=32 @ 8k = 41.9 GB + 70 GB params = 112 GB → 7 chips → 4×2. Step time <code>= 112e9/(8·8.2e11) = 17 ms</code>, throughput 1882 tok/s ≈ 235/chip, comms-bound only when <code>Y &gt; 2F/2200 = 26</code>. The dominant lesson: at any sequence &gt; 2048, KV-cache loading dominates step time over FLOPs, so <strong>LLaMA-3 70B serving is strongly KV/HBM-bandwidth bound</strong> — shrinking the KV cache is the master lever. (See also the external <a href="https://arxiv.org/abs/2211.05102">ESTI / Pope et al.</a> result that PaLM 540B's KV cache at batch 512, context 2048 is ~3 TB, ~3× the parameters, and that MQA sharded over batch buys up to 32× longer context.)</p>
+
+<h2 id="profiling"><span class="sec-num">08</span>Profiling, XLA, and the JAX programming model (Parts 9–10)</h2>
+
+<p><a href="https://jax-ml.github.io/scaling-book/profiling/">Part 9</a> is the empirical loop: compute the roofline, then read the profiler to see why you miss it. JAX → StableHLO → HLO (fusions, layouts) → LLO → machine code. The workflow is to inspect TPU:0 in the Trace Viewer (top XLA-Ops row is ground truth; annotate with <span class="k k-compute">jax.named_scope</span>), map each <code>dot</code>/<code>fusion</code> op to your code (one matmul + pointwise VPU ops each), and watch for retile/relayout copies inserted by tiling mismatches (fix with <code>AUTO</code> layouts). An XLA op carries its shape, dtype, layout (<code>{2,1,0:T(8,128)}</code> = physical ordering plus tiling), and memory space (<code>S(1)</code> = VMEM, <code>S(0)</code>/omitted = HBM) — the layout tiling can silently pad and expand memory ~1.6× (e.g. <code>f32[3,5]</code> under <code>T(2,2)</code> pads to <code>[4,6]</code>). Their MLP up-projection example hits 96 ms observed vs 95.6 ms predicted — near-peak — and the trailing ReduceScatter hits 1.13 ms observed vs ~1.1 ms predicted; matching observed to roofline is the signal of a healthy kernel. The Blackwell analogue is identical in spirit: profile, find the AllToAll or AllGather that exceeds its <code>V/W</code> budget, and move it onto a faster channel or overlap it.</p>
+
+<p><a href="https://jax-ml.github.io/scaling-book/jax-stuff/">Part 10</a> gives the three programming modes — <strong>Auto</strong> (<code>jit</code>, Shardy inserts comms, watch for an 80%-of-profile AllGather), <strong>Explicit</strong> (sharding in the type system, errors on ambiguity), <strong>Manual</strong> (<span class="k k-compute">shard_map</span>, you write every collective) — and the collective-matmul pattern (overlap <code>ppermute</code> with local matmuls) that closed 311 µs → 244 µs vs a 224 µs unsharded baseline. Use <span class="k k-compute">jax.lax.with_sharding_constraint</span> to override bad GSPMD choices.</p>
+
+<div class="codecard">
+  <div class="src-meta"><span class="file">jax — Part 10 programming modes</span><span class="tag">Auto / Explicit / Manual</span><span class="tag">with_sharding_constraint + shard_map</span><span class="tag">illustrative</span></div>
+  <div class="annot-grid">
+<pre class="code"><code>import jax, jax.numpy as jnp
+from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
+from jax.experimental.shard_map import shard_map
+
+mesh = Mesh(jax.devices(), axis_names=("dp", "tp"))           # [1]
+
+@jax.jit
+def mlp(x, w_in, w_out):                                      # Auto mode
+    h = jnp.einsum("bd,df->bf", x, w_in)        # contracting D  # [2]
+    h = jax.nn.silu(h)
+    y = jnp.einsum("bf,fd->bd", h, w_out)
+    return jax.lax.with_sharding_constraint(    # override GSPMD  # [3]
+        y, NamedSharding(mesh, P("dp", None)))
+
+def tp_mlp(x, w_in, w_out):                                   # Manual mode
+    h = jnp.einsum("bd,df->bf", x, w_in)        # F sharded on tp
+    y = jnp.einsum("bf,fd->bd", jax.nn.silu(h), w_out)
+    return jax.lax.psum(y, axis_name="tp")      # reduce-scatter  # [4]
+y = shard_map(tp_mlp, mesh, in_specs=(P("dp", None), P(None, "tp"), P("tp", None)),
+              out_specs=P("dp", None))(x, w_in, w_out)
+</code></pre>
+    <div class="annot-list">
+      <div class="annot"><p><span class="badge">1</span><span class="anh">Two-axis mesh.</span> <code>dp</code> for data/FSDP, <code>tp</code> for tensor parallelism — the same factorization the §10.4 layout maps onto NVL72 domains.</p></div>
+      <div class="annot"><p><span class="badge">2</span><span class="anh">Auto inserts comms.</span> Under <code>jit</code>, GSPMD/Shardy places the collectives. Watch the profile for an AllGather that eats ~80% of the step — usually a missing constraint.</p></div>
+      <div class="annot"><p><span class="badge">3</span><span class="anh">Explicit override.</span> <code>with_sharding_constraint</code> pins a layout to override a bad GSPMD choice — the lever Part 10 recommends when Auto mode resharded wrong.</p></div>
+      <div class="annot"><p><span class="badge">4</span><span class="anh">Manual owns every collective.</span> <code>shard_map</code> + <code>psum</code> is the TP reduce-scatter you write by hand; the collective-matmul pattern overlaps <code>ppermute</code> with local matmuls (311 µs → 244 µs).</p></div>
+    </div>
+  </div>
+</div>
+
+<h2 id="blackwell"><span class="sec-num">09</span>Translating TPU reasoning to GB200 / Blackwell</h2>
+
+<p>The book's <a href="https://jax-ml.github.io/scaling-book/gpus/">GPU chapter (Part 12)</a> ports the whole framework, and it is the right bridge for a GB200 plan. The chip-level mapping: SM ≈ TPU Tensor Core, CUDA core ≈ VPU ALU, Warp Scheduler ≈ VPU, <strong>Tensor Core ≈ MXU</strong>, SMEM/L1 ≈ VMEM, GMEM ≈ HBM. The structural difference is modularity — an H100 has 132 relatively independent SMs (B200: 148) versus a v5p's 2 Tensor Cores.</p>
+
+<p><strong>The Blackwell numbers that move the rooflines.</strong> B200 peak: <strong>2.25 PFLOP/s bf16, 4.5 PFLOP/s FP8, 9.0 PFLOP/s FP4</strong>; HBM3e <strong>192 GB at 8.0 TB/s</strong>. A GB200 superchip is 2 B200 + 1 Grace. The matmul critical intensity is <code>2250e12/8e12 ≈ 281</code> FLOPs/byte — so the <strong>compute-bound batch is ~280 tokens in bf16</strong>, essentially the same ridge point as H100 (295) and TPU (240), because both numerator and denominator scaled. <em>The 240/280/295 critical-batch is a near-invariant of the last three hardware generations.</em> What FP4/FP8 change is not the batch crossover but the absolute throughput ceiling and the bytes-per-param in memory.</p>
+
+<div class="tcards">
+  <div class="tcard" data-fam="prec"><div class="tn">B200 bf16</div><div class="ts">2.25 PFLOP/s</div><div class="tm">192 GB HBM3e @ 8.0 TB/s. Ridge ≈ 281 FLOP/byte.</div></div>
+  <div class="tcard" data-fam="prec"><div class="tn">B200 FP8</div><div class="ts">4.5 PFLOP/s</div><div class="tm">2× bf16; the dense-GEMM training precision.</div></div>
+  <div class="tcard" data-fam="prec"><div class="tn">B200 FP4</div><div class="ts">9.0 PFLOP/s</div><div class="tm">4× bf16; footprint + bandwidth win today, compute win next-gen.</div></div>
+  <div class="tcard" data-fam="comms"><div class="tn">NVLink5</div><div class="ts">900 GB/s/GPU</div><div class="tm">50 GB/s/link × 18 links full-duplex, 2× NVLink4.</div></div>
+</div>
+
+<p><strong>NVLink5 and the network.</strong> NVLink5 is 50 GB/s/link full-duplex × 18 links = <strong>900 GB/s/GPU egress</strong>, double NVLink4's 450. The decisive Blackwell change is the <strong>GB200 NVL72: a 72-GPU single NVLink domain</strong> (versus 8-GPU H100 nodes). This is the most important systems fact for the 100k-GPU plan: it turns what used to be cross-node InfiniBand traffic (≈400 GB/s, and ≈50 GB/s effective for cross-node AllToAll, a &gt;4× degradation) into intra-domain NVLink traffic at 900 GB/s for groups of up to 72 GPUs. Per-node scale-out egress rises to <code>4·18·400/8 = 3.6 TB/s</code>, 9× H100.</p>
+
+<p><strong>Where the crossovers move.</strong> The book's GPU rooflines (per-layer backward <code>T_math = 8BDF/(XC)</code>, <code>T_comms = 8DF/W</code>):</p>
+
+<ul>
+  <li><strong>DP/FSDP</strong> critical per-GPU batch <code>= C/W</code>. On H100, <code>990e12/450e9 ≈ 2200</code> intra-node, ~2475 cross-node (rule of thumb ~2500). On <strong>B200 it rises to <code>2250e12/400e9 = 5625</code></strong> cross-node — Blackwell's FLOPs grew faster than its scale-out bandwidth, so <strong>you need <em>more</em> tokens/GPU to stay compute-bound under DP/FSDP</strong>. Inside an NVL72 domain at 900 GB/s, the intra-domain DP threshold is <code>2250e12/900e9 = 2500</code>, far better than the cross-domain 5625.</li>
+  <li><strong>TP</strong> compute-bound iff <code>Y &lt; F·W/C</code>. On B200 the TP critical intensity is <code>2250e12/900e9 = 2500</code>; for <code>F=28672</code> that is <code>28672/2500 ≈ 11</code> → practically <strong>8-way TP</strong> inside the NVL72, same as before.</li>
+  <li><strong>AllToAll</strong> intra-domain is <code>B/(W·N)</code> — about <strong>2× faster than the TPU ring</strong> (<code>B/4W</code> vs <code>B/8W</code>) thanks to the all-to-all NVSwitch fabric. This directly benefits MoE routing.</li>
+  <li><strong>Expert parallelism</strong> is viable multi-node only when <code>F &gt; 8·(C/W_node)</code>; otherwise keep EP inside an NVL72 domain.</li>
+</ul>
+
+<div class="callout key"><div class="ct">The Blackwell planner's headline</div>
+  <p>The NVL72 domain is the new unit of "cheap bandwidth," and the engineering goal is to keep the expensive collectives (MoE AllToAll, FSDP AllGather) <em>inside</em> it. Note the inversion: B200's FLOPs grew faster than its scale-out bandwidth, so the cross-domain DP/FSDP floor <em>rose</em> to 5625 tokens/GPU.</p></div>
+
+<h2 id="applied-moe"><span class="sec-num">10</span>Applied: the 10T-total / 200B-active MoE on 100,000 GB200</h2>
+
+<p>Now the load-bearing worked calculation. We treat each GB200 as <strong>2 B200 GPUs</strong>, so 100,000 GB200 = <strong>200,000 B200 GPUs</strong>, each <code>C = 2.25e15</code> bf16 FLOP/s (<code>4.5e15</code> FP8), 192 GB HBM at 8.0 TB/s, in NVL72 domains. Aggregate bf16 compute <code>= 2e5 · 2.25e15 = 4.5e20</code> FLOP/s = <strong>450 bf16 exaFLOP/s</strong> (900 FP8 exaFLOP/s). I will pick an architecture consistent with the spec and the book's accounting and show every step.</p>
+
+<div class="stats">
+  <div class="stat" data-fam="compute"><div class="v">450<span class="u">EF/s</span></div><div class="l">aggregate bf16 (900 FP8)</div></div>
+  <div class="stat" data-fam="mem"><div class="v">38.4<span class="u">PB</span></div><div class="l">aggregate HBM (200k × 192 GB)</div></div>
+  <div class="stat" data-fam="data"><div class="v">~2778</div><div class="l">NVL72 domains (200k / 72)</div></div>
+  <div class="stat" data-fam="comms"><div class="v">~100×</div><div class="l">A2A NVLink margin vs ≈parity on IB</div></div>
+</div>
+
+<p><strong>Architecture choice.</strong> 10T total / 200B active is sparsity <code>≈ 50×</code>. Following DeepSeek-style sizing, take <code>D = 16384</code>, <code>F = 8192</code> per expert (expert intermediate), <code>L = 100</code>, <code>E = 256</code> routed experts with <code>k = 8</code> active (+1 shared), GQA with <code>N = 128</code>, <code>K = 8</code>, <code>H = 128</code>, <code>V = 128k</code>. Sanity check on active params: MLP active/token <code>≈ 3·k·D·F·L = 3·8·16384·8192·100 ≈ 3.2e14</code>... that overcounts, so scale <code>F</code> down — the point of this section is the <em>method</em>, so I will work directly from the given totals (10T params, 200B active) rather than re-deriving a perfectly self-consistent config. The book's whole philosophy is that the two numbers that matter — total params and active params — are sufficient for FLOPs, memory, and time.</p>
+
+<h3 id="moe-flops">10.1 · Training FLOPs and wall-clock time</h3>
+
+<p>Training FLOPs use <strong>active</strong> params (only <code>k</code> experts fire per token):</p>
+
+<div class="formula"><span class="lbl">compute</span>
+  <span class="eq">FLOPs/token = 6 × active_params = 6 × 200e9 = 1.2e12 &nbsp;(1.2 TFLOP/token)</span>
+  <span class="note">Only k experts fire per token, so the 6ND rule runs on active, not total, params.</span></div>
+
+<p>Choosing a Chinchilla-generous token budget for a 200B-active model — frontier practice is ~20–40 tokens/active-param, so take a <strong>15T-token</strong> budget (deliberately compute-heavy, undertraining the <em>active</em> count to bank capability in the sparse params):</p>
+
+<pre class="code"><code>Total training FLOPs = 1.2e12 × 15e12 = 1.8e25 FLOPs   (18 yottaFLOPs)</code></pre>
+
+<p>Add the remat tax. With block rematerialization the multiplier rises 6→~8, so the <em>delivered</em> compute requirement is <code>(8/6)·1.8e25 = 2.4e25</code> FLOPs if fully checkpointed; with big-matmuls-only remat (~7×) it is <code>2.1e25</code>. Take the conservative <code>~8×</code>: <code>2.4e25</code>.</p>
+
+<p>Wall-clock at aggregate <code>4.5e20</code> bf16 FLOP/s and an MFU we must justify (see §10.5; take <strong>40%</strong> for a 100k-scale MoE, which is optimistic-but-defensible):</p>
+
+<pre class="code"><code>T = 2.4e25 / (4.5e20 × 0.40) = 2.4e25 / 1.8e20 = 1.33e5 s ≈ 1.5 days</code></pre>
+
+<p>That is the <em>bf16</em> answer. <strong>Run the dense GEMMs in FP8</strong> (the DeepSeek-V3 recipe: compute-dense GEMMs FP8, embeddings/gating/norm/attention in higher precision, FP32 accumulation every 128 elements, &lt;0.25% loss-error). FP8 doubles <code>C</code> to <code>9e20</code> FLOP/s aggregate. Even at a lower 35% FP8 MFU (FP8 MFU is typically a few points below bf16 due to scaling overhead):</p>
+
+<pre class="code"><code>T_fp8 = 2.4e25 / (9e20 × 0.35) = 2.4e25 / 3.15e20 = 7.6e4 s ≈ 0.9 days</code></pre>
+
+<p>So the <strong>first-order training time for 15T tokens is on the order of 1–1.5 days of compute</strong> at 100k GB200. This is the crucial planning insight: at this hardware scale a 15T-token / 200B-active run is <em>not</em> compute-limited in calendar terms — it is limited by data pipeline, checkpointing, fault recovery, and how high you can actually push MFU. If you instead spend a 50T-token budget (33× active params, well past Chinchilla), multiply by 3.3 → <strong>~3–5 days</strong>. The arithmetic scales linearly in tokens.</p>
+
+<div class="callout key"><div class="ct">The crucial planning insight</div>
+  <p>At 100k GB200, a 15T-token / 200B-active run is <strong>~1–1.5 days of raw compute</strong>. It is <em>not</em> compute-limited in calendar terms — the real limits are data pipeline, checkpointing, fault recovery, and how high you can actually push MFU. Time scales linearly in tokens: a 50T-token budget is ~3–5 days.</p></div>
+
+<h3 id="moe-memory">10.2 · Parameter, optimizer, and activation memory</h3>
+
+<p>Memory per the book's <code>2 + 4 + 4 = 10 bytes/param</code> (bf16 weights + fp32 Adam moments). For mixed-precision with FP8 weights you can shave the weight copy, but optimizer state stays fp32, so budget conservatively at <strong>10 bytes/param on the 10T total</strong>:</p>
+
+<pre class="code"><code>Params (bf16)     = 2  × 10e12 = 20 TB
+Optimizer (fp32)  = 8  × 10e12 = 80 TB
+Param+opt total   = 10 × 10e12 = 100 TB</code></pre>
+
+<figure class="fig" data-fig="membar">
+  <figcaption class="figcap"><b>Figure 3 — The 10T-param training state, by dtype.</b> At 10 bytes/param the model+optimizer state is 100 TB — a non-issue against 38.4 PB of aggregate HBM (~0.26%). Toggle the weight/grad dtype: FP8 weights shave the weight copy but fp32 Adam moments dominate either way.
+    <span class="meta"><span>Regime · <b>10T total params, fully sharded</b></span><span>Evidence · <b>Scaling Book 10 B/param</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "paramsB":10000,"optBytes":8,
+    "dtypes":[{"id":"bf16","w":2,"label":"BF16 weights"},{"id":"fp8","w":1,"label":"FP8 weights"}],
+    "parts":[
+      {"label":"Weights","perParam":"w","fam":"compute"},
+      {"label":"Adam m+v (fp32)","perParam":"opt","fam":"optim"},
+      {"label":"Grads","perParam":"grad","fam":"comms"}
+    ] }</script>
+</figure>
+
+<p>Aggregate HBM is <code>200,000 × 192 GB = 38.4 PB</code>, so model+optimizer state is <strong>100 TB / 38,400 TB ≈ 0.26%</strong> of HBM. Per-GPU, fully sharded (FSDP/ZeRO over the whole cluster): <code>100 TB / 2e5 = 500 MB/GPU</code>. Memory for weights is a non-issue at 100k scale — exactly the book's repeated lesson that <em>large clusters are bought for FLOPs, not memory</em>.</p>
+
+<p>The real memory consumers are <strong>activations</strong> and the <strong>MoE routing buffers</strong>. Pick a global batch. The book's FSDP+TP floor is <code>~100</code> tokens/chip compute-bound; we want to be comfortably above. With 200k GPUs and a target of ~2000–4000 tokens/GPU (to clear the B200 DP/FSDP threshold of 5625 cross-domain, we lean on intra-domain sharding — see §10.4), a global batch of <strong>~60M tokens</strong> (e.g. <code>4096 sequences × 16384 ctx</code>, or <code>15360 × 4096</code>, echoing DeepSeek-V3's 62.9M) is reasonable.</p>
+
+<p>Activation memory with block remat is <code>2 · D · BT · checkpoints/layer · L</code>. With <code>D=16384</code>, <code>BT=60e6</code>, 1 checkpoint/layer, <code>L=100</code>:</p>
+
+<pre class="code"><code>Activations ≈ 2 · 16384 · 60e6 · 1 · 100 ≈ 2.0e17 bytes = 200 TB (fully checkpointed)</code></pre>
+
+<p>Sharded over the activation/data axis across 200k GPUs that is ~1 GB/GPU — fine. Without remat it would be ~20× larger (4 PB), which is why remat is mandatory and why we paid the 6→8 FLOP tax in §10.1. The MoE adds a routing/dispatch buffer proportional to <code>k · tokens_per_GPU · D</code>, small relative to the above.</p>
+
+<h3 id="moe-comms">10.3 · Comms volume per parallelism axis</h3>
+
+<p>Now the collective volumes, the part that decides MFU. Per-layer MLP weight bytes (per expert, FP8) <code>= D·F</code> and there are <code>E</code> of them; per-layer activation bytes <code>= 2·BT·D</code> (bf16).</p>
+
+<p><strong>FSDP all-gather (weights).</strong> FSDP AllGathers each layer's weights just-in-time. Total weight bytes/layer across all experts (FP8, 1 byte) <code>≈ E·3·D·F</code>. The cost is <code>bytes/(W·num_axes)</code>. The decisive design rule from the book: <strong>keep the FSDP AllGather inside the NVL72 domain</strong> (900 GB/s/GPU, <code>W ≈ 3.6 TB/s</code> domain-bisection per the GB200 scale-out figure) rather than across the 400 GB/s InfiniBand fabric. Sharding the 10T params over a 72-GPU domain means each domain AllGathers <code>10e12·1B / (#domains)</code> per step in aggregate; per-layer this overlaps with the matmul. With <code>B/N ≈ 2000–4000</code> tokens/GPU we are above the intra-domain FSDP threshold (<code>C/W = 2250e12/900e9 = 2500</code> is marginal — this is why we also use TP and EP to relax it).</p>
+
+<p><strong>MoE all-to-all (routing).</strong> This is the signature MoE cost and the reason NVL72 exists. Each token is dispatched to <code>k=8</code> of <code>E=256</code> experts and gathered back: <strong>two AllToAlls per layer</strong>. The dispatched volume per layer <code>≈ k · BT · D · bytes</code> (each active token's <code>D</code>-vector shipped to its expert). With <code>k=8</code>, <code>BT=60e6</code>, <code>D=16384</code>, bf16:</p>
+
+<div class="formula"><span class="lbl">comms</span>
+  <span class="eq">Dispatch bytes/layer ≈ k · BT · D · bytes = 8 · 60e6 · 16384 · 2 ≈ 1.6e16 B = 16 PB/layer</span>
+  <span class="note">Aggregate, all tokens. Per GPU = 16e15/2e5 = 80 GB/GPU/layer — enormous if it crosses InfiniBand. Two of these (dispatch + combine) per layer.</span></div>
+
+<p>Per GPU that is <code>16e15/2e5 = 80 GB/GPU/layer</code> — <em>enormous</em> if it crosses InfiniBand at 50 GB/s effective (1.6 s/layer, fatal). Inside an NVL72 domain at 900 GB/s with AllToAll's <code>1/(W·N)</code> factor, the same traffic is ~2× cheaper than a TPU ring and overlaps with expert compute. <strong>The hard constraint: expert parallelism must live inside NVL72 domains</strong> (the book's "multi-node EP viable only when <code>F &gt; 8·C/W_node</code>" rule, and DeepSeek-V3's node-limited routing to ≤4 nodes / 64-way EP is the precedent). With 200k GPUs / 72 = ~2778 NVL72 domains, you place all <code>E=256</code> experts within a domain (256 experts spread over 64 GPUs of a domain, 4 experts/GPU) and replicate the expert set across domains — so AllToAll never leaves NVLink. This is the single most important sharding decision in the whole plan.</p>
+
+<div class="callout warn"><div class="ct">EP must not cross the NVLink boundary</div>
+  <p>The dispatch AllToAll moves ~80 GB/GPU/layer. On InfiniBand at ~50 GB/s effective that is ~1.6 s/layer — fatal. Inside an NVL72 domain at 900 GB/s it hides behind compute. <strong>Expert parallelism must live inside NVL72 domains</strong>; place all 256 experts within a domain (4 experts/GPU on 64 GPUs) and replicate across domains.</p></div>
+
+<p><strong>Tensor-parallel all-gather/reduce-scatter.</strong> TP moves <code>4BD</code> bytes/layer, compute-bound iff <code>Y &lt; F·W/C</code>. With FP8 GEMMs and the intra-domain 900 GB/s, <code>F·W/C = 8192·900e9/2.25e15 ≈ 3.3</code> — so TP is limited to ~2–4-way for this small per-expert <code>F</code>. Keep TP at 2–4-way inside the domain.</p>
+
+<p><strong>Pipeline parallelism.</strong> PP moves only adjacent-stage activations (<code>~1.5·2BD/(W·L)</code> per the book), negligible, and — its real value — <strong>divides the FSDP/DP AllReduce cost by the PP degree</strong>. DeepSeek-V3's 16-way DualPipe is the template; on 100k GB200 a PP degree of ~8–16 across domains both cuts cross-domain DP traffic 8–16× and keeps the bubble small with zero-bubble scheduling.</p>
+
+<p><strong>Cross-domain DP.</strong> Whatever remains after EP (intra-domain), TP (intra-domain), and PP (cross-domain) is data-parallel across domains over InfiniBand. The DP AllReduce of gradients is <code>2·params_per_replica/W_dcn</code>. With PP cutting it 16× and a large per-GPU batch, this clears the <code>C/W_dcn = 5625</code>-tokens/GPU cross-domain threshold.</p>
+
+<h3 id="moe-layout">10.4 · Recommended parallelism layout</h3>
+
+<p>Synthesizing the book's rules onto 200k B200 GPUs in ~2778 NVL72 domains:</p>
+
+<pre class="code"><code>Inside each NVL72 domain (≈64–72 GPUs):
+  • Expert Parallelism  : 64-way  (all 256 experts, 4 experts/GPU) — AllToAll stays on NVLink
+  • Tensor Parallelism  : 2–4-way (bounded by F·W/C ≈ 3)
+Across domains:
+  • Pipeline Parallelism: 8–16-way (zero-bubble; cuts DP AllReduce 8–16×)
+  • Data Parallelism / FSDP (ZeRO-1): the remaining ~24–340 replicas over InfiniBand</code></pre>
+
+<figure class="fig" data-fig="meshlayout">
+  <figcaption class="figcap"><b>Figure 4 — The 100k-GB200 mesh factorization.</b> EP×TP is kept <em>inside</em> the NVL72 NVLink domain so the dominant AllToAll rides NVLink; PP×DP spans the cluster over InfiniBand. EP=64 × TP=2 = 128 GPUs ≈ 2 domains; PP=16; DP ≈ 98.
+    <span class="meta"><span>Regime · <b>10T/200B on 200k B200</b></span><span>Evidence · <b>DeepSeek-V3 scaled up</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "deviceTotal":200000,
+    "axes":[
+      {"id":"EP","name":"expert (in-NVL72)","size":64,"fam":"moe"},
+      {"id":"TP","name":"tensor (in-NVL72)","size":2,"fam":"compute"},
+      {"id":"PP","name":"pipeline (DCN)","size":16,"fam":"data"},
+      {"id":"DP","name":"data / FSDP (DCN)","size":98,"fam":"mem"}
+    ],
+    "note":"EP×TP = 128 ≈ 2 NVL72 domains; AllToAll stays on NVLink; PP×DP spans the cluster" }</script>
+</figure>
+
+<p>This is structurally <strong>DeepSeek-V3 scaled up</strong>: EP×PP×DP, <em>no large TP</em>, FP8 GEMMs, ZeRO-1 data parallelism. The mapping to 200k GPUs: 64-way EP × 4-way TP = 256 GPUs ≈ 3.5 NVL72 domains' worth — so in practice an "expert group" spans ~4 domains, and you must either keep EP to 64 within one domain (4 experts/GPU on 64 GPUs) or accept that the largest EP×TP block touches a few domains over NVLink-to-NVLink. The clean choice: <strong>EP=64 + TP=2 = 128 GPUs ≈ 2 domains</strong>, PP=16 across domains, DP = <code>2e5/(128·16) ≈ 98</code>-way. Per-GPU batch <code>= 60e6/(DP·TP·… )</code>; with the data axis at <code>DP×(BT distribution)</code>, per-GPU tokens land around <code>60e6 / (98 · 16-PP-microbatch-factor) ≈ 2000–4000</code>, clearing thresholds.</p>
+
+<div class="callout do"><div class="ct">The clean factorization</div>
+  <p><strong>EP=64 + TP=2 = 128 GPUs ≈ 2 NVL72 domains</strong>, PP=16 across domains, DP ≈ 98-way. Per-GPU tokens land at ~2000–4000, clearing the intra-domain FSDP (2500) and FSDP+TP (~100) floors. Structurally this is DeepSeek-V3 scaled up: EP×PP×DP, no large TP, FP8 GEMMs, ZeRO-1.</p></div>
+
+<h3 id="moe-mfu">10.5 · Arithmetic-intensity / comms-bound check and MFU</h3>
+
+<p>The MFU estimate is the product of (a) staying compute-bound on each axis and (b) realistic Tensor-Core efficiency. Per the book, B200/H100 reach <strong>~80–85% of peak FLOPs</strong> (vs ~95% on TPU), and FP8 with fine-grained scaling shaves a few more points. Layer-level losses:</p>
+
+<ul>
+  <li><strong>Expert GEMM efficiency</strong>: each active expert sees <code>k·BT/E</code> tokens. With <code>BT/GPU ≈ 3000</code>, <code>k=8</code>, <code>E=256</code>, tokens/expert/GPU <code>≈ 3000·8/256 ≈ 94</code> — <em>below</em> the ~280 compute-bound batch, so individual expert matmuls risk being memory-bound. This is the MoE MFU killer the book flags (<code>B &gt; 120·E/k = 3840</code> tokens to make experts compute-bound). Mitigation: aggregate tokens across the EP group (grouped GEMM over all GPUs holding a given expert) so the effective per-expert batch is <code>k·BT_global/E</code>, which at 60M global tokens is <code>8·60e6/256 ≈ 1.9M</code> tokens/expert — comfortably compute-bound. <strong>Grouped/ragged expert GEMM is mandatory</strong> to avoid the sub-batch trap.</li>
+  <li><strong>AllToAll overlap</strong>: with EP on NVLink and DualPipe-style overlap, AllToAll hides behind expert compute (DeepSeek-V3 achieved ~1:1 comm:compute fully hidden). Budget ~90% overlap.</li>
+  <li><strong>FSDP/PP overlap</strong>: collective-matmul and zero-bubble scheduling hide most of it; budget ~85%.</li>
+</ul>
+
+<figure class="fig narrow" data-fig="line">
+  <figcaption class="figcap"><b>Figure 5 — Per-expert arithmetic intensity vs the ridge.</b> A naive per-GPU expert batch of ~94 tokens sits far below the ~280 ridge — memory-bound. Grouping tokens across the whole EP group lifts the effective per-expert batch to ~1.9M, comfortably compute-bound.
+    <span class="meta"><span>Regime · <b>k=8, E=256, BT_global=60M</b></span><span>Evidence · <b>book MoE B&gt;120·E/k</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "xlabel":"tokens per expert (per-replica B)","ylabel":"arithmetic intensity (FLOP/byte)","logx":true,"logy":true,
+    "series":[
+      {"name":"per-expert intensity ≈ B","fam":"moe","pts":[[94,94],[1000,1000],[100000,100000],[1900000,1900000]]},
+      {"name":"B200 ridge ≈ 280","fam":"norm","dash":true,"pts":[[94,280],[1900000,280]]}
+    ],
+    "annotations":[{"x":94,"y":94,"text":"naive per-GPU: memory-bound"},{"x":1900000,"y":280,"text":"grouped EP: compute-bound"}] }</script>
+</figure>
+
+<p>Net MFU estimate: <code>0.83 (Tensor-Core peak fraction) × 0.92 (FP8 scaling) × ~0.55 (combined collective-overlap + bubble + load-imbalance losses at 100k scale)</code>. MoE load imbalance and the sheer collective volume at 100k GPUs make ~0.5–0.55 of <em>that</em> realistic, giving a delivered <strong>MFU ≈ 0.83 · 0.92 · 0.55 ≈ 0.42 → round to ~35–40%</strong>. That justifies the 40% used in §10.1 (bf16) / 35% (FP8). Frontier MoE runs at this scale that report numbers (DeepSeek-V3's implied ~22% on H800; the book's Q7) suggest <strong>35–40% is optimistic and 25–35% is the honest planning band</strong> — so the realistic training time is the §10.1 number <strong>divided by <code>0.30/0.40 = 1.33×</code></strong>, i.e. <strong>~1–2 days bf16, ~1–1.5 days FP8 at a sober 30% MFU</strong>, scaling linearly if you spend more tokens.</p>
+
+<p><strong>The communication-bound verdict.</strong> The plan is compute-bound iff (i) experts use grouped GEMM (else memory-bound on tiny per-expert batches), (ii) EP AllToAll stays inside NVL72 NVLink (else <code>&gt;4×</code> IB degradation makes routing dominate), and (iii) PP divides the cross-domain DP AllReduce enough to clear <code>C/W_dcn = 5625</code> tokens/GPU. Violate any one and you fall off the roofline. The 100k-GB200 MoE is <em>exactly</em> the regime where the book's three bounds (compute, communication, memory) are all simultaneously live, with <strong>communication — specifically MoE AllToAll — as the binding constraint</strong>, and the GB200 NVL72 domain as the architectural answer to it.</p>
+
+<h3 id="moe-sanity">10.6 · A second sanity pass: per-layer compute vs comms time</h3>
+
+<p>To make the bound concrete, compare per-layer <code>T_math</code> and <code>T_comms</code> numerically for the dispatch AllToAll, the dominant collective. Per-layer active expert FLOPs (FP8) <code>= 6_fwd+bwd-fraction</code> — take forward MLP <code>4·k·BT·D·F</code> for the active experts; with <code>k=8</code>, <code>BT=60e6</code>, <code>D=16384</code>, <code>F=8192</code>: <code>4·8·60e6·16384·8192 ≈ 2.6e21</code> FLOPs/layer forward (<code>~7.7e21</code> with backward). At aggregate FP8 <code>9e20</code> FLOP/s, <code>T_math ≈ 7.7e21/9e20 ≈ 8.5 s/layer</code> of <em>aggregate</em> compute — meaningless until divided by overlap and parallelism, but the ratio against comms is what matters. The dispatch AllToAll moves <code>~1.6e16</code> bytes/layer aggregate; on NVLink at <code>900 GB/s/GPU × 2e5 GPU = 1.8e17 B/s</code> aggregate egress, with AllToAll's <code>1/(W·N)</code>-style discount the effective time is <code>~1.6e16 / (1.8e17) ≈ 0.09 s/layer</code> aggregate — roughly <strong>100× smaller than the compute time</strong>, so on NVLink the routing comfortably hides. Re-run the same AllToAll over InfiniBand at <code>50 GB/s</code> effective: <code>1.6e16 / (50e9 · 2e5) ≈ 1.6 s/layer</code> — now <em>comparable to or larger than</em> compute, confirming the hard rule that EP must not cross the NVLink boundary. This single ratio (≈100× margin on NVLink vs ≈parity on IB) is the entire justification for the NVL72-resident expert placement.</p>
+
+<figure class="fig" data-fig="barshare">
+  <figcaption class="figcap"><b>Figure 6 — Why EP must stay on NVLink: dispatch AllToAll vs compute, per layer.</b> On NVLink the routing leg is ~0.09 s against ~8.5 s of compute (a ~100× margin, fully hidden). The same traffic over InfiniBand is ~1.6 s — comparable to compute and fatal. This single ratio justifies NVL72-resident experts.
+    <span class="meta"><span>Regime · <b>per-layer, aggregate, FP8</b></span><span>Evidence · <b>§10.6 worked ratio</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "title":"per-layer time budget — NVLink vs InfiniBand routing","unit":"seconds (aggregate)",
+    "items":[
+      {"label":"expert compute (fwd+bwd)","value":8.5,"fam":"compute"},
+      {"label":"dispatch A2A on NVLink","value":0.09,"fam":"comms"},
+      {"label":"dispatch A2A on InfiniBand","value":1.6,"fam":"comms"}
+    ],
+    "note":"NVLink routing hides at ~100× margin; the same A2A on IB is ≈parity with compute — fatal." }</script>
+</figure>
+
+<h2 id="rules"><span class="sec-num">11</span>Rules of thumb to burn into memory</h2>
+
+<ul>
+  <li><strong>Training FLOPs = 6 × params × tokens</strong> (forward 2×, backward 4×); inference 2×. With block remat, 6 → ~8.</li>
+  <li><strong><code>max(T_math, T_comms)</code></strong> is your runtime estimate; <code>T_math + T_comms</code> is the no-overlap pessimistic bound.</li>
+  <li><strong>Critical batch ≈ peak FLOP/s ÷ HBM BW</strong>: 240 (TPU v5e), ~280 (B200), ~295 (H100) — a near-invariant. It is the <em>per-replica token</em> batch, not sequences, not global.</li>
+  <li><strong>Weight-only int8/FP8 halves the critical batch</strong> (240→120); full-precision-symmetric quantization does not.</li>
+  <li><strong>Collective costs in units of <code>V/W</code></strong>: AllToAll 1/4, AllGather = ReduceScatter 1, AllReduce 2. Ring time is independent of device count; an AllReduce is two AllGathers.</li>
+  <li><strong><code>MoE needs B &gt; 120·E/k</code> tokens/replica</strong> to make experts compute-bound — and use grouped GEMM to reach it.</li>
+  <li><strong><code>KV/token = 2·L·K·H</code></strong>; KV cache dominates inference memory; GQA/MQA/quantization are the levers; decode is <em>always</em> HBM-bandwidth bound.</li>
+  <li><strong>DP/FSDP compute-bound iff <code>B/X &gt; C/W ≈ 2550</code></strong> (TPU v5p) / <strong>~2500 intra-NVL72, 5625 cross-domain</strong> (B200). Params+Adam = 10 bytes/param.</li>
+  <li><strong>TP caps at ~8-way</strong> (compute-bound iff <code>Y &lt; F·W/C</code>), precision-independent.</li>
+  <li><strong>FSDP+TP drops the floor to <code>~α²/(2F) ≈ 100</code> tokens/chip</strong>; <code>X_opt = sqrt((B/F)·(M_X/M_Y)·N)</code>.</li>
+  <li><strong>PP is comms-cheap and divides the DP AllReduce by its degree</strong> — its real systems value; needs zero-bubble scheduling.</li>
+  <li><strong>Attention FLOPs only matter when <code>T &gt; 8D</code></strong> (~64K tokens at D=8k); otherwise the MLP dominates params <em>and</em> FLOPs (3/4 of params).</li>
+  <li><strong>Large clusters are for FLOPs, not memory</strong> — at 100k GB200, model+optimizer state is &lt;0.3% of HBM.</li>
+  <li><strong>Keep MoE AllToAll inside the NVL72 NVLink domain</strong>; cross-node AllToAll loses &gt;4× bandwidth and will dominate.</li>
+  <li><strong>A 20% benchmark win is irrelevant if it costs 20% of roofline efficiency</strong> — the book's opening thesis, and the discipline this whole chapter exists to enforce.</li>
+</ul>
+
+<div class="callout key"><div class="ct">The meta-discipline</div>
+  <p>A 20% benchmark win is irrelevant if it costs 20% of roofline efficiency. Every figure in this chapter is one application of the same move: compute <code>T<sub>math</sub></code> and <code>T<sub>comms</sub></code>, take the max, and ask which one you can move onto a faster channel.</p></div>
+
+<div class="sources"><h3>Sources</h3><ul>
+  <li>How To Scale Your Model — Landing / Introduction: <a href="https://jax-ml.github.io/scaling-book/">jax-ml.github.io/scaling-book</a></li>
+  <li>Part 0: Introduction: <a href="https://jax-ml.github.io/scaling-book/index/">scaling-book/index</a></li>
+  <li>Part 1: Intro to Rooflines: <a href="https://jax-ml.github.io/scaling-book/roofline/">scaling-book/roofline</a></li>
+  <li>Part 2: All About TPUs: <a href="https://jax-ml.github.io/scaling-book/tpus/">scaling-book/tpus</a></li>
+  <li>Part 3: Sharded Matrices and How to Multiply Them: <a href="https://jax-ml.github.io/scaling-book/sharding/">scaling-book/sharding</a></li>
+  <li>Part 4: All the Transformer Math You Need to Know: <a href="https://jax-ml.github.io/scaling-book/transformers/">scaling-book/transformers</a></li>
+  <li>Part 5: How to Parallelize a Transformer for Training: <a href="https://jax-ml.github.io/scaling-book/training/">scaling-book/training</a></li>
+  <li>Part 6: Training LLaMA 3 on TPUs: <a href="https://jax-ml.github.io/scaling-book/applied-training/">scaling-book/applied-training</a></li>
+  <li>Part 7: All About Transformer Inference: <a href="https://jax-ml.github.io/scaling-book/inference/">scaling-book/inference</a></li>
+  <li>Part 8: Serving LLaMA 3-70B on TPUs: <a href="https://jax-ml.github.io/scaling-book/applied-inference/">scaling-book/applied-inference</a></li>
+  <li>Part 9: How to Profile and Debug TPU Programs: <a href="https://jax-ml.github.io/scaling-book/profiling/">scaling-book/profiling</a></li>
+  <li>Part 10: Programming TPUs in JAX: <a href="https://jax-ml.github.io/scaling-book/jax-stuff/">scaling-book/jax-stuff</a></li>
+  <li>Part 11: Conclusions and Further Reading: <a href="https://jax-ml.github.io/scaling-book/conclusion/">scaling-book/conclusion</a></li>
+  <li>Part 12: How to Scale Your Model on GPUs: <a href="https://jax-ml.github.io/scaling-book/gpus/">scaling-book/gpus</a></li>
+  <li>Efficiently Scaling Transformer Inference (Pope et al., 2022): <a href="https://arxiv.org/abs/2211.05102">arxiv.org/abs/2211.05102</a></li>
+  <li>GQA: Grouped-Query Attention (Ainslie et al., 2023): <a href="https://arxiv.org/abs/2305.13245">arxiv.org/abs/2305.13245</a></li>
+  <li>Multi-Query Attention (Shazeer, 2019): <a href="https://arxiv.org/abs/1911.02150">arxiv.org/abs/1911.02150</a></li>
+  <li>GLU Variants Improve Transformer (Shazeer, 2020): <a href="https://arxiv.org/abs/2002.05202">arxiv.org/abs/2002.05202</a></li>
+  <li>FlashAttention (Dao et al., 2022): <a href="https://arxiv.org/abs/2205.14135">arxiv.org/abs/2205.14135</a></li>
+  <li>DeepSeek-V3 Technical Report (2024): <a href="https://arxiv.org/abs/2412.19437">arxiv.org/abs/2412.19437</a></li>
+  <li>Attention Is All You Need (Vaswani et al., 2017): <a href="https://arxiv.org/abs/1706.03762">arxiv.org/abs/1706.03762</a></li>
+</ul></div>

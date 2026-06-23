@@ -1,0 +1,357 @@
+<p class="eyebrow">Chapter 01 · Who is training what, and what it costs</p>
+<h1>The mid-2026 frontier landscape: the runs, the silicon, the price tags, and where a 10T/200B bet sits</h1>
+<p class="lede">You are planning a <span class="f-norm">10T-total / 200B-active</span> MoE on <span class="f-mem">100,000 GB200</span> GPUs. As of mid-2026, almost nobody has done anything close — and the one party that has, did it at one-eighth your GPU count, one-twentieth your total parameters, and one-sixth your active budget. This chapter maps the whole distribution, run by run, with explicit confidence labels, and positions your target inside it.</p>
+<p class="byline"><span>~24 min read</span><span class="dot">6 figures</span><span class="dot">grounded in the MAI-Base-1 report &amp; Epoch estimates</span></p>
+<hr />
+
+<p>The single most useful fact for anyone planning a 10T-total / 200B-active MoE on 100,000 GB200 GPUs is that, as of mid-2026, <em>almost nobody has done anything close</em>, and the one party that has trained a from-scratch trillion-parameter MoE on production GB200 silicon — Microsoft AI, with <a href="https://microsoft.ai/pdf/mai-thinking-1.pdf">MAI-Base-1 / MAI-Thinking-1</a> — did it at one-eighth your GPU count, one-twentieth your total parameters, and one-sixth your active-parameter budget. The frontier you are joining is real, but the part of it that overlaps your exact target is a single 109-page technical report and a handful of leaked cluster-power numbers. Everything else is either (a) a closed Western run whose parameter counts are state secrets and whose compute must be inferred from energy and rack counts, or (b) a Chinese / Microsoft open(-ish)-weight run that publishes honest architecture tables but tops out an order of magnitude below your total-parameter target and 4–6× below your active-parameter target. This chapter maps that distribution run-by-run with explicit confidence labels, builds the comparison table you will return to repeatedly, and then positions your target inside it: which tier it sits in, who is nearest, and whether the configuration is plausible at all.</p>
+
+<div class="pull">The labs telling you <em>how</em> to train a trillion-parameter MoE are not the labs at the top of the leaderboard, and the labs at the top are telling you nothing. Your recipe must be assembled from the documented tier and extrapolated to a scale none of them have published.</div>
+
+<div class="stats">
+  <div class="stat" data-fam="norm"><div class="v">8,192<span class="u">GB200</span></div><div class="l">MAI-Base-1: the only on-substrate GB200 trillion-MoE</div></div>
+  <div class="stat" data-fam="mem"><div class="v">100k<span class="u">GPU</span></div><div class="l">your target cluster — ~12× MAI's</div></div>
+  <div class="stat" data-fam="moe"><div class="v">200B<span class="u">act</span></div><div class="l">~4–6× every shipped open MoE</div></div>
+  <div class="stat" data-fam="compute"><div class="v">0.45<span class="u">EF/s</span></div><div class="l">dense FP8 peak, 100k GPUs (not 1.0)</div></div>
+</div>
+
+<h2 id="bifurcation"><span class="sec-num">01</span>The bifurcation: closed-inferred vs. open-documented</h2>
+
+<p>By June 2026 the frontier has cleanly split into two epistemic regimes, and you must treat them differently.</p>
+
+<p>The <strong>Western closed-weight tier</strong> — OpenAI, Google DeepMind, Anthropic, xAI — publishes essentially no architecture. Parameter counts, token counts, and FLOP budgets are absent from every GPT-5.x release note, the <a href="https://storage.googleapis.com/deepmind-media/Model-Cards/Gemini-3-Pro-Model-Card.pdf">Gemini 3 Pro model card</a>, and every Claude release. What is knowable is <em>infrastructural</em>: cluster GPU counts, datacenter power envelopes, and chip-purchase contracts, all of which leak through supply-chain reporting, satellite imagery of buildouts, and energy filings. From those you reconstruct compute via the standard identity (FLOPs ≈ 6 × active-params × tokens, plus an RL multiplier), and groups like Epoch AI publish methodologically transparent estimates with 90% confidence intervals. For this tier, treat every parameter number as <span class="conf conf-rumored">rumor</span> and every compute number as <span class="conf conf-leaked">inferred</span> unless it carries an Epoch-style derivation.</p>
+
+<div class="formula"><span class="lbl">compute</span>
+  <span class="eq">pretrain FLOP ≈ 6 · active-params · tokens   (+ RL multiplier)</span>
+  <span class="note">The reconstruction identity for the closed tier. Note it tracks <em>active</em> params, not total — which is why trillion-total models with 32–37B active are small on a FLOP basis.</span></div>
+
+<p>The <strong>open-documented tier</strong> — DeepSeek, Qwen/Alibaba, Moonshot's Kimi, Zhipu's GLM, MiniMax, and Microsoft AI — publishes real architecture tables, and in DeepSeek's and MAI's cases publishes (or all-but-publishes) the training recipe down to optimizer betas and FP8 cast points. This tier is where your actual engineering evidence lives. The irony worth internalizing before you spend a billion dollars of compute: the labs telling you <em>how</em> to train a trillion-parameter MoE are not the labs at the top of the capability leaderboard, and the labs at the top are telling you nothing. Your recipe must be assembled from the documented tier and extrapolated to a scale none of them have published.</p>
+
+<figure class="fig" data-fig="compare">
+  <figcaption class="figcap"><b>Figure 1 — Two epistemic regimes.</b> The closed Western tier leaks infrastructure but hides architecture; the open tier hands you recipes but tops out an order of magnitude below your total-param target. Your evidence lives on the right; your scale lives off the right edge of it.
+    <span class="meta"><span>Regime · <b>mid-2026 frontier</b></span><span>Evidence · <b>release notes vs. tech reports</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "left":{"title":"Western closed-weight","fam":"comms","items":["OpenAI, Google DeepMind, Anthropic, xAI","no params / tokens / FLOPs published","knowable: GPUs, power, chip contracts","compute = inferred (Epoch-style, 90% CI)","treat params as rumor"]},
+    "right":{"title":"Open-documented","fam":"data","items":["DeepSeek, Qwen, Kimi, GLM, MiniMax, MAI","real architecture tables published","DeepSeek/MAI: recipe to betas + FP8 casts","this is where your evidence lives","tops out ~1.6T total / ~49B active"]},
+    "rows":[
+      {"k":"params disclosed","left":"no","right":"yes"},
+      {"k":"top of leaderboard","left":"yes","right":"no"},
+      {"k":"transferable recipe","left":"no","right":"yes"},
+      {"k":"at your scale","left":"unknown","right":"6× below total"}
+    ] }</script>
+</figure>
+
+<h2 id="mai"><span class="sec-num">02</span>The GB200 reference point: MAI-Base-1</h2>
+
+<p><a href="https://microsoft.ai/pdf/mai-thinking-1.pdf">MAI-Thinking-1 / MAI-Base-1</a> ("Building a Hill-Climbing Machine," Microsoft AI, 2 June 2026) is the load-bearing document of this entire field manual, because it is the only public, detailed report of a from-scratch trillion-parameter MoE trained on <strong>8,192 GB200 GPUs</strong> — your exact substrate, at 8% of your scale. Confirmed specifics:</p>
+
+<div class="tcards">
+  <div class="tcard" data-fam="moe"><div class="tn">sparsity</div><div class="ts">35B act / 1T total</div><div class="tm">decoder-only MoE, 8 of 512 experts/token in a compressed latent space, softmax gating.</div></div>
+  <div class="tcard" data-fam="norm"><div class="tn">layer pattern</div><div class="ts">dense ↔ high-sparsity MoE</div><div class="tm">alternating, first FFN layer dense — not uniform medium-sparsity. Ablated and defended.</div></div>
+  <div class="tcard" data-fam="attn"><div class="tn">attention</div><div class="ts">5:1 local:global</div><div class="tm">SWA-512 + RoPE-10k local, NoPE global → clean FlashAttention-4 + Ulysses CP.</div></div>
+  <div class="tcard" data-fam="data"><div class="tn">tokens</div><div class="ts">30T + 3.55T mid</div><div class="tm">64K then 256K context phases, 256K final context.</div></div>
+</div>
+
+<ul>
+  <li><strong>35B active / 1T total</strong> sparse decoder-only MoE, activating <strong>8 of 512 experts</strong> per token in a compressed latent space with softmax gating.</li>
+  <li><strong>Alternating dense-FFN and high-sparsity-MoE layers</strong> (first FFN layer dense), rather than the uniform medium-sparsity stacking most open MoEs use — an architecture choice the report ablates and defends.</li>
+  <li><strong>Interleaved 5:1 local:global attention</strong>: <span class="k k-attn">sliding-window-512</span> with RoPE base 10k on local layers, <strong>NoPE (no positional encoding) on global layers</strong>, which is what lets them run <span class="f-attn">FlashAttention-4</span> and Ulysses context parallelism cleanly.</li>
+  <li><strong>30T-token main pretrain</strong> + <strong>3.55T tokens of mid-training</strong> (64K then 256K context phases), 256K final context.</li>
+  <li>Numerics: <strong>BF16 master weights, <span class="f-prec">FP8 E4M3</span> for the forward GEMM, <span class="f-prec">FP8 E5M2</span> for the data-gradient, BF16 weight-gradient with FP32 accumulation</strong>, delayed scaling.</li>
+  <li>Parallelism: <strong>expert-parallel 64 + ZeRO-2</strong> for pretrain and mid-training phase 1, <strong>ZeRO-3 / FSDP</strong> for mid-training phase 2, context parallelism for the long-context phases.</li>
+  <li><strong>Global batch 134M tokens</strong>; AdamW with <strong>β1 = 0.95, β2 = 0.925</strong>, peak LR 2e-4 → 2e-5 cosine, ~12B-token warmup. The unusually low β2 is itself a stability signal worth noting.</li>
+  <li>A custom <strong>"YOLO" training framework</strong> with Triton/CUDA/CuteDSL/CUTLASS <span class="f-prec">FP8</span> grouped-GEMM kernels for the 512-expert layer, and a full "Cluster Environment" section dedicated to goodput.</li>
+</ul>
+
+<div class="code-cap">yaml — MAI-Base-1 recipe, transcribed to a MaxText-style config (illustrative)</div>
+<pre class="code"><code># --- architecture ---
+num_experts: 512
+num_experts_per_tok: 8          # 8 of 512 routed
+first_ffn_layer_dense: true     # alternating dense <-> high-sparsity MoE
+attention_local_global_ratio: "5:1"
+local_attention: { type: sliding_window, window: 512, rope_base: 10000 }
+global_attention: { type: nope }   # no positional encoding on global layers
+
+# --- numerics (delayed scaling) ---
+master_weight_dtype: bfloat16
+fwd_gemm_dtype: float8_e4m3       # forward GEMM
+dgrad_dtype:    float8_e5m2       # data-gradient
+wgrad_dtype:    bfloat16          # weight-gradient, FP32 accumulation
+fp32_accum: true
+
+# --- optimizer / schedule ---
+optimizer: adamw
+adam_b1: 0.95
+adam_b2: 0.925                    # unusually low -> stability signal
+lr_peak: 2.0e-4
+lr_end:  2.0e-5                   # cosine
+warmup_tokens: 12_000_000_000     # ~12B
+global_batch_tokens: 134_000_000  # 134M
+
+# --- parallelism ---
+phase_pretrain:    { expert_parallel: 64, zero: 2 }
+phase_midtrain_p1: { expert_parallel: 64, zero: 2 }
+phase_midtrain_p2: { zero: 3, fsdp: true, context_parallel: true }
+</code></pre>
+
+<p>Three disclosures are strategically decisive for your planning. First, MAI deliberately <strong>over-trains at 500–1000 tokens-per-active-parameter (TPP)</strong> — a 35B-active model on 30T tokens is ~857 TPP — versus Chinchilla-optimal ~20 and their own 100–200 TPP ablation ladder, trading training compute for inference cheapness. Second, <strong>no distillation, no LM-generated synthetic data, no open training sets</strong> — a deliberately clean-data stance that flags clean-token scarcity as the binding constraint at scale. Third, an <strong>attention-output zero-initialization trick</strong> to fix early MoE router imbalance, a cheap stability fix you should adopt on day one. Reported benchmarks: 52.8% SWE-Bench Pro, 97.0% AIME 2025, 87.7% LiveCodeBench v6. This is the recipe to clone and scale; the rest of the landscape tells you which knobs to turn as you 5–8× it.</p>
+
+<div class="callout key"><div class="ct">The one report to read cover-to-cover</div>
+  <p>MAI-Base-1 is your exact substrate (GB200) at 8% of your scale, with the recipe published to optimizer betas and FP8 cast points. Clone it and scale: attention-output zero-init from day one, dense+MoE interleaving, FP8 E4M3 forward / E5M2 dgrad with FP32 accum, EP=64. Everything else in this chapter tells you which knobs to turn as you 5–8× it.</p></div>
+
+<h2 id="western"><span class="sec-num">03</span>The Western closed tier (compute inferred)</h2>
+
+<h3 id="openai">OpenAI GPT-5.x</h3>
+<p>GPT-5 launched 7 August 2025. Epoch AI's best estimate puts it at <strong>~3e25 FLOP pretraining and ~5e25 FLOP total</strong> (RL contributing 10–200% of pretrain), built on an assumed <strong>~100B active params</strong> and <strong>≥30T tokens</strong> — and critically, <em>below</em> GPT-4.5's &gt;1e26 FLOP (<a href="https://epochai.substack.com/p/notes-on-gpt-5-training-compute">Epoch</a>). The clearest public read on the frontier's strategic shift: OpenAI traded raw pretraining scale for a smaller, over-trained, RL-heavy model. By June 2026 the line has iterated through GPT-5.1 toward GPT-5.5, trained at the <strong>Abilene "Stargate I"</strong> site (Oracle/OCI, GB200 NVL72 racks, ~1.2 GW planned, energized September 2025). Circulating 3–5T total-param claims are <span class="conf conf-rumored">rumor</span>.</p>
+
+<h3 id="gemini">Google Gemini 2.5 → 3 / 3.1</h3>
+<p>Gemini 3 Pro released 18 November 2025 (LMArena 1501 Elo, HLE 37.5% no-tools, GPQA-Diamond 91.9%). The <a href="https://storage.googleapis.com/deepmind-media/Model-Cards/Gemini-3-Pro-Model-Card.pdf">model card</a> confirms a <strong>sparse, natively-multimodal MoE trained on Google TPUs via JAX/Pathways</strong> but discloses <strong>no parameter count, token count, or FLOPs</strong> — Google's consistent posture across the 2.5/3 line. Training ran on <strong>TPU v5e + v6e (Trillium)</strong> pods on the Jupiter fabric (&gt;13 Pb/s bisection, &gt;100k-chip pods). "Deep Think" is a test-time-compute mode, not a separate pretrain. Widely-guessed 500B+ total / 50–100B active is <span class="conf conf-rumored">rumor</span>. The relevance to you: Gemini proves a hyperscaler can run frontier MoE pretraining at &gt;100k-accelerator scale, but on a non-NVIDIA fabric whose collective-communication economics differ fundamentally from your NVLink-domain GB200 racks.</p>
+
+<h3 id="anthropic">Anthropic Claude Opus 4.x</h3>
+<p>Zero parameter/token/FLOP disclosure anywhere. The confirmable facts are infrastructural: <strong>Project Rainier</strong>, AWS's ~<strong>500,000 Trainium2</strong> cluster, is online and training Claude; Anthropic states it now uses <strong>&gt;1M Trainium2 chips</strong> and has contracted (Nov 2025, expanded 2026) for <strong>up to 5 GW</strong> of Trainium2/3 capacity, with Rainier providing "more than 5×" the training compute of prior Claude models (<a href="https://www.anthropic.com/news/anthropic-amazon-compute">Anthropic</a>). Opus 4.6 is the SWE-Bench-Pro comparison target that MAI and others cite. Architecture is entirely <span class="conf conf-rumored">undisclosed</span>. Like Gemini, this is a non-NVIDIA datapoint — a proof of frontier scale, not a transferable recipe.</p>
+
+<h3 id="xai">xAI Grok 3/4 (Colossus)</h3>
+<p>The best-documented Western <em>compute</em> story. <strong>Colossus (Memphis)</strong> stood up 100k H100 in 122 days and doubled to ~200k mixed H100/H200/GB200 in 92 days; by December 2025 the mix was reportedly ~150k H100 + 50k H200 + 30k GB200, with <strong>Colossus 2</strong> scaling toward <strong>~110k GB200 NVL72 and ~1.1 GW</strong> and the broader site reportedly ~555k GPUs / ~2 GW by early 2026 (<a href="https://newsletter.semianalysis.com/p/xais-colossus-2-first-gigawatt-datacenter">SemiAnalysis</a>; <span class="conf conf-leaked">leaked/estimated</span>). The headline for <strong>Grok 4</strong> (July 2025): xAI claims <strong>RL compute on the same order of magnitude as pretraining</strong> — a ~10× RL scale-up over Grok 3, RL ≈ 50% of the training budget (<a href="https://x.ai/news/grok-4">xAI</a>) — the cleanest public signal that the frontier RL:pretrain ratio is approaching 1:1. Epoch AI estimates Grok 4 at <strong>~246M H100-hours, ~310 GWh, median ~$490M, ~154,000 t CO₂</strong>, with large explicit uncertainty (<a href="https://epoch.ai/data-insights/grok-4-training-resources">Epoch</a>). Colossus 2 is, crucially, the <em>only</em> ~100k-GB200-class cluster actually being stood up in the West — it is your closest real-world infrastructure analog, and the SemiAnalysis power-buildout reconstruction is the most concrete reference you have for the datacenter side of a 100k-GB200 deployment.</p>
+
+<div class="callout note"><div class="ct">The RL:pretrain ratio is approaching 1:1</div>
+  <p>Grok 4's ~10× RL scale-up (RL ≈ 50% of budget) and GPT-5's ~5e25 total vs ~3e25 pretrain are the two cleanest signals that RL is no longer an afterthought. When you budget your own run, the RL stage is a first-class line item, not a tail.</p></div>
+
+<h2 id="llama4"><span class="sec-num">04</span>Meta Llama 4: the cautionary tale at your scale</h2>
+
+<p>Llama 4 (April 2025) shipped <strong>Scout</strong> (109B total / <strong>17B active</strong>, 16 experts) and <strong>Maverick</strong> (~400B total / <strong>17B active</strong>, 128 experts), both on <strong>&gt;30T tokens across 200 languages</strong> (<a href="https://venturebeat.com/ai/metas-answer-to-deepseek-is-here-llama-4-launches-with-long-context-scout-and-maverick-models-and-2t-parameter-behemoth-on-the-way">VentureBeat</a>). But the model that matters to you is <strong>Behemoth — ~2T total / 288B active</strong> — Meta's frontier teacher, which as of mid-2026 is consistently reported <strong>shelved / never shipped</strong>, with mid-training <strong>MoE-routing and chunked-attention instabilities at 2T scale</strong> cited as why Meta lost confidence (<span class="conf conf-leaked">leaked/rumor</span>, but reported by multiple outlets). This is the single most important cautionary datapoint in the entire landscape for your target. Behemoth's <strong>288B active is the only shipped-or-attempted active-parameter budget comparable to your 200B</strong>, and it <em>did not ship</em> — and it failed on exactly the two axes (<span class="f-moe">routing stability</span>, <span class="f-attn">attention stability</span>) that dominate trillion-parameter MoE risk. Read Behemoth not as "2T is impossible" but as "2T total with ~290B active, attempted without the MAI/Kimi stability stack, broke." Your job is to not repeat it.</p>
+
+<div class="callout warn"><div class="ct">The only 288B-active attempt did not ship <span class="conf conf-leaked">leaked/rumor</span></div>
+  <p>Behemoth (2T/288B) is the single closest precedent to your 200B-active bet, and it was abandoned on routing + chunked-attention instability at 2T scale — the exact two failure modes that dominate trillion-MoE risk. Do not interpret this as "2T is impossible"; interpret it as "this scale, attempted without the MAI attention-zero-init / Kimi MuonClip stability stack, broke."</p></div>
+
+<h2 id="deepseek"><span class="sec-num">05</span>DeepSeek V3 → V4: the efficiency frontier</h2>
+
+<p>DeepSeek defines the cheap-frontier datapoint everyone calibrates against. <strong>V3</strong> (December 2024): <strong>671B total / 37B active</strong>, <strong>14.8T tokens</strong>, <strong>2,788,000 H800 GPU-hours ≈ $5.576M</strong> marginal compute cost — all confirmed in the <a href="https://arxiv.org/abs/2412.19437">technical report</a>. That run is also the most honest public <em>MoE-at-scale efficiency anchor</em> you have: derived from the published GPU-hours it lands at <strong>~21.4% FP8 MFU (~42.9% BF16-equivalent), ~424 effective TFLOP/s/GPU</strong> over a full 14.8T-token run — a number that should weight far above any short MLPerf dense-405B sprint when you forecast your own sustained throughput.</p>
+
+<p><strong>V4</strong> (released 24 April 2026, MIT): <strong>V4-Pro 1.6T total / 49B active</strong>, <strong>V4-Flash 284B / 13B active</strong>, both with <strong>1M context</strong>, both reportedly trained on <strong>&gt;32T tokens</strong> (<span class="conf conf-leaked">leaked</span> — DeepSeek published no token count, optimizer, hardware, or cost for V4) (<a href="https://www.morphllm.com/deepseek-v4">Morph</a>). The architectural pivot is the open-weight playbook for cheap 1M context: from V3's <span class="k k-attn">MLA</span>, through V3.2's <strong>DeepSeek Sparse Attention (DSA)</strong>, to V4's <strong>hybrid Compressed Sparse Attention + Heavily Compressed Attention</strong> with top-k compressed-token selection plus a 128-token uncompressed local window, KV compressed ~4× along sequence. V4-Pro-Max reportedly hits ~80.6% SWE-Bench Verified. For your long-context mid-training phase, DSA-lineage attention is the technique to lift; V4-Pro at 1.6T/49B is also the largest <em>shipped</em> open MoE total-param count, and still 6× below your total target.</p>
+
+<div class="callout do"><div class="ct">Lift DSA-lineage attention for the long-context phase</div>
+  <p>V3 MLA → V3.2 DSA → V4 hybrid Compressed Sparse + Heavily Compressed Attention (top-k compressed-token selection + 128-token uncompressed local window, KV ~4× compressed along sequence) is the open-weight playbook for cheap 1M context. This is the technique to clone for your 256K+ mid-training phases.</p></div>
+
+<h2 id="chinese"><span class="sec-num">06</span>The Chinese open-weight cohort</h2>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Model</th><th class="num">Total</th><th class="num">Active</th><th>Experts</th><th class="num">Tokens</th><th>Notable</th></tr></thead>
+  <tbody>
+    <tr><td><b>Qwen3</b> (May 2025)</td><td class="num">235B</td><td class="num">22B</td><td>8/token</td><td class="num">~36T</td><td>119 langs, 262K ctx, Apache-2.0 (<a href="https://arxiv.org/abs/2505.09388">arXiv</a>)</td></tr>
+    <tr><td><b>Qwen3-Max</b> (Sept 2025)</td><td class="num">&gt;1T</td><td class="num">—</td><td>—</td><td class="num">36T</td><td>proprietary</td></tr>
+    <tr><td><b>Qwen3.5-397B-A17B</b> (2026)</td><td class="num">397B</td><td class="num">17B</td><td>—</td><td class="num">—</td><td>reportedly beats Qwen3-Max at a fraction of cost</td></tr>
+    <tr><td><b>Kimi K2</b> (Moonshot, 2025)</td><td class="num">1T</td><td class="num">32B</td><td>384 (8 routed + 1 shared)</td><td class="num">15.5T</td><td><b>MuonClip, zero loss spikes</b> (<a href="https://huggingface.co/moonshotai/Kimi-K2-Base">HF</a>)</td></tr>
+    <tr><td><b>GLM-4.6</b> (Zhipu, Sept 2025)</td><td class="num">355B</td><td class="num">32B</td><td>—</td><td class="num">23T</td><td>loss-free sigmoid-gate balancing</td></tr>
+    <tr><td><b>GLM-5</b> <span class="conf conf-leaked">leaked</span></td><td class="num">744B</td><td class="num">—</td><td>—</td><td class="num">—</td><td><b>leaked</b></td></tr>
+    <tr><td><b>MiniMax-M2</b> (2026)</td><td class="num">229.9B</td><td class="num">9.8B</td><td>—</td><td class="num">29.2T</td><td>62-layer, 192K ctx, ~4% activation</td></tr>
+  </tbody>
+  <caption>The open cohort: honest architecture tables, all an order of magnitude below your 10T total. Sources inline.</caption>
+</table></div>
+
+<p>Two of these are decision-relevant beyond the table. <strong>Kimi K2</strong> is the strongest existence proof that a non-AdamW optimizer can stabilize trillion-parameter MoE pretraining: <strong>1T total / 32B active, 384 experts, 15.5T tokens, <span class="f-optim">MuonClip</span> optimizer, reported zero loss spikes at unprecedented scale</strong> (<a href="https://huggingface.co/moonshotai/Kimi-K2-Base">HF</a>). MuonClip is a live alternative to MAI's AdamW + attention-zero-init recipe and the most important optimizer datapoint of the year. <strong>Alibaba's trajectory</strong> is the clearest statement of the prevailing efficiency trend: having crossed 1T with Qwen3-Max, they appear to be <strong>walking back from the 1T total</strong> toward sparser, cheaper configs (Qwen3.5-397B-A17B reportedly beating Qwen3-Max). And <strong>MiniMax-M2's ~4% activation ratio</strong> (9.8B/229.9B), alongside V4-Flash's 4.6% and Qwen3's 9%, marks the direction the entire field is moving: <em>down</em> in activation ratio, toward cheaper inference — which is the precise direction your 200B-active bet runs against.</p>
+
+<figure class="fig" data-fig="bars">
+  <figcaption class="figcap"><b>Figure 2 — Active-parameter budgets across the shipped frontier.</b> Every shipped open MoE clusters at 10–37B active; your 200B is ~4–6× the next-highest, and the only comparable number (Behemoth 288B) was cancelled. The dashed line is your target.
+    <span class="meta"><span>Regime · <b>active params, B</b></span><span>Evidence · <b>tech reports + leaks</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "ylabel":"active params (B)","max":320,
+    "bars":[
+      {"label":"MiniMax-M2","value":9.8,"fam":"moe"},
+      {"label":"DeepSeek\nV4-Flash","value":13,"fam":"moe"},
+      {"label":"Llama 4\nMaverick","value":17,"fam":"data"},
+      {"label":"Qwen3","value":22,"fam":"data"},
+      {"label":"Kimi K2","value":32,"fam":"optim"},
+      {"label":"MAI-Base-1","value":35,"fam":"norm"},
+      {"label":"DeepSeek-V3","value":37,"fam":"compute"},
+      {"label":"DeepSeek\nV4-Pro","value":49,"fam":"compute"},
+      {"label":"Llama 4\nBehemoth†","value":288,"fam":"comms"}
+    ],
+    "ref":{"y":200,"label":"YOUR TARGET — 200B"} }</script>
+</figure>
+
+<figure class="fig" data-fig="line">
+  <figcaption class="figcap"><b>Figure 3 — The field is moving down in activation ratio; you are moving up.</b> MiniMax ~4%, V4-Flash 4.6%, Qwen3 9% — the prevailing trend is toward cheaper inference. Your 200B/10T is 2% total sparsity but a very heavy <em>absolute</em> per-token compute load, running against the grain.
+    <span class="meta"><span>Regime · <b>activation ratio = active/total</b></span><span>Evidence · <b>shipped configs</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "xlabel":"total params (B)","ylabel":"activation ratio (%)","logx":true,
+    "series":[
+      {"name":"shipped open MoEs","fam":"moe","pts":[[229.9,4.3],[284,4.6],[235,9.4],[355,9.0],[671,5.5],[1000,3.2],[1600,3.1]]},
+      {"name":"your target","fam":"norm","dash":true,"pts":[[10000,2.0]]}
+    ],
+    "annotations":[{"x":229.9,"y":4.3,"text":"MiniMax ~4%"},{"x":10000,"y":2.0,"text":"10T/200B = 2% total, heavy absolute"}] }</script>
+</figure>
+
+<h2 id="master-table"><span class="sec-num">07</span>The master comparison table</h2>
+
+<p>Confidence: <span class="conf conf-confirmed">C</span> = confirmed in primary report, <span class="conf conf-leaked">L</span> = leaked / secondary-source, <span class="conf conf-rumored">R</span> = rumored, <span class="conf conf-leaked">I</span> = independently inferred (Epoch-style).</p>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Model</th><th class="num">Total</th><th class="num">Active</th><th class="num">Tokens</th><th>Cluster / HW</th><th class="num">Pretrain FLOP</th><th class="num">Cost</th><th>Conf.</th></tr></thead>
+  <tbody>
+    <tr><td><b>MAI-Base-1</b></td><td class="num">1T</td><td class="num">35B</td><td class="num">30T (+3.55T mid)</td><td>8,192 GB200</td><td class="num">~6.3e24†</td><td class="num">n/d</td><td><span class="conf conf-confirmed">C</span></td></tr>
+    <tr><td><b>GPT-5</b></td><td class="num">~100B act (R)</td><td class="num">~100B</td><td class="num">≥30T</td><td>Stargate/Abilene GB200</td><td class="num">~3e25 (~5e25 total)</td><td class="num">n/d</td><td><span class="conf conf-leaked">I</span></td></tr>
+    <tr><td><b>Gemini 3 Pro</b></td><td class="num">500B+ (R)</td><td class="num">50–100B (R)</td><td class="num">n/d</td><td>TPU v5e/v6e, Jupiter</td><td class="num">n/d</td><td class="num">n/d</td><td><span class="conf conf-rumored">R</span></td></tr>
+    <tr><td><b>Claude Opus 4.x</b></td><td class="num">n/d</td><td class="num">n/d</td><td class="num">n/d</td><td>Rainier, &gt;1M Trainium2</td><td class="num">n/d</td><td class="num">n/d</td><td><span class="conf conf-confirmed">C</span> (HW only)</td></tr>
+    <tr><td><b>Grok 4</b></td><td class="num">n/d</td><td class="num">n/d</td><td class="num">n/d</td><td>Colossus ~200k mixed</td><td class="num">~246M H100-hr</td><td class="num">~$490M</td><td><span class="conf conf-leaked">I</span></td></tr>
+    <tr><td><b>Llama 4 Maverick</b></td><td class="num">~400B</td><td class="num">17B</td><td class="num">&gt;30T</td><td>Meta H100</td><td class="num">~4e24†</td><td class="num">n/d</td><td><span class="conf conf-confirmed">C</span></td></tr>
+    <tr><td><b>Llama 4 Behemoth</b></td><td class="num">~2T</td><td class="num">288B</td><td class="num">n/d</td><td>Meta</td><td class="num">— (shelved)</td><td class="num">—</td><td><span class="conf conf-leaked">L</span> (shelved)</td></tr>
+    <tr><td><b>DeepSeek-V3</b></td><td class="num">671B</td><td class="num">37B</td><td class="num">14.8T</td><td>2,048 H800</td><td class="num">~3.3e24†</td><td class="num">$5.576M</td><td><span class="conf conf-confirmed">C</span></td></tr>
+    <tr><td><b>DeepSeek-V4-Pro</b></td><td class="num">1.6T</td><td class="num">49B</td><td class="num">&gt;32T (L)</td><td>n/d</td><td class="num">~9.4e24†</td><td class="num">n/d</td><td><span class="conf conf-leaked">L</span></td></tr>
+    <tr><td><b>Qwen3 flagship</b></td><td class="num">235B</td><td class="num">22B</td><td class="num">~36T</td><td>n/d</td><td class="num">~4.8e24†</td><td class="num">n/d</td><td><span class="conf conf-confirmed">C</span></td></tr>
+    <tr><td><b>Qwen3-Max</b></td><td class="num">&gt;1T</td><td class="num">n/d</td><td class="num">36T</td><td>n/d</td><td class="num">n/d</td><td class="num">n/d</td><td><span class="conf conf-confirmed">C</span> (params)</td></tr>
+    <tr><td><b>Kimi K2</b></td><td class="num">1T</td><td class="num">32B</td><td class="num">15.5T</td><td>n/d (MuonClip)</td><td class="num">~3.0e24†</td><td class="num">n/d</td><td><span class="conf conf-confirmed">C</span></td></tr>
+    <tr><td><b>GLM-4.6</b></td><td class="num">355B</td><td class="num">32B</td><td class="num">23T</td><td>n/d</td><td class="num">~4.4e24†</td><td class="num">n/d</td><td><span class="conf conf-confirmed">C</span></td></tr>
+    <tr><td><b>MiniMax-M2</b></td><td class="num">229.9B</td><td class="num">9.8B</td><td class="num">29.2T</td><td>n/d</td><td class="num">~1.7e24†</td><td class="num">n/d</td><td><span class="conf conf-confirmed">C</span></td></tr>
+    <tr><td><b>— YOUR TARGET —</b></td><td class="num"><b>10T</b></td><td class="num"><b>200B</b></td><td class="num"><b>20–60T</b></td><td><b>100k GB200</b></td><td class="num"><b>2.4e25–7.2e25†</b></td><td class="num"><b>$B-scale</b></td><td>plan</td></tr>
+  </tbody>
+  <caption>† Pretrain FLOP estimated as 6 × active-params × tokens; excludes RL. "n/d" = not disclosed.</caption>
+</table></div>
+
+<div class="callout note"><div class="ct">Why the trillion-total models look "small" on FLOPs</div>
+  <p>On a <em>FLOP</em> basis (which tracks active params, not total) MAI-Base-1, DeepSeek-V3, and Kimi K2 are all small — ~3–6e24 — despite their trillion-parameter totals, because their active budgets are 32–37B. This is the central tension your config inverts: you are pushing the axis (active params) that actually drives both training FLOPs and inference cost.</p></div>
+
+<h2 id="positioning"><span class="sec-num">08</span>Positioning the 10T / 200B / 100k-GB200 target</h2>
+
+<h3 id="pos-total">Total parameters</h3>
+<p>Your <strong>10T total</strong> is ~6× DeepSeek-V4-Pro (1.6T), ~5–10× Kimi K2 / Qwen3-Max (1T), and ~5× the <em>shelved</em> Llama-4 Behemoth (2T). It would be the largest dense-equivalent capacity ever attempted by a wide margin — roughly <strong>one order of magnitude above the largest shipped open MoE in total params</strong>. No one has publicly shipped past ~1.6T total; the only attempt past 2T (Behemoth) was abandoned. You are, in total-parameter terms, off the right edge of the entire distribution.</p>
+
+<h3 id="pos-active">Active parameters — the real outlier</h3>
+<p>Your <strong>200B active</strong> is the genuinely radical bet. It is <strong>~4–6× the active budget of every shipped open MoE</strong> (V4-Pro 49B, K2 32B, MAI 35B, Qwen3 22B) and comparable <em>only</em> to Behemoth's 288B-active teacher, which did not ship. Meanwhile the field has spent all of 2025–2026 <em>lowering</em> activation ratios (MiniMax ~4%, V4-Flash 4.6%, Qwen3 9%). Your configuration is <strong>2% sparsity in total terms</strong> (200B/10T — sparser than most) but a <strong>very heavy per-token compute load</strong> in absolute terms. Active params drive both training FLOPs <em>and</em> inference cost; choosing 200B active is a deliberate, expensive bet against the prevailing efficiency trend, justified only if you believe per-token capability at that active budget buys capability the sparser configs cannot reach. This is the decision to interrogate hardest before committing.</p>
+
+<div class="callout key"><div class="ct">The one decision to interrogate hardest</div>
+  <p>200B active is the single contrarian bet in your whole plan. It is the only axis where you are off the distribution in a direction the field is actively retreating from, and the only comparable number was cancelled for instability. It is justified <em>only</em> if you believe per-token capability at 200B active buys something the sparser configs cannot reach.</p></div>
+
+<h3 id="pos-compute">Compute budget — corrected hardware math</h3>
+<p>Be careful with the GB200 NVL72 spec sheet: NVIDIA's headline <strong>720 PFLOP/s FP8 / 360 PFLOP/s BF16 per 72-GPU rack</strong> are <strong>with-sparsity (2:4)</strong> figures — the <a href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">GB200 NVL72 page</a> footnotes "Dense is one-half sparse spec shown." For ordinary dense training FLOPs the meaningful peaks are <strong>360 PFLOP/s FP8 and 180 PFLOP/s BF16 per rack</strong>, i.e. <strong>~4.5 PFLOP/s dense FP8 / ~2.25 PFLOP/s dense BF16 per B200 GPU</strong>. Consequently a <strong>100,000-GPU cluster is ~0.45 EFLOP/s dense FP8 peak</strong>, <em>not</em> the ~1.0 EFLOP/s you get only by counting sparsity. Derate this hard for MFU. Realistic <em>sustained</em> large-MoE FP8 MFU on GB200 in 2025–2026 sits in the <strong>~20–35% band</strong> — the DeepSeek-V3 floor is ~21% FP8 and well-tuned dense frameworks ceiling near ~47% (<a href="https://newsletter.semianalysis.com/p/h100-vs-gb200-nvl72-training-benchmarks">SemiAnalysis</a>) — with heavy routing and expert-parallel all-to-all dragging real MoE numbers toward the bottom of that range. At ~35% MFU on ~0.45 EFLOP/s dense FP8 you sustain roughly <strong>0.16 EFLOP/s</strong>.</p>
+
+<div class="formula"><span class="lbl">compute</span>
+  <span class="eq">100k × 4.5 PF/s = 0.45 EF/s dense FP8 × ~35% MFU ≈ 0.16 EF/s sustained</span>
+  <span class="note">The headline 720 PF/s/rack is a <em>with-sparsity</em> number; dense is one-half. Quote against 0.45, not 1.0, then derate hard for MFU.</span></div>
+
+<div class="codecard">
+  <div class="src-meta"><span class="file">forecast/gb200_throughput.py</span><span class="tag">corrected dense-FP8 math</span><span class="tag">illustrative</span></div>
+  <div class="annot-grid">
+<pre class="code"><code>GPUS            = 100_000
+DENSE_FP8_PFLOP = 4.5            # per B200; sparse spec (9.0) halved   # [1]
+peak_ef         = GPUS * DENSE_FP8_PFLOP / 1e3        # PF -> EF = 0.45 EF/s
+
+# sustained large-MoE FP8 MFU: ~20-35% band (V3 floor ~21%, ceiling ~47%)
+for mfu in (0.21, 0.35):                                                # [2]
+    print(f"MFU {mfu:4.0%}: {peak_ef * mfu:.3f} EFLOP/s sustained")
+# MFU  21%: 0.095 EFLOP/s
+# MFU  35%: 0.158 EFLOP/s   <- ~0.16 EF/s
+
+def wallclock_days(tokens_T, active_B=200, sustained_ef=0.158):         # [3]
+    flop = 6 * active_B * 1e9 * tokens_T * 1e12       # 6 * A * D
+    return flop / (sustained_ef * 1e18) / 86_400      # compute-only LOWER bound
+
+for T in (20, 30, 60, 85):
+    print(f"{T:>3}T tok: {wallclock_days(T):4.1f} days (floor)")        # [4]
+# 20T: 1.7 | 30T: 2.6 | 60T: 5.2 | 85T: 7.4
+</code></pre>
+    <div class="annot-list">
+      <div class="annot"><p><span class="badge">1</span><span class="anh">Halve the spec sheet.</span> NVIDIA's 9.0 PFLOP/s FP8 per B200 is a 2:4-sparsity number; dense training sees one-half — so 100k GPUs is 0.45 EF/s, not the ~1.0 EF/s you get only by counting sparsity.</p></div>
+      <div class="annot"><p><span class="badge">2</span><span class="anh">Derate hard for MFU.</span> Sustained large-MoE FP8 MFU sits in the ~20–35% band — the V3 floor is ~21%, dense ceilings near ~47%; heavy routing + EP all-to-all drag real MoE toward the bottom.</p></div>
+      <div class="annot"><p><span class="badge">3</span><span class="anh">6·A·D, active not total.</span> Training FLOP ≈ 6 × active-params × tokens — it tracks the 200B active budget, not the 10T total. RL is excluded and stacks on top.</p></div>
+      <div class="annot"><p><span class="badge">4</span><span class="anh">A lower bound, not a schedule.</span> These are compute-only floors; real wall-clock is multiples higher once checkpoint/restart, fault recovery, NVLink blast-radius, and the GB200 software ramp are added.</p></div>
+    </div>
+  </div>
+</div>
+
+<figure class="fig" data-fig="membar">
+  <figcaption class="figcap"><b>Figure 4 — Quote against the dense peak, not the sparse one.</b> The spec-sheet "1.0 EFLOP/s" for 100k GPUs is a 2:4-sparsity number; dense FP8 is one-half (0.45 EF/s), and after a realistic ~35% MoE MFU you sustain ~0.16 EF/s. Toggle the dtype to see BF16's further halving.
+    <span class="meta"><span>Regime · <b>100k GB200, dense vs sparse vs sustained</b></span><span>Evidence · <b>NVIDIA footnote + SemiAnalysis MFU</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "paramsB":100,"activGB":100,"optBytes":8,
+    "dtypes":[{"id":"fp8","w":1,"label":"FP8 dense"},{"id":"bf16","w":2,"label":"BF16 dense"}],
+    "parts":[
+      {"label":"spec sheet (2:4 sparse)","perParam":1,"fam":"comms"},
+      {"label":"dense peak (½ sparse)","perParam":"w","fam":"compute"},
+      {"label":"after ~35% MFU","perParam":0.35,"fam":"moe"}
+    ],
+    "note":"Headline EFLOP/s is a sparsity number; quote dense, then derate for MFU." }</script>
+</figure>
+
+<p>Training FLOPs ≈ 6 × active-params × tokens. For 200B active:</p>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th class="num">Tokens</th><th class="num">Pretrain FLOP</th><th>vs. frontier</th><th class="num">Wall-clock @ ~0.16 EF/s sustained</th></tr></thead>
+  <tbody>
+    <tr><td class="num">20T</td><td class="num">~2.4e25</td><td>≈ GPT-5 pretrain</td><td class="num">~1.7 days*</td></tr>
+    <tr><td class="num">30T</td><td class="num">~3.6e25</td><td>~1.2× GPT-5 pretrain</td><td class="num">~2.6 days*</td></tr>
+    <tr><td class="num">60T</td><td class="num">~7.2e25</td><td>approaching GPT-4.5</td><td class="num">~5.2 days*</td></tr>
+    <tr><td class="num">~85T</td><td class="num">~1.0e26</td><td>GPT-4.5 territory</td><td class="num">~7.4 days*</td></tr>
+  </tbody>
+  <caption>*Compute-only lower bounds; real wall-clock is multiples higher (see below).</caption>
+</table></div>
+
+<figure class="fig" data-fig="timeline">
+  <figcaption class="figcap"><b>Figure 5 — A 30T-token run, where the time actually goes.</b> The compute-only floor (~2.6 days) is a small fraction of real wall-clock once checkpoint/restart, fault recovery, NVLink-domain blast-radius, optimizer churn, and the GB200 software-maturity ramp are stacked on.
+    <span class="meta"><span>Regime · <b>10T/200B, 30T tokens, 100k GB200</b></span><span>Evidence · <b>SemiAnalysis GB200 cautions</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "segments":[
+      {"label":"compute floor","frac":22,"fam":"compute","sub":"~2.6 days"},
+      {"label":"checkpoint / restart + fault recovery","frac":28,"fam":"mem","sub":"NVL* blast-radius"},
+      {"label":"NVLink-backplane reliability tax","frac":22,"fam":"comms","sub":"72-GPU failure domain"},
+      {"label":"software-maturity ramp","frac":28,"fam":"data","sub":"GB200 still demands it"}
+    ] }</script>
+</figure>
+
+<p>*Compute-only lower bounds; real wall-clock is multiples higher once you add checkpoint/restart, fault recovery, the NVLink-domain failure blast-radius, optimizer-state churn, and the multi-month software-maturity ramp GB200 still demands. SemiAnalysis cautioned in late 2025 that <strong>no large-scale training run had yet completed on GB200 NVL72</strong>, blocked by software immaturity and NVLink-backplane reliability (the whole 72-GPU rack is one failure domain), and that GB200 must run <strong>≥1.6× faster than H100 just to break even on TCO</strong> (<a href="https://newsletter.semianalysis.com/p/h100-vs-gb200-nvl72-training-benchmarks">SemiAnalysis</a>). Treat the 1.6× break-even as the real bar, not the marketing FLOPs.</p>
+
+<div class="callout warn"><div class="ct">As of late 2025, no large run had finished on GB200 NVL72</div>
+  <p>SemiAnalysis flagged software immaturity and NVLink-backplane reliability — the whole 72-GPU rack is a single failure domain — as the blockers, and set <strong>≥1.6× over H100</strong> as the TCO break-even bar. Treat 1.6× as the real target, not the marketing FLOPs, and budget the goodput/determinism tooling MAI dedicates a whole "Cluster Environment" section to.</p></div>
+
+<p>The strategic reading of this table: a single 30T-token run lands at <strong>roughly GPT-5-pretrain scale (~3e25)</strong> but with ~2× the active params, and pushing into GPT-4.5 territory (~1e26) requires ~85T tokens <em>or</em> a heavy RL stage on top — and with the frontier RL:pretrain ratio approaching 1:1 (Grok 4, GPT-5), the RL stage is no longer an afterthought to your budget.</p>
+
+<h3 id="pos-tpp">TPP check — why you cannot over-train your way out</h3>
+<p>This is the cleanest constraint on the whole plan. MAI over-trained a <em>35B-active</em> model to 500–1000 TPP (200T tokens would be needed at the top of that range). Your <strong>200B active at even 1000 TPP would demand 200T tokens</strong> — flatly infeasible on the clean data MAI flags as scarce. At a sane <strong>100–200 TPP you train on 20–40T tokens</strong>, i.e. <em>mild</em> over-training, decisively <strong>not</strong> the heavy-over-training regime MAI used. The lesson: your active budget is simply too large to over-train, so you cannot recover inference efficiency the way smaller-active models do. Above ~40–50T tokens <strong>data, not compute, becomes the binding constraint</strong> — clean-token scarcity bites long before your 100k GB200 cluster runs out of FLOP/s. Your run is data-bound, not compute-bound, which inverts the usual frontier intuition.</p>
+
+<div class="callout miss"><div class="ct">Your run is data-bound, not compute-bound</div>
+  <p>200B active at 1000 TPP would need 200T clean tokens — infeasible. At a sane 100–200 TPP you land at 20–40T tokens, only <em>mild</em> over-training. Above ~40–50T tokens, clean-token scarcity bites before the cluster runs out of FLOP/s. This inverts the usual frontier intuition: you cannot over-train your way to inference efficiency the way a 35B-active model can.</p></div>
+
+<div class="stats">
+  <div class="stat" data-fam="data"><div class="v">200<span class="u">T</span></div><div class="l">tokens for 200B-act at 1000 TPP — infeasible</div></div>
+  <div class="stat" data-fam="data"><div class="v">20–40<span class="u">T</span></div><div class="l">sane 100–200 TPP regime → mild over-train</div></div>
+  <div class="stat" data-fam="compute"><div class="v">1.6<span class="u">×</span></div><div class="l">GB200-over-H100 TCO break-even bar</div></div>
+</div>
+
+<h3 id="pos-stability">Stability and recipe risk</h3>
+<p>The two largest publicly-attempted MoEs near your scale converged on the same lessons, and your run must adopt all of them: <strong><span class="f-optim">MuonClip</span>-style optimization</strong> (Kimi: zero spikes at 1T/15.5T) <em>or</em> carefully-tuned AdamW with attention-output zero-init and global-batch load balancing (MAI); <strong>dense + MoE layer interleaving</strong> rather than uniform medium-sparsity; <strong><span class="f-prec">FP8</span> forward GEMMs with FP32 accumulation</strong>; and <strong>expert-parallel ≈ 64</strong> as the practical EP degree. Behemoth's reported failure mode — routing plus chunked-attention instability at 2T total / 288B active — is the single biggest flag for going past ~2T total, and your 10T sits 5× beyond it. At 10T total you will need <strong>pipeline + expert + context parallelism stacked simultaneously</strong>, and goodput/determinism tooling (MAI dedicates an entire Cluster Environment section to it) will matter more to time-to-results than peak FLOPs ever will.</p>
+
+<div class="callout do"><div class="ct">The non-negotiable stability stack</div>
+  <p>Adopt all of: MuonClip <em>or</em> AdamW + attention-output zero-init + global-batch load balancing; dense+MoE interleaving (not uniform medium-sparsity); FP8 forward GEMMs with FP32 accumulation; EP ≈ 64. At 10T total, stack pipeline + expert + context parallelism simultaneously, and invest in goodput/determinism tooling — it will gate time-to-results harder than peak FLOPs.</p></div>
+
+<h3 id="pos-tier">What tier you sit in</h3>
+<p>There are, functionally, three tiers in mid-2026. <em>Tier 1</em>, the shipped open MoEs, tops out at ~1.6T total / ~49B active (DeepSeek-V4-Pro, Kimi K2, Qwen3-Max). <em>Tier 2</em>, the inferred Western closed runs, is unknown in parameters but ~3e25–1e26 FLOP in compute (GPT-5, Grok 4, Gemini 3, Claude Opus 4.x). <em>Tier 0</em>, the abandoned frontier, contains exactly one entry: Llama-4 Behemoth at 2T/288B. <strong>Your target sits above all three on total parameters and in a tier of one on the active-parameter axis</strong> — the only company at 200B active is a model that was cancelled for instability. On <em>compute</em> you are squarely Tier 2 (a 30T-token run ≈ GPT-5 pretrain), which is reassuring: the FLOP budget is precedented even if the parameter configuration is not.</p>
+
+<figure class="fig" data-fig="barshare">
+  <figcaption class="figcap"><b>Figure 6 — The plausibility verdict, decomposed.</b> The compute budget is precedented (Tier 2), the total-param scale is an unprecedented-but-smooth ~6× extrapolation, and the 200B-active choice is the one genuinely contrarian, genuinely risky bet — the share of risk you actually own.
+    <span class="meta"><span>Regime · <b>where the risk lives</b></span><span>Evidence · <b>landscape synthesis</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "title":"plausibility of the 10T/200B/100k-GB200 plan","unit":"% of net risk",
+    "items":[
+      {"label":"compute budget — precedented (Tier 2)","value":15,"fam":"compute"},
+      {"label":"total-param scale — smooth 6× extrapolation","value":30,"fam":"norm"},
+      {"label":"200B-active — the contrarian bet","value":40,"fam":"moe"},
+      {"label":"GB200 software / reliability ramp","value":15,"fam":"comms"}
+    ],
+    "note":"Compute is the safe part; the 200B-active choice is where the risk concentrates." }</script>
+</figure>
+
+<p>The plausibility verdict: the <strong>compute is plausible and precedented; the total-parameter scale is unprecedented but a smooth ~6× extrapolation of documented MoE practice; the 200B-active choice is the one genuinely contrarian, genuinely risky bet</strong>, and the recipe to de-risk it is MAI-Base-1 scaled up, with Kimi's MuonClip for spike-free optimization and DeepSeek's DSA-lineage sparse attention for the long-context phase. You are not doing something the field has proven impossible — Behemoth's cancellation is a stability-engineering failure, not a scaling-law wall — but you are doing it with thinner margins for error than any shipped run, on silicon that, as of late 2025, no one had yet completed a large run on.</p>
+
+<div class="callout key"><div class="ct">The plausibility verdict in one line</div>
+  <p>Compute: plausible and precedented. Total-param scale: unprecedented but a smooth ~6× extrapolation. 200B active: the one genuinely contrarian, genuinely risky bet. The de-risking recipe is MAI-Base-1 scaled up + Kimi MuonClip + DeepSeek DSA-lineage attention. Behemoth's cancellation was a stability-engineering failure, not a scaling-law wall — but your margins are thinner than any shipped run, on silicon no one had finished a large run on as of late 2025.</p></div>
+
+<div class="sources"><h3>Sources</h3><ul>
+  <li>MAI-Thinking-1 technical report (Microsoft AI): <a href="https://microsoft.ai/pdf/mai-thinking-1.pdf">microsoft.ai/pdf/mai-thinking-1.pdf</a></li>
+  <li>Epoch AI — Notes on GPT-5 training compute: <a href="https://epochai.substack.com/p/notes-on-gpt-5-training-compute">epochai.substack.com/p/notes-on-gpt-5-training-compute</a></li>
+  <li>Epoch AI — What did it take to train Grok 4?: <a href="https://epoch.ai/data-insights/grok-4-training-resources">epoch.ai/data-insights/grok-4-training-resources</a></li>
+  <li>xAI — Grok 4: <a href="https://x.ai/news/grok-4">x.ai/news/grok-4</a></li>
+  <li>SemiAnalysis — xAI's Colossus 2: First Gigawatt Datacenter: <a href="https://newsletter.semianalysis.com/p/xais-colossus-2-first-gigawatt-datacenter">newsletter.semianalysis.com/p/xais-colossus-2-first-gigawatt-datacenter</a></li>
+  <li>Gemini 3 Pro model card: <a href="https://storage.googleapis.com/deepmind-media/Model-Cards/Gemini-3-Pro-Model-Card.pdf">deepmind-media/Model-Cards/Gemini-3-Pro-Model-Card.pdf</a></li>
+  <li>Anthropic — Project Rainier / AWS compute: <a href="https://www.anthropic.com/news/anthropic-amazon-compute">anthropic.com/news/anthropic-amazon-compute</a></li>
+  <li>VentureBeat — Llama 4 launch (Scout/Maverick/Behemoth): <a href="https://venturebeat.com/ai/metas-answer-to-deepseek-is-here-llama-4-launches-with-long-context-scout-and-maverick-models-and-2t-parameter-behemoth-on-the-way">venturebeat.com — Llama 4 launch</a></li>
+  <li>DeepSeek-V3 technical report: <a href="https://arxiv.org/abs/2412.19437">arxiv.org/abs/2412.19437</a></li>
+  <li>DeepSeek-V4 (secondary): <a href="https://www.morphllm.com/deepseek-v4">morphllm.com/deepseek-v4</a></li>
+  <li>Qwen3 technical report: <a href="https://arxiv.org/abs/2505.09388">arxiv.org/abs/2505.09388</a></li>
+  <li>Kimi K2 / MuonClip (Moonshot): <a href="https://huggingface.co/moonshotai/Kimi-K2-Base">huggingface.co/moonshotai/Kimi-K2-Base</a></li>
+  <li>SemiAnalysis — H100 vs GB200 NVL72 Training Benchmarks: <a href="https://newsletter.semianalysis.com/p/h100-vs-gb200-nvl72-training-benchmarks">newsletter.semianalysis.com/p/h100-vs-gb200-nvl72-training-benchmarks</a></li>
+  <li>NVIDIA — GB200 NVL72 (spec / sparsity footnote): <a href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">nvidia.com/en-us/data-center/gb200-nvl72</a></li>
+  <li>GLM-4.6 / MiniMax-M2 reference: <a href="https://arxiv.org/html/2605.26494v1">arxiv.org/html/2605.26494v1</a></li>
+</ul></div>

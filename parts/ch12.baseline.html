@@ -1,0 +1,552 @@
+<h1
+id="12-modern-scaling-laws-beyond-chinchilla-for-moe-for-data-quality-and-for-your-own-dataset">12.
+Modern scaling laws: beyond Chinchilla, for MoE, for data quality, and
+for your own dataset</h1>
+<p>Chinchilla is not your operating manual. It is a foil. Hoffmann 2022
+corrected Kaplan's allocation artifact — Kaplan's untuned warmup,
+mismatched LR decay, and loss read at non-converged points had inflated
+parameter scaling to the famous ~0.73/0.27 split — and settled the dense
+world on roughly equal exponents, <code>a≈b≈0.5</code>, ~20
+tokens/parameter (<a href="https://arxiv.org/abs/2203.15556">Hoffmann
+2022</a> via <a
+href="https://arxiv.org/abs/2401.02954">DeepSeek-LLM</a>). For a
+10T-total / 200B-active MoE on 100,000 GB200 GPUs, that constant is
+worse than useless: it will mis-size your model by a factor of several
+and mis-allocate tens of millions of dollars of compute. Three
+structural facts break it.</p>
+<p>First, the loss surface is no longer <code>L(N, D)</code>. It is at
+minimum <code>L(N, D, N_active, G, S, P)</code> — a six-dimensional
+object in total params, tokens, active params, expert granularity,
+sparsity, and numerical precision — and the cross-terms are not
+separable. Second, the objective is not compute-optimal loss at fixed
+training FLOPs. With a billion-plus inference requests amortized against
+one training run, the correct objective is <em>lifetime</em> cost, which
+pushes you far into the over-trained regime, to 50–100+ tokens per
+active parameter, well past the Chinchilla ratio. Third — and this is
+the fact that makes the other two operational rather than academic —
+<strong>every exponent in the law is a function of your data
+quality</strong>. DeepSeek demonstrated this directly: refitting one
+functional form on "early in-house," "current in-house," and
+OpenWebText2 moved the optimal-allocation exponents from
+<code>a=0.450/b=0.550</code> to <code>a=0.524/b=0.476</code> to
+<code>a=0.578/b=0.422</code> (<a
+href="https://arxiv.org/abs/2401.02954">DeepSeek-LLM</a>). Better data
+shifts budget toward parameters. There is no transferable Chinchilla
+constant; there is only the law you fit on your own corpus.</p>
+<p>This chapter assembles the modern multi-axis law piece by piece —
+granularity, sparsity, the comprehensive coupled form, data-constrained
+repetition, inference-aware over-training, precision, hyperparameters,
+and distillation — gives the fitted formulas you would actually regress,
+and closes with the concrete shape of a scaling-law campaign for the
+10T/200B target. The recurring instruction is the same throughout:
+published exponents tell you the <em>form</em>; only your own sweep
+tells you the <em>coefficients</em>, and at <code>10^26</code> FLOPs the
+coefficients are where the money is.</p>
+<h2 id="121-the-moe-multiplicative-axes-granularity-and-sparsity">12.1
+The MoE multiplicative axes: granularity and sparsity</h2>
+<p>Granularity and sparsity are not knobs that perturb a dense law. They
+are independent multiplicative axes, and the literature converges on one
+through-line: <strong>the optimal value of each rises monotonically with
+training compute</strong>. A bigger budget wants finer experts and more
+total params per active param.</p>
+<p><strong>Granularity.</strong> Define
+<code>G = d_ff / d_expert</code>: the ratio of the dense FFN width to a
+single expert's width. <code>G=1</code> is a "standard" MoE where each
+expert is a full dense FFN; <code>G=8</code> slices that FFN into eight
+narrower experts and routes to more of them to keep active params fixed.
+The Krajewski/DeepSeek line (<a
+href="https://arxiv.org/abs/2402.07871">Krajewski 2024</a>) fits</p>
+<pre><code>L(N, D, G) = c + (g/G^γ + a)·N^(−α) + b·D^(−β)</code></pre>
+<p>with, for <code>E=64</code> experts:
+<code>a=18.1, α=0.115, b=30.8, β=0.147, g=2.1, γ=0.58, c=0.47</code>.
+Granularity enters <em>only</em> the parameter term, as a multiplicative
+discount <code>g/G^γ</code>. Because <code>γ=0.58 &lt; 1</code>, returns
+to granularity are sublinear but the fit is unbounded — there is no
+internal optimum, so compute-optimal <code>G</code> simply climbs with
+budget: <code>G=8</code> at 64×100M, <code>G=16</code> at 1–3B active,
+<code>G=32</code> at 7B, <code>G=64</code> by 300B/2.96T. The headline
+that paper sells is dramatic and partly real: at <code>10^25</code>
+FLOPs an optimized fine-grained MoE needs ~40× fewer FLOPs than a dense
+model for equal loss, and <code>G=1</code> (expert = full FFN) is
+suboptimal at nearly every budget.</p>
+<p>But the <code>G=64</code> recommendation does not survive contact
+with a more complete law, and you should not build to it. The 2024 fit
+omits the costs that finer experts actually incur — the
+activated-parameter term, the shared-expert contribution, and the
+routing plus all-to-all communication that fine granularity multiplies.
+Add those and the optimum collapses, as §12.2 shows.</p>
+<p><strong>Sparsity as its own axis.</strong> Frantar's pre-MoE-hype
+result (<a href="https://arxiv.org/abs/2309.08520">Frantar 2023</a>) is
+the under-cited origin of the key fact, and it is architecture-general
+(fit on T5/C4 and ViT/JFT, not just MoE):</p>
+<pre><code>L(S, N, D) = (a_S·(1−S)^b_S + c_S)·N^(−b_N) + (a_D/D)^b_D + c</code></pre>
+<p>with
+<code>a_S=16.8, b_S=0.722, c_S=45.0, b_N=0.245, b_D=0.203, c=0.651</code>.
+Here <code>S</code> is the sparsity fraction. The load-bearing
+conclusion: <strong>optimal sparsity increases with training
+data</strong> — roughly 50% sparsity is optimal at 2–3× Chinchilla
+training length, and it keeps climbing past that. Apple's "Parameters vs
+FLOPs" (<a href="https://arxiv.org/abs/2501.12370">Yun 2025</a>)
+restates this for MoE with <code>S=(E−K)/E</code>:</p>
+<pre><code>L = a·N^(−α) + b·D^(−β) + c·(1−S)^(−λ) + d·(1−S)^(−δ)·N^(−γ) + e</code></pre>
+<p>and pushes the result to its aggressive limit: at fixed training
+compute, raising <code>S</code> while proportionally growing
+<em>total</em> params <strong>always</strong> lowers loss. Optimal
+sparsity approaches ~0.9 and trends toward 1.0 for large models; as
+<code>S</code> rises, optimal <em>total</em> <code>N</code> rises and
+optimal <em>active</em> <code>N</code> falls. The practical implication
+for the build is direct. DeepSeek-V3 sits at 37B/671B ≈ 0.945 sparsity.
+A 200B-active / 10T-total model is <code>S ≈ 0.98</code> — meaningfully
+sparser than V3, and exactly consistent with "sparser wins as you
+scale." If anything the law argues you are under-sparse: at this compute
+scale, the optimum may want even more total params behind your 200B
+active.</p>
+<p>The two axes are coupled through compute. More budget → finer
+<code>G</code> <em>and</em> higher <code>S</code> <em>and</em> more
+tokens, simultaneously. Treating them independently (sweeping
+<code>G</code> at fixed <code>S</code>, or vice versa) will give you a
+saddle, not the optimum. You need the coupled form.</p>
+<p>One more subtlety the separable laws hide: the granularity and
+sparsity optima interact through the routing cost. Finer experts (higher
+<code>G</code>) and higher sparsity both increase the <em>number of
+experts</em> <code>E</code>, which increases all-to-all token-routing
+traffic and load-balancing variance. The Frantar and Apple laws price
+the <em>statistical</em> benefit of sparsity but not the
+<em>systems</em> cost of the routing it implies; the comprehensive law's
+collapse of <code>G_opt</code> from 64 to ~7 is largely the systems cost
+reasserting itself. This is why the right place to fit is the coupled
+form with real wall-clock-equivalent FLOPs, not an idealized FLOP count
+that pretends routing is free.</p>
+<h2 id="122-the-comprehensive-coupled-law--fit-against-this-one">12.2
+The comprehensive coupled law — fit against this one</h2>
+<p>The single most useful template for the 10T target is the first law
+to couple all five MoE axes in one fitted form (<a
+href="https://arxiv.org/abs/2509.23678">Cao 2025</a>):</p>
+<pre><code>L(N, D, N_a, G, S) = (eG + f/G + mS² + nS)·(1/N^α + k/N_a^α + h·N_a/N)
+                     + a/N^α + b/D^β + c/N_a^α + ε</code></pre>
+<p>with
+<code>e=0.1577, f=7.2446, m=5.1395, n=−3.2363, k=0.0013, h=0.0450, a=38.05, α=0.2383, b=27129, β=0.4694, c=31.10, ε=1.8182</code>.
+Here <code>N</code> is total params, <code>N_a</code> active params,
+<code>D</code> tokens, <code>G</code> granularity, <code>S</code> the
+shared-expert ratio. Two facts from this fit should reset your
+priors.</p>
+<p><strong>(1) MoE exponents are not dense exponents with a
+substitution.</strong> This law gives <code>β ≈ 0.47</code> and
+<code>α ≈ 0.24</code>, versus dense Chinchilla's roughly
+<code>0.67</code>/<code>0.35</code>. The data exponent is markedly
+steeper and the parameter exponent shallower. Concretely: MoE rewards
+<em>tokens</em> more and <em>raw parameters</em> less than a dense
+intuition predicts — another vector pointing at over-training (§12.3)
+and at not over-spending on total param count beyond what sparsity
+buys.</p>
+<p><strong>(2) Optimal granularity is ~7, not ~64.</strong> Minimizing
+this coupled law yields <code>G_opt ≈ 6.78</code> (build to
+<code>G ∈ [7,9]</code>, allow up to 12) and a shared-expert ratio around
+0.31. That is not a lone theoretical result — it is the
+independently-discovered production frontier. DeepSeek-V3.1 uses
+<code>G=9</code>, Kimi-K2 uses <code>G=9</code>, Qwen3-235B-A22B uses
+<code>G=8</code>. Three frontier labs converged on <code>G=8–9</code>
+without coordinating, because once you charge for activated params,
+shared experts, and all-to-all routing, the <code>G=64</code> of the
+2024 law is a mirage. <strong>Build recommendation:
+<code>G ∈ [8,12]</code>, 1–2 shared experts. Do not build
+<code>G=32–64</code>.</strong> The shared experts matter: at ~0.31
+shared ratio you keep one or two always-on experts that capture the
+common-token computation, letting the routed experts specialize and
+reducing routing-induced variance.</p>
+<p>A complementary lens is "efficiency leverage" (<a
+href="https://arxiv.org/abs/2507.17702">Ling team 2025</a>), which
+reframes the whole question as <code>EL = C_dense / C_moe</code>, the
+dense-to-MoE compute ratio for equal loss:</p>
+<pre><code>EL(A, G, C) = Â^(α + γ·(log G)² + β·log G),   α = a + d·log C</code></pre>
+<p>with <code>a=1.23, d=−0.0761, γ=0.0167, β=−0.117</code>, where
+<code>A</code> is the activation ratio. The crucial term is
+<code>α = a + d·log C</code>: the <code>d·log C</code> dependence means
+<strong>MoE's efficiency advantage amplifies with compute</strong>. The
+bigger your budget, the more the sparse architecture pays off relative
+to dense — which is the entire economic thesis of a 100k-GB200 run.
+Their validated pilot, Ling-mini-beta (0.85B active / 17.5B total, 3.4%
+activation, <code>G=12</code>, 1 shared expert), hit &gt;7× efficiency
+versus a 6.1B dense baseline at equal loss on 1T tokens, with optimal
+<code>G ≈ 12</code> and the finding that <em>lower activation is always
+better</em>, down to 0.8%. For the 200B-active build at ~2% activation,
+this is corroborating evidence that you are in the right sparsity
+neighborhood and could defensibly go sparser.</p>
+<div class="tablewrap"><table class="data">
+<thead>
+<tr>
+<th>Axis</th>
+<th>What it is</th>
+<th>Direction with compute</th>
+<th>10T/200B target</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Granularity <code>G</code></td>
+<td><code>d_ff / d_expert</code></td>
+<td>rises, but capped ~7–12 by routing/comms cost</td>
+<td><strong><code>G = 8–12</code></strong></td>
+</tr>
+<tr>
+<td>Sparsity <code>S=(E−K)/E</code></td>
+<td>inactive expert fraction</td>
+<td>rises monotonically, →~0.9–0.98</td>
+<td><strong><code>S ≈ 0.98</code></strong> (defensibly higher)</td>
+</tr>
+<tr>
+<td>Shared experts</td>
+<td>always-on experts</td>
+<td>~0.31 of expert budget</td>
+<td><strong>1–2 shared</strong></td>
+</tr>
+<tr>
+<td>Total vs active <code>N/N_a</code></td>
+<td>dilution factor</td>
+<td>total rises, active falls at fixed compute</td>
+<td><strong>~50× (10T/200B)</strong></td>
+</tr>
+<tr>
+<td>Activation ratio</td>
+<td><code>N_a / N</code></td>
+<td>lower is better, down to ~0.8%</td>
+<td><strong>~2%, could trend lower</strong></td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="123-inference-aware-over-training-train-smaller-and-longer">12.3
+Inference-aware over-training: train smaller and longer</h2>
+<p>Compute-optimality minimizes loss at fixed <em>training</em> FLOPs.
+That is the wrong objective for a model you will serve a billion times.
+Sardana &amp; Frankle (<a
+href="https://arxiv.org/abs/2401.00448">2024</a>) replace it with
+lifetime cost:</p>
+<pre><code>minimize   6·N·D_tr + 2·N·D_inf    subject to   L(N, D_tr) = ℓ</code></pre>
+<p>and a real-cost version that weights each term by hardware
+utilization:</p>
+<pre><code>6·N·D_tr·C_tr/MFU_tr  +  2·N·C_inf·(D_inp/MFU_inp + D_out/MFU_out)</code></pre>
+<p>The conclusion is sharp and one-directional: with large inference
+volume you train a <em>smaller</em> model on <em>more</em> tokens.
+Across 47 models from 150M to 6B they pushed to <strong>10,000 tokens
+per parameter with no loss flat-lining</strong> — fifty times the
+Chinchilla ratio, and the curve still had not bent. The penalty for
+ignoring this is large and counterintuitive: their 70B example "costs
+36% more than cost-optimal" despite using only 1.3% more training FLOPs,
+because compute-optimality picked too large a model that is then
+expensive to serve forever.</p>
+<p>For the 10T/200B build this settles the token budget. A 200B-active
+model is in the cost-optimal zone at 50–100+ tokens per <em>active</em>
+parameter — i.e. tens of trillions of tokens, not the ~4T that naive
+Chinchilla (≈20 tok/active-param) would prescribe. This is <em>the</em>
+reason your scaling-law campaign must not optimize
+min-loss-at-fixed-FLOPs. You are fitting <code>L(N, D)</code> to then
+plug into a lifetime-cost objective, and the optimum lives far to the
+right of the IsoFLOP frontier's tangent point. Practically: pin
+total/active params from the MoE sparsity argument, then ride
+<code>D</code> out to wherever the marginal training FLOP stops beating
+the marginal inference saving — which, at frontier inference volumes, is
+very far indeed.</p>
+<p>Note the MoE-specific accounting subtlety: the <code>2·N·D_inf</code>
+inference term should use <em>active</em> params for the
+dense-equivalent forward FLOPs (you only pay for routed experts per
+token), while the <code>6·N·D_tr</code> training term also runs on
+active params per token but must carry the <em>total</em>-param memory
+and all-to-all communication footprint that determines your achievable
+MFU. The decoupling of total from active params is precisely what makes
+MoE attractive under this objective: you get the representational
+capacity of 10T params at the inference FLOP cost of 200B, so the
+inference term in the lifetime cost is ~50× smaller than a dense model
+of equal capacity would incur. This is the quantitative core of why a
+100k-GB200 owner builds sparse and over-trains hard rather than building
+a smaller dense model — the sparsity multiplies the
+inference-amortization argument, not just the training one.</p>
+<p>There is a tension here you must hold in mind, surfaced in §12.6:
+over-training is exactly what makes a checkpoint <em>fragile</em> under
+cheap post-training quantization. You cannot independently maximize
+over-training and minimize inference precision.</p>
+<h2 id="124-data-constrained-scaling-the-binding-constraint-at-10t">12.4
+Data-constrained scaling: the binding constraint at 10T</h2>
+<p>Here is the collision. The sparsity argument wants more total params.
+The inference-aware argument wants tens of T of tokens. At 200B active,
+Chinchilla-optimal is ~4T unique tokens; the over-trained,
+inference-aware target wants far more. But only ~15–20T high-quality
+unique tokens realistically exist. <strong>Data, not compute, is the
+binding constraint of this build</strong>, and Muennighoff's
+data-constrained law (<a
+href="https://arxiv.org/abs/2305.16264">2023</a>) becomes the operative
+object.</p>
+<p>Repeated tokens are worth less than fresh ones, and the law
+quantifies the decay. Effective data from <code>R_D</code> repetitions
+of <code>U_D</code> unique tokens:</p>
+<pre><code>D&#39; = U_D + U_D·R_D*·(1 − e^(−R_D / R_D*)),     R_D* ≈ 15.4</code></pre>
+<p>and an analogous diminishing return on "excess" parameters:</p>
+<pre><code>N&#39; = U_N + U_N·R_N*·(1 − e^(−R_N / R_N*)),     R_N* ≈ 5.3</code></pre>
+<p>The operating rules fall straight out of the constants:</p>
+<ul>
+<li><strong>≤4 epochs of repetition are nearly free</strong> —
+repeated-token loss sits within noise of unique-token loss.</li>
+<li>Returns decay sharply past <code>R_D* ≈ 15</code> and are
+effectively nil by ~40 epochs.</li>
+<li>Because <code>R_N* &lt; R_D*</code> (5.3 &lt; 15.4), in the
+data-constrained regime you should <strong>scale epochs faster than
+parameters</strong> — the inverse of the Chinchilla allocation.
+Repeating data buys more than adding params once you are
+data-bound.</li>
+</ul>
+<p>For the build: plan ~5T unique high-quality tokens at ≤4 epochs ≈
+~20T effective tokens before repetition decay bites hard. Beyond that,
+marginal compute is better spent on <em>data acquisition, cleaning, and
+synthetic generation</em> than on naively growing parameters — data
+sourcing is a compute-equivalent lever and should be budgeted as one. A
+useful nuance: larger datasets tolerate <em>more</em> repetition before
+decay (<a href="https://arxiv.org/abs/2511.13421">2025 follow-up</a>),
+so the 4-epoch rule is a floor for a clean corpus, not a hard ceiling
+for a large one. The campaign should fit <code>R_D*</code> and
+<code>R_N*</code> on <em>your</em> corpus rather than inheriting
+15.4/5.3 — these too are quality-dependent.</p>
+<h2 id="125-precision-scaling-and-the-fp4gb200-angle">12.5 Precision
+scaling and the FP4/GB200 angle</h2>
+<p>Precision is now an axis of the loss law, and on GB200 it is the axis
+with the most money attached. Kumar et al. (<a
+href="https://arxiv.org/abs/2411.04330">2024</a>), across 465+ runs,
+model an effective parameter count that degrades as precision drops:</p>
+<pre><code>N_eff(P) = N·(1 − e^(−P/γ))³     (when weight/activation/KV precisions match)
+L = A·N_eff^(−α) + B·D^(−β) + E + δ_PTQ</code></pre>
+<p>Two results bind the precision plan:</p>
+<ol type="1">
+<li><strong>Compute-optimal training precision is ~7–8 bits</strong>
+when <code>N</code>, <code>D</code>, and <code>P</code> are jointly
+optimized. FP8 is near-optimal; BF16 is <em>over-precise</em> at scale —
+you are paying for bits that buy no loss. This is the theoretical
+license for low-precision pretraining.</li>
+<li><strong>PTQ degradation <code>δ_PTQ</code> grows with
+<code>D/N</code>.</strong> The more you over-train — which §12.3
+mandates — the <em>worse</em> the model tolerates cheap post-training
+quantization at inference. Over-training and aggressive low-precision
+inference are in direct tension; you cannot have both for free.</li>
+</ol>
+<p>For GB200 specifically, the relevant evidence is NVIDIA's NVFP4
+<em>pretraining</em> recipe (<a
+href="https://arxiv.org/abs/2509.25149">2025</a>) — pretraining, not
+just inference quant. NVFP4 uses E2M1 elements with FP8 (E4M3) scales
+over <strong>16-element micro-blocks</strong> and an FP32 tensor-global
+scale. Stable FP4 pretraining required a specific stack of tricks:</p>
+<ul>
+<li><strong>Random Hadamard transforms</strong> (16×16) on the Wgrad
+inputs, to spread outliers across the block before quantization.</li>
+<li><strong>Stochastic rounding for gradients only</strong> —
+deterministic rounding on the forward pass, stochastic on the backward,
+to keep gradient estimates unbiased.</li>
+<li><strong>2D 16×16 weight scaling</strong> for consistency between
+forward and backward.</li>
+<li><strong>~16% of linear layers kept in BF16</strong> — specifically
+the first 2 and last 8 blocks, which carry disproportionate
+sensitivity.</li>
+<li><strong>BF16 for the last ~18% of training tokens</strong> — without
+this the loss gap widens from &lt;1% to ~1.5% during the decay phase;
+the FP4 numerics that are fine in the stable phase hurt precisely where
+the WSD decay is recovering loss.</li>
+</ul>
+<p>The result: a 12B model on 10T tokens hit MMLU-pro 62.58% versus
+62.62% for FP8 — a tie. Nemotron 3 (<a
+href="https://arxiv.org/abs/2512.20856">2025</a>) pushed NVFP4 to 25T
+tokens on a hybrid Mamba-MoE, evidence the recipe scales to the token
+horizon this build needs.</p>
+<p><strong>Build implication.</strong> FP4 bulk GEMMs are defensible on
+GB200 — that is the whole reason to buy Blackwell. But budget BF16 for
+the head and tail layers (~16%) and for the final ~15–20% of tokens, and
+treat the precision schedule as part of the WSD decay plan. And
+crucially: because <code>δ_PTQ</code> grows with <code>D/N</code> and
+you are over-training hard, <strong>do not plan aggressive INT4 PTQ on
+the over-trained checkpoint</strong> — the very over-training that makes
+the model cheap to serve also makes it the worst candidate for the
+cheapest inference quantization. The capacity to be quantized at
+inference is something you spend by over-training.</p>
+<p>A note on the hardware roofline these FLOPs run against: NVIDIA's
+headline 720 PFLOP/s FP8 / 360 PFLOP/s BF16 per GB200 NVL72 rack are
+<em>with-sparsity</em> (2:4) figures — the page footnotes "Dense is
+one-half sparse spec shown." Dense peak is <strong>360 PFLOP/s FP8 and
+180 PFLOP/s BF16 per rack</strong> (~4.5 / ~2.25 PFLOP/s per B200 GPU),
+so a 100,000-GPU cluster is **~0.45 EFLOP/s dense FP8 peak**, not ~1.0
+EFLOP/s (the EFLOP figure only holds counting sparsity, which is not
+meaningful for dense training FLOPs). Realistic large-MoE FP8 MFU is
+~35–40% for 2025–2026, lower for heavy-routing configs (<a
+href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">NVIDIA
+GB200 NVL72</a>). Reference every FLOP estimate against the
+<em>dense</em> peak.</p>
+<h2 id="126-hyperparameter-scaling-laws-lr-batch-size-weight-decay">12.6
+Hyperparameter scaling laws: LR, batch size, weight decay</h2>
+<p>You cannot tune learning rate and batch size by hand at 10T tokens —
+a single bad LR wastes a run worth more than a small company. The HP
+scaling laws let you fit <code>η(N,D)</code> and <code>B(D)</code> from
+cheap small-scale proxies and extrapolate. Three converging fits
+matter.</p>
+<p><strong>DeepSeek-LLM</strong> (<a
+href="https://arxiv.org/abs/2401.02954">2024</a>) fits against compute
+<code>C</code> directly:</p>
+<pre><code>η_opt = 0.3118·C^(−0.125),    B_opt = 0.2920·C^(0.3271)</code></pre>
+<p>and — importantly at 200B scale — uses non-embedding FLOPs/token
+<code>M = 72·n_layer·d_model² + 12·n_layer·d_model·l_seq</code> as the
+scale variable instead of <code>N</code>, because the <code>6N</code>
+bookkeeping distorts at large model size where embeddings and attention
+shift the real per-token compute.</p>
+<p><strong>StepLaw / Predictable Scale</strong> (<a
+href="https://arxiv.org/abs/2503.04715">2025</a>) is the empirical
+backbone — 3,700 LLMs, ~1M H800-hours, 100T tokens of sweeping:</p>
+<pre><code>η(N, D) = 1.79·N^(−0.713)·D^(0.307),    B(D) = 0.58·D^(0.571)</code></pre>
+<p>Two properties make this directly usable. The optimum is a
+<strong>convex plateau</strong>, not a sharp peak — being somewhat
+off-optimal costs little, so coarse grids suffice. And the prediction
+error is <strong>&lt;0.5% across sparsity levels</strong>, meaning the
+law <em>transfers to MoE</em>. This is the law to extrapolate your LR
+and batch from.</p>
+<p><strong>MoE-specific HP fit</strong> (<a
+href="https://arxiv.org/abs/2507.17702">Ling team 2025</a>):</p>
+<pre><code>η_opt = 1.1576·C^(−0.1529),    B_opt = 0.0694·C^(0.3644)</code></pre>
+<p>The MoE correction relative to dense at equal compute is
+<strong>larger batch, slightly lower LR</strong>. The mechanism: each
+expert is updated only on the routed subset of a batch, so the
+<em>per-expert effective batch</em> is smaller than the global batch —
+you compensate by enlarging the global batch and softening the LR to
+keep per-expert update noise in the same regime. At 200B active with
+top-k routing over <code>G=8–12</code>, this correction is not
+negligible; do not inherit a dense LR/batch schedule.</p>
+<p><strong>Weight decay and its batch coupling</strong> are the
+usually-ignored axis. "Power Lines" (<a
+href="https://arxiv.org/abs/2505.13738">2025</a>) extends HP scaling to
+weight decay and its coupling with batch size, and at 10T tokens the
+effective-LR / WD interaction materially shapes the late-training loss
+that the WSD decay phase is trying to recover. The Power Scheduler line
+(<a href="https://arxiv.org/abs/2408.13359">2024</a>) gives batch- and
+token-agnostic LR schedules that survive the extrapolation.</p>
+<p><strong>WSD makes all of this affordable at 10T scale.</strong>
+MiniCPM's Warmup-Stable-Decay scheduler (<a
+href="https://arxiv.org/abs/2404.06395">2024</a>) decouples the stable
+phase's LR from a pre-committed token count: you train at constant LR
+through the stable phase, then decay to recover most of the loss, and
+crucially you can <strong>fork annealing from a single stable
+checkpoint</strong> to run cheap proxy sweeps without retraining the
+stable trunk. This is what let MiniCPM <em>measure</em> its own
+data-to-model optimum at <strong>~192×</strong> (versus Chinchilla's
+~20×) rather than assume it — a tenfold disagreement with Chinchilla,
+discovered only because WSD made the measurement cheap. For the 10T
+campaign, WSD forks are how you run the dozens of IsoFLOP configs in
+§12.8 without paying full freight for each.</p>
+<h2
+id="127-distillation-scaling-laws--for-the-serving-fleet-not-the-flagship">12.7
+Distillation scaling laws — for the serving fleet, not the flagship</h2>
+<p>Distillation has its own law, and it tells you <em>not</em> to
+distill the flagship. Busbridge et al. (<a
+href="https://arxiv.org/abs/2502.08606">Apple 2025</a>) find that
+student loss is governed by the teacher's <em>cross-entropy</em>
+<code>L_T</code>, <strong>not the teacher's size</strong>, through a
+broken power law that produces a <strong>capacity gap</strong>: past an
+optimum, a stronger teacher actively <em>hurts</em> the student, because
+the teacher's KL target grows faster than the student can fit it. The
+optimal teacher is only "slightly larger than the student," then the
+benefit plateaus.</p>
+<p>The hard truth follows: <strong>supervised learning always wins given
+enough student compute and tokens</strong>. Distillation pays only when
+the teacher already exists or is amortized across many students (where
+it fits at ~1% error). For the 200B flagship this means distillation is
+a tool for the <em>downstream serving fleet</em> — the smaller models
+you deploy in cost-sensitive contexts — sized with a ~1×-student
+teacher, not a scheme for compressing the full 200B into a tiny student.
+Do not budget the flagship's quality on a distillation shortcut; budget
+it on supervised pretraining tokens, and reserve distillation for
+spinning out the small-serving variants once the flagship exists and its
+inference cost is already sunk.</p>
+<h2
+id="128-running-the-scaling-law-campaign-for-the-10t200b-target">12.8
+Running the scaling-law campaign for the 10T/200B target</h2>
+<p>Everything above is prologue to one decision: how do you actually fit
+the law that sizes a <code>10^26</code>-FLOP run? Labs keep these laws
+private not as theater but because a 1% loss-prediction error at this
+scale is tens of millions of dollars of mis-allocated compute, and the
+exponents are corpus-specific. Here is the campaign.</p>
+<p><strong>(1) Fit your own law on your own data.</strong> This is
+non-negotiable — DeepSeek's quality-exponent result means published
+<code>a/b/α/β</code> are <em>wrong for your corpus</em>. Run an
+IsoFLOP/IsoLoss sweep at <code>1e18–3e20</code> FLOPs over ~30–50 MoE
+configs, varying active params <code>N_a</code>, granularity
+<code>G ∈ {4…16}</code>, sparsity <code>S</code>, and shared-expert
+count. Fit the coupled form <code>L(N, D, N_a, G, S)</code> from §12.2
+(<a href="https://arxiv.org/abs/2509.23678">Cao 2025</a>), or your own
+variant, with <strong>Huber loss in log-space</strong> (Huber for
+robustness to the noisy small-scale runs, log-space because the law is
+multiplicative). Use IsoFLOP profiles — train each config to a fixed
+FLOP budget, read the loss minimum across the param/token tradeoff — and
+stack several FLOP levels to pin the exponents.</p>
+<p><strong>(2) Tune HPs with StepLaw/WSD proxies.</strong> Extrapolate
+<code>η(N,D)</code> and <code>B(D)</code> from small-scale fits (<a
+href="https://arxiv.org/abs/2503.04715">StepLaw</a>), exploiting the
+convex plateau so a coarse grid suffices. Apply the MoE correction
+(larger batch, lower LR). Use WSD annealing forks from a shared stable
+checkpoint to make the per-config cost cheap.</p>
+<p><strong>(3) Apply the data-constrained correction.</strong> Set the
+unique-token budget (~5T high-quality), cap epochs at ≤4 (<a
+href="https://arxiv.org/abs/2305.16264">Muennighoff</a>), fit your own
+<code>R_D*</code>/<code>R_N*</code>, and treat data acquisition as a
+compute-equivalent lever in the budget — every clean trillion tokens you
+source is worth more than the parameters that trillion of FLOPs would
+otherwise buy.</p>
+<p><strong>(4) Re-optimize allocation under the inference-aware
+objective.</strong> Do not stop at compute-optimal. Plug the fitted
+<code>L(N, D)</code> into the lifetime-cost objective
+<code>6N·D_tr + 2N·D_inf</code> (<a
+href="https://arxiv.org/abs/2401.00448">Sardana &amp; Frankle</a>) with
+your real inference volume, and read off fewer active params / more
+tokens than naive compute-optimal — the optimum sits far to the right of
+the IsoFLOP tangent.</p>
+<p><strong>(5) Choose precision per the precision law.</strong>
+FP8/NVFP4 for bulk GEMMs, BF16 for head/tail layers and the final
+~15–20% decay (<a href="https://arxiv.org/abs/2509.25149">NVFP4</a>),
+and <em>avoid INT4 PTQ on the over-trained checkpoint</em> because
+<code>δ_PTQ</code> grows with your <code>D/N</code> (<a
+href="https://arxiv.org/abs/2411.04330">Kumar</a>).</p>
+<p>The output of this campaign is not a single number. It is a fitted
+five-dimensional surface plus a precision schedule plus an HP
+extrapolation, all conditioned on <em>your</em> corpus. Build to
+<code>G=8–12</code>, 1–2 shared experts, <code>S≈0.98</code>, tens of T
+tokens at ≤4 epochs of a ~5T-token clean core, FP4 bulk with BF16
+head/tail/decay, and LR/batch from a StepLaw fit with the MoE
+correction. Anyone handing you a Chinchilla constant for this run is
+handing you a foil.</p>
+<h2 id="sources">Sources</h2>
+<ul>
+<li><a href="https://arxiv.org/abs/2402.07871">Krajewski/DeepSeek
+granularity law (2402.07871)</a></li>
+<li><a href="https://arxiv.org/abs/2509.23678">Comprehensive MoE scaling
+law (2509.23678)</a></li>
+<li><a href="https://arxiv.org/abs/2507.17702">Efficiency Leverage, Ling
+team (2507.17702)</a></li>
+<li><a href="https://arxiv.org/abs/2501.12370">Apple optimal-sparsity
+law (2501.12370)</a></li>
+<li><a href="https://arxiv.org/abs/2309.08520">Frantar sparsity law
+(2309.08520)</a></li>
+<li><a href="https://arxiv.org/abs/2305.16264">Data-constrained scaling,
+Muennighoff (2305.16264)</a></li>
+<li><a href="https://arxiv.org/abs/2401.00448">Inference-aware scaling,
+Sardana &amp; Frankle (2401.00448)</a></li>
+<li><a href="https://arxiv.org/abs/2411.04330">Precision scaling law,
+Kumar et al. (2411.04330)</a></li>
+<li><a href="https://arxiv.org/abs/2509.25149">NVFP4 pretraining, NVIDIA
+(2509.25149)</a></li>
+<li><a href="https://arxiv.org/abs/2512.20856">Nemotron 3 NVFP4 at 25T
+(2512.20856)</a></li>
+<li><a href="https://arxiv.org/abs/2503.04715">StepLaw / Predictable
+Scale (2503.04715)</a></li>
+<li><a href="https://arxiv.org/abs/2401.02954">DeepSeek-LLM HP and
+data-quality laws (2401.02954)</a></li>
+<li><a href="https://arxiv.org/abs/2502.08606">Distillation scaling law,
+Apple (2502.08606)</a></li>
+<li><a href="https://arxiv.org/abs/2404.06395">MiniCPM / WSD scheduler
+(2404.06395)</a></li>
+<li><a href="https://arxiv.org/abs/2505.13738">Power Lines: weight decay
+&amp; batch size (2505.13738)</a></li>
+<li><a href="https://arxiv.org/abs/2408.13359">Power Scheduler
+(2408.13359)</a></li>
+<li><a
+href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">NVIDIA
+GB200 NVL72 spec page</a></li>
+</ul>

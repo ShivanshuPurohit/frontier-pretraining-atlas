@@ -1,0 +1,411 @@
+<p class="eyebrow">Chapter 04 · Laying the model across 100k GPUs</p>
+<h1>Parallelism strategy for a 10T/200B-active MoE: the five axes and the fabric that decides everything</h1>
+<p class="lede">The parallelism plan is the single decision that most determines whether your 100,000-GB200 cluster runs at 40% MFU or 18%. It is not one choice but a composition of five-to-six orthogonal axes mapped onto a strictly hierarchical fabric — and getting the mapping wrong doesn't cost a few points, it halves your throughput.</p>
+<p class="byline"><span>~28 min read</span><span class="dot">6 figures</span><span class="dot">grounded in MaxText <code>configs/base.yml</code> + <code>layers/pipeline.py</code></span></p>
+<hr />
+
+<p>The parallelism plan is the single decision that most determines whether your 100,000-GB200 cluster runs at 40% MFU or 18%. It is not one choice but a composition of five-to-six orthogonal axes — <span class="f-mem">data/FSDP</span>, <span class="f-compute">tensor</span> (with sequence-parallel variant), <span class="f-data">pipeline</span>, <span class="f-moe">expert</span>, and <span class="f-attn">context</span> — each of which must shard a <em>different</em> part of the model state, mapped onto a <em>strictly hierarchical</em> fabric where intra-rack <span class="f-comms">NVLink</span> runs at 1.8 TB/s/GPU and inter-rack <span class="f-comms">InfiniBand</span> at roughly one-twentieth of that. Get the mapping wrong — put a high-volume collective on the wrong tier of the fabric — and you do not lose a few points of MFU, you lose half your throughput. This chapter does the memory math that rules out the naive plans, derives why each axis exists, and proposes a concrete layout with numbers, then grounds it in the user's actual codebase (MaxText) <code>ici_</code>/<code>dcn_</code> axes and <code>pipeline.py</code>.</p>
+
+<div class="pull">The parallelism plan is not one choice but the disciplined assignment of each axis to the one fabric tier and one slice of model state it was built for: EP×TP on NVLink, PP on InfiniBand, DP/FSDP across islands, CP folded onto attention. That single composition rule is the entire layout — everything else is justification.</div>
+
+<div class="stats">
+  <div class="stat" data-fam="mem"><div class="v">120<span class="u">TB</span></div><div class="l">resident Muon state (vs 160 TB Adam)</div></div>
+  <div class="stat" data-fam="mem"><div class="v">19.2<span class="u">PB</span></div><div class="l">aggregate HBM · state is 0.6–0.8%</div></div>
+  <div class="stat" data-fam="comms"><div class="v">~20<span class="u">:1</span></div><div class="l">NVLink : InfiniBand bandwidth cliff</div></div>
+  <div class="stat" data-fam="compute"><div class="v">≤72</div><div class="l">EP×TP must fit one NVL72 domain</div></div>
+</div>
+
+<h2 id="memory-math"><span class="sec-num">01</span>Memory math: the optimizer state, not the weights, dictates the layout</h2>
+
+<p>The first thing to internalize is that a 10T-parameter model is <em>not</em> a capacity problem on this cluster. It is a sharding-and-bandwidth problem dressed up as a capacity problem. Walk the per-parameter byte budget for the steady state.</p>
+
+<p>For a <span class="f-optim">Muon-primary</span> optimizer — which is the right call in mid-2026, since DeepSeek-V4 and Kimi-K2 both adopted <span class="f-optim">Muon</span> as the main optimizer and keep AdamW only on embeddings, output heads, and RMSNorm parameters (<a href="https://arxiv.org/html/2509.23106v2">Muon-state quantization paper</a>) — the resident per-parameter footprint is:</p>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Component</th><th class="num">Bytes/param (Muon)</th><th class="num">Bytes/param (AdamW)</th></tr></thead>
+  <tbody>
+    <tr><td>Compute weights (bf16)</td><td class="num">2</td><td class="num">2</td></tr>
+    <tr><td>Master weights (fp32)</td><td class="num">4</td><td class="num">4</td></tr>
+    <tr><td>Gradient (bf16)</td><td class="num">2</td><td class="num">2</td></tr>
+    <tr><td>Optimizer state</td><td class="num">4 (one fp32 momentum)</td><td class="num">8 (two fp32 moments m,v)</td></tr>
+    <tr><td><b>Total</b></td><td class="num"><b>~12 B</b></td><td class="num"><b>~16 B</b></td></tr>
+  </tbody>
+  <caption>Muon's single momentum buffer halves the dominant optimizer-state term against AdamW's two moments.</caption>
+</table></div>
+
+<p>For 10T parameters that is <strong>120 TB (Muon) to 160 TB (Adam)</strong> of resident, non-replication-shardable state, plus an <span class="f-prec">FP8 (E4M3)</span> compute copy of the weights — the V3/V4 training format — adding 10 TB. The bf16 weights alone are 20 TB; in FP8, 10 TB. The decisive observation: the optimizer-and-master state is <strong>60–75% of the resident footprint</strong>, and Muon's single momentum buffer (<a href="https://arxiv.org/html/2509.23106v2">4 B/param vs AdamW's 8 B</a>) is the cheapest 40-TB saving available — it halves the dominant term. The Scaling Book's own capacity note generalizes here: pure data parallelism with Adam's 10 bytes/param caps a model at ~9B parameters on a 96 GB chip (<a href="https://jax-ml.github.io/scaling-book/training/">JAX Scaling Book, training chapter</a>). The 10T model holds 1,100× that.</p>
+
+<div class="formula"><span class="lbl">mem</span>
+  <span class="eq">resident bytes ≈ N · (2<sub>bf16</sub> + 4<sub>fp32 master</sub> + 2<sub>grad</sub> + opt) &nbsp;→&nbsp; 12 B (Muon) · 10T = 120 TB</span>
+  <span class="note">opt = 4 B (Muon, one momentum) or 8 B (Adam, m+v). Plus a 10 TB FP8 compute copy. None of this is replication-shardable — it must be split across devices.</span></div>
+
+<figure class="fig" data-fig="membar">
+  <figcaption class="figcap"><b>Figure 1 — Per-parameter resident state, Muon vs the dtype you store weights in.</b> Master weights + optimizer momentum dominate; toggling the weight/grad dtype shows that FP8/FP4 shrinks only the weight and grad bars, never the fp32 master or momentum. The optimizer term is the binding constraint, not the weights.
+    <span class="meta"><span>Regime · <b>10T params, Muon-primary</b></span><span>Evidence · <b>Muon-state paper + transformer accounting</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "paramsB":10000,"activGB":84000,"optBytes":4,
+    "dtypes":[{"id":"bf16","w":2,"label":"BF16"},{"id":"fp8","w":1,"label":"FP8"},{"id":"fp4","w":0.5,"label":"FP4"}],
+    "parts":[
+      {"label":"Compute weights","perParam":"w","fam":"compute"},
+      {"label":"Master weights (fp32)","perParam":4,"fam":"mem"},
+      {"label":"Gradient","perParam":"grad","fam":"comms"},
+      {"label":"Muon momentum (fp32)","perParam":"opt","fam":"optim"},
+      {"label":"Activations (4M-tok batch)","perParam":"act","fam":"data"}
+    ] }</script>
+</figure>
+
+<p>Now the aggregate picture. A GB200 carries 192 GB HBM3e per GPU at 8 TB/s (<a href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">NVIDIA GB200 NVL72</a>). 100,000 GPUs → <strong>~19.2 PB aggregate HBM</strong>. The 120–160 TB of model+optimizer state is <strong>0.6–0.8% of total HBM</strong>. There is no capacity wall. This is precisely why the problem is sharding and bandwidth: the binding constraints are (a) you must shard optimizer state so no device holds a meaningful fraction, (b) <em>activation</em> memory, not parameter memory, is what actually fills HBM per device, and (c) every collective must land on a fabric tier fast enough to hide under that layer's compute.</p>
+
+<div class="callout key"><div class="ct">The one number to remember</div>
+  <p>The 120–160 TB of model+optimizer state is <strong>0.6–0.8% of 19.2 PB aggregate HBM</strong>. There is no capacity wall — this is a sharding-and-bandwidth problem in disguise. The optimizer-and-master state is 60–75% of the resident footprint, so Muon's single momentum buffer is the cheapest 40-TB win on the table.</p></div>
+
+<h3 id="activation-memory">Activation memory is the real per-device pressure</h3>
+
+<p>Per the transformer accounting, a transformer block saves ~20 tensors/layer without rematerialization, which for a 4M-token batch at L=64, D=8192 is <strong>~84 TB of activation memory</strong> (<a href="https://jax-ml.github.io/scaling-book/transformers/">Scaling Book transformers</a>). "Big-matmuls-only" remat saves ~7×; full-block remat saves only layer inputs but raises training FLOPs from 6Nθ to <strong>~8Nθ</strong> (<a href="https://jax-ml.github.io/scaling-book/transformers/">same</a>) — a 33% compute tax you pay grudgingly and selectively. For a 10T MoE the activation footprint also carries the dispatched expert tokens (<code>top_k</code> copies of the routed activations) and the all-to-all staging buffers. This is why the layout must shard activations along <em>sequence</em> (<span class="f-compute">SP-TP</span>, <span class="f-attn">CP</span>) and <em>pipeline-stage</em> boundaries, not merely shard weights. A plan that shards 120 TB of optimizer state perfectly but leaves activations replicated will OOM on the first long-context microbatch.</p>
+
+<h3 id="compute-check">Compute-time sanity check</h3>
+
+<p>Training FLOPs ≈ 6 × active-params × tokens (<a href="https://jax-ml.github.io/scaling-book/transformers/">Scaling Book transformers</a>). For 200B active over a 30T-token run: 6 · 2e11 · 3e13 = <strong>3.6e25 FLOP</strong>. At 100,000 GB200, <strong>dense</strong> FP8 peak is ~4.5 PFLOP/s/GPU — note that NVIDIA's headline 720 PFLOP/s FP8 per NVL72 rack is the <em>with-sparsity (2:4)</em> figure; the page footnotes "Dense is one-half sparse spec shown," so dense rack FP8 is 360 PFLOP/s and the cluster dense FP8 peak is <strong>~0.45 EFLOP/s, not ~1.0</strong> (<a href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">NVIDIA GB200 NVL72</a>). At a realistic 40% MoE FP8 MFU: 1e5 · 4.5e15 · 0.40 = 1.8e20 FLOP/s → 3.6e25 / 1.8e20 ≈ <strong>2.0e5 s ≈ 2.3 days of <em>ideal</em> compute</strong>, which in practice becomes weeks once all-to-all, pipeline bubble, checkpointing, and restart overheads land. The point of the parallelism plan is to keep that MFU near 40% rather than letting MoE communication drag it to 18%.</p>
+
+<h2 id="fsdp-fails"><span class="sec-num">02</span>Why pure FSDP (ZeRO-3) fails at this scale</h2>
+
+<p><span class="f-mem">FSDP/ZeRO-3</span> shards weights, gradients, and optimizer state across the DP axis, all-gathers the full weight shard just-in-time per layer in the forward pass, and reduce-scatters gradients in the backward. Its memory story is perfect — state ÷ X for FSDP degree X. Its communication story is what kills it at 100k.</p>
+
+<p>The roofline is unambiguous: DP and FSDP are compute-bound <em>only when per-device batch exceeds the network's arithmetic intensity</em> C/W (<a href="https://jax-ml.github.io/scaling-book/training/">Scaling Book training</a>). On TPU v5p that threshold is ~2,550 tokens/chip over ICI and ~73,440 tokens/pod over the slower DCN. Recompute it for GB200: with NVLink W ≈ 1.8e12 B/s bidirectional and FP8 compute C ≈ 4.5e15 FLOP/s, C/W ≈ <strong>~2,500 tokens/GPU</strong> — essentially the same regime as v5p (<a href="https://jax-ml.github.io/scaling-book/gpus/">Scaling Book GPU chapter</a>). FSDP's communication volume is <strong>batch-independent</strong>: it moves the full weight set every step regardless of how many tokens ride along. That is the fatal property. As you grow FSDP degree toward 100,000, the all-gather of the 10–20 TB weight set must complete inside each layer's compute window, and the per-device shard shrinks to tens of MB while the <em>collective</em> still moves the whole model.</p>
+
+<p>Worse, FSDP at 100k crosses the fabric hierarchy. NVLink intranode is 1.8 TB/s/GPU; inter-rack RDMA is ~90 GB/s/GPU (<a href="https://github.com/deepseek-ai/DeepEP">DeepEP</a>) — a <strong>~20:1 cliff</strong>. A 100k-way all-gather necessarily spans thousands of NVL72 racks over InfiniBand, and its latency cannot hide behind one layer's compute. And FSDP cannot exploit MoE structure at all: it replicates the all-to-all-bound expert FFNs across the entire mesh and pays the weight-gather cost on all 10T parameters when only 200B are active per token. You would be all-gathering 50× more expert weight than any token touches.</p>
+
+<div class="callout warn"><div class="ct">FSDP's fatal property at 100k</div>
+  <p>FSDP communication volume is <strong>batch-independent</strong> — it moves the entire 10–20 TB weight set every step no matter how many tokens ride along. Pushed to 100k-way it spans thousands of racks over the 20:1 IB cliff and all-gathers 50× more expert weight than any token touches. The memory story is perfect; the comms story is fatal.</p></div>
+
+<p>The fix is structural: <strong>confine FSDP/ZeRO to a fast island and offload the "shard the 10T" job to EP + PP.</strong> FSDP becomes the outer, elastic optimizer-sharding axis (<span class="f-mem">ZeRO-1</span>, gradients/optimizer only) across DP replicas — not the mechanism that shards the model.</p>
+
+<h2 id="five-axes"><span class="sec-num">03</span>The five axes and what each must shard</h2>
+
+<p>Each axis exists because it shards a different state and rides a different fabric tier. The discipline is to assign each its natural job and no more.</p>
+
+<div class="tcards">
+  <div class="tcard" data-fam="moe"><div class="tn">EP — expert parallel</div><div class="ts">all-to-all dispatch/combine</div><div class="tm">Shards the bulk of 10T weights with no replication, no per-step weight all-gather. Lives on NVLink.</div></div>
+  <div class="tcard" data-fam="compute"><div class="tn">TP + SP-TP</div><div class="ts">model-dim + sequence shard</div><div class="tm">Attention/MLA/router/shared expert. Comm-bound past Y &gt; F/(C/W) ≈ 8–16-way, NVLink only.</div></div>
+  <div class="tcard" data-fam="data"><div class="tn">PP — pipeline</div><div class="ts">stage-boundary activations</div><div class="tm">Cheapest way to shard 10T across slow links — moves activations, not weights. Cost is the bubble.</div></div>
+  <div class="tcard" data-fam="attn"><div class="tn">CP — context parallel</div><div class="ts">ring/striped attention</div><div class="tm">Shards sequence + KV for 1M-token context. MLA/DSA compresses KV, so engage only at 64K→1M.</div></div>
+  <div class="tcard" data-fam="mem"><div class="tn">DP/FSDP + ZeRO-1</div><div class="ts">replicas + optimizer state</div><div class="tm">Elastic, fault-isolating outer axis. Gradient all-reduce is batch-amortized → tolerates slow top-of-fabric.</div></div>
+</div>
+
+<ul>
+  <li><strong><span class="f-moe">EP (expert parallel)</span></strong> — the load-bearing axis for a 10T MoE. Experts sit on disjoint device groups; routing becomes all-to-all dispatch → grouped-GEMM → all-to-all combine. EP shards the bulk of the 10T weights <em>without replication</em> and <em>without per-step weight all-gather</em>. All-to-all volume per layer is <strong>T·K·h·(EP−1)/EP</strong> (T local tokens, K top-k, h hidden) (<a href="https://arxiv.org/abs/2603.07685">Megatron-Core MoE</a>). This is the only axis that natively matches MoE sparsity, and it must live on NVLink.</li>
+  <li><strong><span class="f-compute">TP + sequence-parallel TP</span></strong> — shards attention and the dense parts (MLA up-projection, router, shared expert) along the model dimension; SP-TP additionally shards LayerNorm and activations along the sequence dimension to kill replicated-activation memory. TP becomes communication-bound past <strong>Y &gt; F/(C/W)</strong>, i.e. ~8–16 way in practice and only ever inside an NVLink domain (<a href="https://jax-ml.github.io/scaling-book/training/">Scaling Book training</a>). For a DeepSeek-class small expert F (~2,048), the GPU-chapter figure caps useful TP-on-experts at ~1–2 way (<a href="https://jax-ml.github.io/scaling-book/gpus/">Scaling Book GPU chapter</a>) — which is the whole argument for expert-sharding the FFN instead.</li>
+  <li><strong><span class="f-data">PP (pipeline)</span></strong> — partitions layers into stages; the cheapest way to shard 10T across <em>slow</em> links because it moves only stage-boundary activations (≈1.5·2BD/(W·L) per layer, negligible), not weights (<a href="https://jax-ml.github.io/scaling-book/training/">Scaling Book training</a>). The cost is the bubble.</li>
+  <li><strong><span class="f-attn">CP (context parallel)</span></strong> — shards the sequence and KV for long context (V4 targets 1M tokens). Ring/striped attention. For an MLA/DSA model the KV is already compressed, so CP need only engage at the 64K→1M stages.</li>
+  <li><strong><span class="f-mem">DP/FSDP outer + ZeRO-1</span></strong> — replicates the (EP×TP×PP)-sharded unit and shards optimizer state across replicas. This is the elastic, fault-isolation axis. DP all-reduce of gradients is batch-amortized, so it tolerates the slow top-of-fabric.</li>
+</ul>
+
+<h3 id="token-vs-expert">Token-sharding vs expert-sharding: the central MoE choice</h3>
+
+<p>The FFN can be sharded two ways. <strong>Expert-sharding (EP)</strong> keeps each expert <em>whole</em> on a device and shuffles <em>tokens</em> to it (all-to-all dispatch/combine). <strong>Token-sharding (TP-on-experts)</strong> splits each expert's matrices and keeps tokens local (all-gather/reduce-scatter). DeepSeek and Megatron-Core both favor expert-sharding for the FFN because high TP "fragments small experts into inefficient shards" while low TP "underutilizes attention" (<a href="https://arxiv.org/abs/2603.07685">Megatron-Core MoE</a>). The expert intermediate dim is small — 2,048 for DeepSeek-V3 (<a href="https://arxiv.org/html/2412.19437v1">V3 report</a>) — so a TP=8 split of a 2,048-wide GEMM leaves 256-wide tiles that under-fill the tensor cores. Expert-sharding keeps the GEMM full-width and pays only an all-to-all, which on NVLink is cheap (the all-to-all is one-quarter of an all-gather in the bandwidth-bound regime, since shards travel only part-way round the ring (<a href="https://jax-ml.github.io/scaling-book/sharding/">Scaling Book sharding</a>)).</p>
+
+<div class="callout do"><div class="ct">Expert-shard the FFN — its F≈2,048 is too small to TP-split</div>
+  <p>A TP=8 split of a 2,048-wide expert GEMM leaves 256-wide tiles that starve the tensor cores. Keep each expert whole, shuffle tokens to it, and pay only an all-to-all — one-quarter the cost of an all-gather in the bandwidth-bound regime, and cheap on NVLink.</p></div>
+
+<p>Megatron-Core's <strong>Parallel Folding</strong> resolves the attention-vs-expert TP conflict cleanly: it gives attention layers and MoE layers <em>different</em> TP/DP/EP meshes via a dual DeviceMesh — e.g. TP=8 with high CP on attention, TP=1 with high EP on experts — and does a zero-copy reshard at the boundary (<a href="https://arxiv.org/abs/2603.07685">Megatron-Core MoE</a>). This is the production answer to "attention wants TP, experts want EP." MaxText expresses the same intent more coarsely through its separate <code>tensor</code> and <code>expert</code> logical axes plus the CP-as-EP <span class="k k-moe">custom_mesh_and_rule</span> path (more in §07).</p>
+
+<h2 id="pipeline-schedule"><span class="sec-num">04</span>Pipeline schedule: DualPipe vs zero-bubble vs 1F1B</h2>
+
+<p>With PP=16–32 stages on a 10T model, the bubble is real money. The schedules, ranked by sophistication:</p>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Schedule</th><th>Bubble</th><th class="num">Weight copies</th><th>Activation stages</th><th>Comm overlap</th></tr></thead>
+  <tbody>
+    <tr><td>1F1B</td><td>(PP−1)(F+B)</td><td class="num">1×</td><td>PP</td><td>none</td></tr>
+    <tr><td>ZB-H1 (zero-bubble)</td><td>~⅓ of 1F1B at equal peak mem</td><td class="num">1×</td><td>PP</td><td>partial</td></tr>
+    <tr><td>ZB-H2</td><td>≈0 (true zero bubble)</td><td class="num">1×</td><td>higher</td><td>partial</td></tr>
+    <tr><td>DualPipe</td><td>(PP/2−1)(F&amp;B+B−3W)</td><td class="num"><b>2×</b></td><td>PP+1</td><td><b>native</b></td></tr>
+    <tr><td>DualPipeV</td><td>same as DualPipe</td><td class="num">2×</td><td><b>PP/2</b></td><td>native</td></tr>
+  </tbody>
+  <caption>Bubble, weight-duplication, activation-stage and overlap trade across the pipeline schedule zoo.</caption>
+</table></div>
+
+<p><strong>Zero-bubble</strong> (<a href="https://arxiv.org/abs/2401.10241">ZB paper</a>) splits the backward into input-gradient (∂x) and weight-gradient (∂W) passes. ZB-H1 cuts the 1F1B bubble to ~1/3 at the <em>same</em> peak memory; ZB-H2 reaches a true zero bubble but demands more activation memory and enough microbatches to fill the schedule. Its virtue is <strong>no weight duplication</strong>; its weakness is that overlapping the EP all-to-all under compute is harder because the schedule wasn't designed around it.</p>
+
+<p><strong>DualPipe</strong> (<a href="https://github.com/deepseek-ai/DualPipe">DeepSeek DualPipe</a>) is the V3 recipe: each forward and backward chunk is decomposed into four phases — <strong>attention, all-to-all dispatch, MLP, all-to-all combine</strong> — and a bidirectional schedule overlaps the all-to-all of one micro-batch with the GEMMs of another (<a href="https://arxiv.org/html/2412.19437v1">V3 report</a>). Bubble drops to (PP/2−1)(F&amp;B+B−3W). The cost is <strong>2× resident parameter copies</strong> (the bidirectional schedule), which at 10T is +20 TB resident — non-trivial but absorbable against 19 PB aggregate HBM, and DeepSeek argues it is cheap precisely because EP already shards experts. The communication side reserves <strong>20 SMs across 10 warp-specialized channels with custom PTX</strong> (<a href="https://arxiv.org/html/2412.19437v1">V3 report</a>) — a tax that DeepEP-V2 and the V4 mega-kernel are explicitly trying to eliminate.</p>
+
+<figure class="fig" data-fig="pipeline">
+  <figcaption class="figcap"><b>Figure 2 — 1F1B vs DualPipe bubble.</b> DualPipe's bidirectional schedule overlaps one micro-batch's all-to-all with another's GEMMs, dropping the bubble from 1F1B's (PP−1)(F+B) to (PP/2−1)(F&amp;B+B−3W) — at the cost of two resident parameter copies. Toggle the schedule to compare.
+    <span class="meta"><span>Regime · <b>PP=16 across racks</b></span><span>Evidence · <b>DeepSeek-V3 report</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "stages":16,"microbatches":24,"schedules":["1f1b","dualpipe"] }</script>
+</figure>
+
+<p><strong>DualPipeV</strong> (<a href="https://github.com/deepseek-ai/DualPipe">DualPipe repo</a>) is the under-discussed memory-saving variant: the "cut-in-half" V-shape keeps the same bubble with <strong>PP/2 devices and PP/2 activation stages</strong> (versus PP+1 for DualPipe), halving per-device activation memory. For a GB200 build where the EP all-to-all crosses NVL72 boundaries, DualPipe-family overlap is worth the weight duplication because it hides the InfiniBand and cross-rack traffic — <strong>DualPipeV is the practical choice</strong>.</p>
+
+<div class="callout note"><div class="ct">Two adjuncts to hold in reserve</div>
+  <p><strong>PipeOffload</strong> (<a href="https://arxiv.org/html/2503.01328v1">arXiv 2503.01328</a>) offloads activations to host memory, making deep PP at large microbatch counts memory-feasible <em>without</em> DualPipe's weight duplication — a real alternative if the +20 TB resident is unwelcome. And <strong>vocabulary parallelism</strong> (<a href="https://arxiv.org/pdf/2411.05288">arXiv 2411.05288</a>) addresses the timing imbalance the large embedding/output head injects into PP stages — material for a 10T model where the vocab projection (DV, counted once) is large enough to unbalance a zero-bubble or DualPipe schedule unless explicitly sharded.</p></div>
+
+<h2 id="fabric"><span class="sec-num">05</span>The fabric hierarchy and the composition rule</h2>
+
+<p>Treat the fabric as a strict three-tier hierarchy and assign each collective to exactly one tier:</p>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Tier</th><th>Bandwidth</th><th>Spans</th><th>Carry here</th></tr></thead>
+  <tbody>
+    <tr><td>NVLink 5 (intra-NVL72)</td><td>1.8 TB/s/GPU bidir, 130 TB/s rack bisection</td><td>72 GPUs</td><td>TP, EP all-to-all, SP-TP AG/RS</td></tr>
+    <tr><td>InfiniBand leaf/spine (intra-island)</td><td>~90 GB/s/GPU RDMA (~800 Gb/s scale-out)</td><td>racks in an island</td><td>PP stage-boundary activations</td></tr>
+    <tr><td>Top-of-fabric (inter-island)</td><td>slowest tier</td><td>islands</td><td>DP/FSDP gradient all-reduce (batch-amortized)</td></tr>
+  </tbody>
+  <caption>One collective per fabric tier — the assignment that makes or breaks MFU.</caption>
+</table></div>
+
+<p>The <strong>~20:1 NVLink:IB cliff</strong> (<a href="https://github.com/deepseek-ai/DeepEP">DeepEP</a>; <a href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">NVIDIA GB200</a>) is more extreme than the 4:1 cliff DeepSeek navigated on H800 (<a href="https://arxiv.org/html/2505.09343v1">DeepSeek-V3 hardware retrospective</a>), so the H800 lessons sharpen rather than soften: node-limited routing (cap fan-out), IB-then-NVLink forwarding to dedupe inter-node traffic, and overlapping IB with NVLink. The Scaling Book GPU chapter is blunt about the failure mode: cross-node all-to-all degrades to <strong>~50 GB/s when it spans 2+ nodes</strong> (<a href="https://jax-ml.github.io/scaling-book/gpus/">Scaling Book GPU chapter</a>) — the single biggest GB200 MoE risk.</p>
+
+<p>The composition rule that falls out:</p>
+
+<div class="pull">EP × TP ≤ 72 (NVLink-resident). PP across racks within an island (InfiniBand). DP/FSDP across islands (top-of-fabric). CP folded into the attention mesh only.</div>
+
+<p>Every O(activations·model) collective stays on NVLink; InfiniBand carries only O(activations) PP sends and batch-amortized DP all-reduce. This is non-negotiable — it is the difference between hiding the all-to-all and watching it serialize at 50 GB/s.</p>
+
+<div class="callout warn"><div class="ct">The single biggest way to lose half your MFU</div>
+  <p>Cross-node all-to-all degrades to <strong>~50 GB/s once it spans 2+ nodes</strong>. Put TP, SP, or EP all-to-all over InfiniBand and you do not lose a few points — you serialize the dominant collective at one-twentieth of NVLink and watch your MFU collapse from 40% toward 18%.</p></div>
+
+<h2 id="layout"><span class="sec-num">06</span>Proposed device layout for 100,000 GB200</h2>
+
+<p>100,000 GB200 ≈ <strong>1,389 NVL72 racks</strong>. The concrete assignment:</p>
+
+<figure class="fig" data-fig="meshlayout">
+  <figcaption class="figcap"><b>Figure 3 — The 100k-GB200 mesh factorization.</b> EP×TP is kept <em>inside</em> the 72-GPU NVL72 NVLink domain so the dominant all-to-all rides NVLink (8×8 = 64 ≤ 72); PP spans racks within an island over InfiniBand; DP/FSDP spans islands over the top-of-fabric.
+    <span class="meta"><span>Regime · <b>10T/200B on 100k GB200</b></span><span>Evidence · <b>NVL72 domain + V3-shaped plan</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "deviceTotal":100000,
+    "axes":[
+      {"id":"EP","name":"expert (in-NVL72)","size":8,"fam":"moe"},
+      {"id":"TP","name":"tensor (in-NVL72)","size":8,"fam":"compute"},
+      {"id":"PP","name":"pipeline (IB)","size":16,"fam":"data"},
+      {"id":"DP","name":"data+ZeRO-1 (top)","size":98,"fam":"mem"}
+    ],
+    "note":"EP×TP = 64 ≤ 72 → one NVL72 NVLink domain; PP on IB, DP across islands" }</script>
+</figure>
+
+<h3 id="layout-nvl72">Inside one NVL72 (72 GPUs): EP × TP</h3>
+<p>Use <strong>TP=8</strong> for attention/MLA/shared-expert/router (the dense, model-dim-sharded parts), and <strong>EP up to 64</strong> spanning the rest of the rack for the routed experts — both ride 1.8 TB/s NVLink, so the expert all-to-all and the attention AG/RS never touch InfiniBand. This mirrors DeepSeek's "256 experts over 8 H800 nodes, EP=64" (<a href="https://arxiv.org/html/2412.19437v1">V3 report</a>) but <em>collapses it into a single rack</em>, because the NVL72's 72-GPU NVLink domain is what 8 H800 nodes used to be — node egress jumps from ~400 GB/s (H100 8-GPU node) to <strong>~3,600 GB/s</strong> (<a href="https://jax-ml.github.io/scaling-book/gpus/">Scaling Book GPU chapter</a>). For 10T/200B-active at ~6–8 experts/token, group experts so routing is <strong>rack-limited</strong> (the GB200 analog of DeepSeek's node-limited M=4 routing, where each token reaches ≤4 nodes chosen by per-group affinity sums (<a href="https://arxiv.org/html/2412.19437v1">V3 report</a>, <a href="https://arxiv.org/html/2505.09343v1">hardware retrospective</a>)): cap each token to ≤2–4 racks, send once over RDMA then fan out over NVLink to dedupe IB traffic. Keep an entire expert <em>group</em> inside one NVL72 domain so the RDMA leg carries only cross-group traffic.</p>
+
+<div class="callout key"><div class="ct">The one architectural lever</div>
+  <p>The NVL72's 72-GPU flat NVLink domain is what 8 H800 nodes used to be — node egress jumps from ~400 GB/s to <strong>~3,600 GB/s</strong>. Keep <strong>EP×TP ≤ 72</strong> so the entire expert all-to-all and attention AG/RS ride NVLink and never touch InfiniBand. Everything else in the layout is downstream of this single decision.</p></div>
+
+<p>A subtlety: TP=8 and EP=64 do not multiply to 72 on the same 72 GPUs — they are <em>different meshes over the same rack</em> (Parallel-Folding style). Attention runs TP=8 over 8-GPU NVLink subgroups with the experts collapsed; the MoE layer runs EP=64 with TP=1, resharding at the boundary. In MaxText's coarser model you instead set <code>ici_tensor_parallelism=8</code> and <code>ici_expert_parallelism=8</code> so ICI EP×TP = 64 ≤ 72, letting <code>ici_fsdp_parallelism=-1</code> auto-fill the remainder of the rack (see §07).</p>
+
+<h3 id="layout-pp">Across racks within an island: PP</h3>
+<p>Put <strong>PP=16–32</strong> stages across racks connected by one InfiniBand leaf/spine island. PP moves only stage-boundary activations over IB — the cheapest cross-rack traffic. Run <strong>DualPipeV</strong> so the EP all-to-all and PP sends overlap with compute; bubble ≈ (PP/2−1)(F&amp;B+B−3W). With 61 decoder layers (DeepSeek-V3 scale) or more for a 10T model, PP=16–32 gives 2–4 layers/stage — comfortable for circular/interleaved scheduling.</p>
+
+<h3 id="layout-dp">Across islands: DP/FSDP outer + ZeRO-1</h3>
+<p>With EP·TP filling ~72 GPUs/rack and PP=16–32 racks/replica, one replica ≈ <strong>1,150–2,300 GPUs</strong>; 100k GPUs → <strong>~43–87 DP replicas</strong>. Shard optimizer state (ZeRO-1) across DP so each replica holds 1/N of the 120 TB Muon state (~1.4–2.8 TB/replica, trivially distributed within the replica's GPUs). DP all-reduce of gradients is the only full-model collective crossing the top of fabric, and it is batch-amortized — keep per-replica token batch above the DCN arithmetic-intensity threshold (the GB200 analog of ~73k tokens/replica (<a href="https://jax-ml.github.io/scaling-book/training/">Scaling Book training</a>)) to stay compute-bound. With ~43 replicas and a ~60M-token global batch you get ~1.4M tokens/replica — comfortably DP-safe.</p>
+
+<h3 id="layout-cp">CP for long context</h3>
+<p>Engage <strong>CP=2–8</strong> only at the 64K→1M sequence stages, folded onto the attention mesh (Parallel-Folding style) so the MoE EP layout is untouched. MLA/DSA's compressed KV keeps CP all-gather volume low — and DSA's FP8 lightning indexer selecting top-2048 KV tokens per query reduces attention from O(L²) to O(Lk) (<a href="https://arxiv.org/abs/2512.02556">DeepSeek-V3.2 / DSA</a>), so the CP traffic is on a compressed, sparse KV. This mirrors Llama-3 405B's 4D layout (TP=8, CP=16, PP=16, DP=4 on 16,384 H100 at 128K context (<a href="https://arxiv.org/pdf/2407.21783">Llama-3</a>)), but with EP added as the load-bearing fifth axis and the rack as the new "node."</p>
+
+<h3 id="layout-summary">Layout summary</h3>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Axis</th><th>Degree</th><th>Fabric tier</th><th>Shards</th></tr></thead>
+  <tbody>
+    <tr><td>TP (+SP)</td><td class="num">8</td><td>NVLink (intra-rack)</td><td>attention/MLA, router, shared expert, activations along seq</td></tr>
+    <tr><td>EP</td><td class="num">up to 64</td><td>NVLink (intra-rack)</td><td>routed experts (bulk of 10T)</td></tr>
+    <tr><td>PP</td><td class="num">16–32</td><td>InfiniBand (intra-island)</td><td>layers across racks</td></tr>
+    <tr><td>DP/FSDP+ZeRO-1</td><td class="num">~43–87</td><td>top-of-fabric (inter-island)</td><td>replicas + optimizer state</td></tr>
+    <tr><td>CP</td><td class="num">2–8 (long-ctx)</td><td>NVLink, folded on attention</td><td>sequence/KV</td></tr>
+  </tbody>
+  <caption>The complete 5-axis layout for 10T/200B on 100k GB200.</caption>
+</table></div>
+
+<h2 id="maxtext"><span class="sec-num">07</span>Mapping to MaxText <code>ici_</code>/<code>dcn_</code> axes and <code>pipeline.py</code></h2>
+
+<p>The user's actual codebase (MaxText) expresses this directly. Its logical mesh, from <code>src/MaxText/configs/base.yml</code>, is:</p>
+
+<div class="code-cap">yaml — MaxText logical mesh axes (configs/base.yml)</div>
+<pre class="code"><code>mesh_axes: ['diloco', 'data', 'stage', 'fsdp', 'fsdp_transpose',
+            'context', 'context_autoregressive', 'tensor',
+            'tensor_transpose', 'tensor_sequence', 'expert', 'autoregressive']
+</code></pre>
+
+<p>with the hard ordering rule that <strong>DCN axes must appear earlier in the list than ICI axes</strong>, and the product of all <code>ici_*</code> degrees equals chips-per-slice (<a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/MaxText/configs/base.yml">MaxText base.yml</a>). On a GB200 build the mapping is <strong>ICI → NVLink rack domain, DCN → InfiniBand</strong>. The literal config:</p>
+
+<div class="codecard">
+  <div class="src-meta"><span class="file">src/MaxText/configs/base.yml</span><span class="tag">ici_/dcn_ parallelism</span><span class="tag">GB200 layout</span></div>
+  <div class="annot-grid">
+<pre class="code"><code># --- ICI = NVLink, inside one NVL72 rack ---
+ici_tensor_parallelism: 8        # attention/MLA/shared-expert, NVLink   [1]
+ici_expert_parallelism: 8        # ICI EP x TP = 64  &lt;= 72/rack          [2]
+ici_fsdp_parallelism: -1         # auto-fill the rack remainder          [3]
+ici_pipeline_parallelism: 1
+ici_context_parallelism: 1       # raise only for long-context phase
+
+# --- DCN = InfiniBand, across racks/islands ---
+dcn_pipeline_parallelism: 16     # PP across racks (the 'stage' axis)    [4]
+dcn_data_parallelism: -1         # auto-shard DP across islands
+dcn_expert_parallelism: 1        # never put EP all-to-all over IB       [5]
+dcn_tensor_parallelism: 1        # 'never recommended' in base.yml
+dcn_sequence_parallelism: 1      # 'never recommended'
+dcn_tensor_sequence_parallelism: 1
+</code></pre>
+    <div class="annot-list">
+      <div class="annot"><p><span class="badge">1</span><span class="anh">TP on NVLink.</span> Tensor parallelism shards attention/MLA/router/shared-expert along the model dim — kept inside the rack so AG/RS never hits IB.</p></div>
+      <div class="annot"><p><span class="badge">2</span><span class="anh">EP×TP ≤ 72.</span> ICI EP×TP = 8×8 = 64, comfortably under the 72-GPU NVL72 domain — the composition rule in literal form.</p></div>
+      <div class="annot"><p><span class="badge">3</span><span class="anh">Auto-fill.</span> <code>ici_fsdp_parallelism: -1</code> auto-shards the recommended ICI axis over the remainder of the rack.</p></div>
+      <div class="annot"><p><span class="badge">4</span><span class="anh">PP on the slow tier.</span> The <code>stage</code> axis carries only stage-boundary activations over IB — the cheapest cross-rack traffic.</p></div>
+      <div class="annot"><p><span class="badge">5</span><span class="anh">Never EP/TP over DCN.</span> The explicit <code># never recommended</code> comments encode the ~50 GB/s cross-node all-to-all cliff.</p></div>
+    </div>
+  </div>
+</div>
+
+<p>This is the literal expression of "EP×TP on ICI, PP×DP on DCN." The <code>base.yml</code> defaults confirm the philosophy: <code>ici_fsdp_parallelism: -1</code> (auto-shard the recommended ICI axis), <code>dcn_data_parallelism: -1</code> (auto-shard the recommended DCN axis), and the explicit <code># never recommended</code> comments on <code>dcn_tensor_parallelism</code>, <code>dcn_sequence_parallelism</code>, and <code>dcn_tensor_sequence_parallelism</code> (<a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/MaxText/configs/base.yml">MaxText base.yml</a>) — TP/SP over DCN is fatal precisely because of the ~50 GB/s cross-node all-to-all cliff. Note that EP is named via the <code>expert</code> axis (and TP via <code>tensor</code>, SP via <code>tensor_sequence</code>); the <code>stage</code> axis is pipeline. Because EP sits <em>late</em> in the mesh-axis list and PP (<code>stage</code>) sits early, the ordering rule naturally places PP on DCN and EP on ICI when you set the degrees as above.</p>
+
+<div class="callout note"><div class="ct">Context-as-expert</div>
+  <p>MaxText exposes a <span class="k k-attn">CP_AS_EP</span> path via <code>custom_mesh_and_rule</code> (<code>utils/sharding.py</code>) that folds context parallelism onto the expert mesh — useful when you want long-context CP to reuse the EP all-to-all machinery rather than carve out separate devices. For the long-context phase this is how you raise effective CP without disturbing the routed-expert layout.</p></div>
+
+<h3 id="maxtext-pipeline">Pipeline</h3>
+<p><code>src/MaxText/layers/pipeline.py</code> implements a <strong>circular pipeline</strong>. The number of decoder layers equals <code>num_stages × num_layers_per_pipeline_stage × num_pipeline_repeats</code>. The relevant knobs from <code>base.yml</code>:</p>
+
+<ul>
+  <li><code>num_layers_per_pipeline_stage: 1</code> (default) — more layers/stage means easier comm overlap but fewer repeats;</li>
+  <li><code>num_pipeline_repeats: -1</code> — auto-set to <code>num_decoder_layers / (num_pipeline_stages × num_layers_per_pipeline_stage)</code>;</li>
+  <li><code>num_pipeline_microbatches: -1</code> — auto-set to the number of stages; must be a multiple of the stage count; more microbatches → smaller bubble;</li>
+  <li><code>pipeline_delay_activation_forwarding: false</code> — when true, delays activation forwarding one loop iteration to simplify XLA's overlap of the circular (last-stage→first-stage) transfer, doing it asynchronously.</li>
+</ul>
+
+<div class="formula"><span class="lbl">data</span>
+  <span class="eq">bubble frac = (num_stages − 1) / (num_repeats · num_microbatches + num_stages − 1)</span>
+  <span class="note">The circular-schedule arithmetic MaxText documents — the reason to push microbatch count up. Same family as 1F1B, not DualPipeV.</span></div>
+
+<p>The bubble fraction MaxText documents is <strong>(num_stages − 1) / (num_pipeline_repeats × num_pipeline_microbatches + num_stages − 1)</strong> (<a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/MaxText/configs/base.yml">MaxText base.yml</a>) — the same circular-schedule arithmetic that motivates pushing microbatch count up. MaxText's circular pipeline is a 1F1B-family schedule, not DualPipeV; if you want native all-to-all/PP comm-compute overlap you either lean on <code>pipeline_delay_activation_forwarding</code> plus XLA's overlap, or you port a DualPipe-style bidirectional schedule. For the GB200 target, the pragmatic path inside MaxText is: maximize <code>num_pipeline_microbatches</code>, enable delayed activation forwarding, and rely on the EP all-to-all (<span class="k k-comms">jax.lax.ragged_all_to_all</span>) overlapping with grouped-GEMM at the kernel level rather than at the schedule level.</p>
+
+<h3 id="maxtext-moe">Where the MoE sharding actually happens</h3>
+<p>MaxText's <code>sparse_matmul</code> path in <code>layers/moe.py</code> is the EP-sharded, dropless realization. EP cross-device routing uses <span class="k k-comms">jax.lax.ragged_all_to_all</span> with offsets/sizes from <code>get_all_to_all_params</code>; the grouped GEMM dispatches across <span class="k k-compute">jax.lax.ragged_dot</span>, the forked megablox <code>mblx.gmm</code>, or <code>tokamax.ragged_dot</code>. The dropless ragged buffer is sized at <code>min(ep_degree, global_experts/top_k) × balanced_size</code> for worst-case no-drop — never worse than 256/8 = <strong>32×</strong> for a DeepSeek-style config, and once EP &gt; 32 the bound is <code>global_experts/top_k</code> independent of EP (<a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/layers/moe.py">MaxText moe.py</a>). The <code>base.yml</code> defaults are <code>megablox: true</code>, <code>sparse_matmul: true</code>, <code>capacity_factor: -1.0</code> (dropless), <code>ragged_buffer_factor: -1.0</code> (worst-case dropless buffer) (<a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/MaxText/configs/base.yml">base.yml</a>).</p>
+
+<div class="formula"><span class="lbl">moe</span>
+  <span class="eq">ragged buffer = min( |EP| , global_exp / top<sub>k</sub> ) × balanced_size &nbsp;→&nbsp; ≤ 256/8 = 32×</span>
+  <span class="note">Once |EP| &gt; global_exp/top<sub>k</sub> the bound is global_exp/top<sub>k</sub>, independent of EP. Set ragged_buffer_factor ≈ 3.0 to cap activation memory at a near-dropless compromise.</span></div>
+
+<p>At EP in the dozens-to-hundreds, set <code>ragged_buffer_factor ≈ 3.0</code> to cap activation memory at a near-dropless compromise rather than provisioning the full 32× worst case, and enable the <span class="k k-moe">use_ring_of_experts</span> / <span class="k k-moe">use_ragged_sort</span> Pallas kernels (<code>a2a_ragged_sort</code>, <code>ring_ragged_sort</code>) which gather only the valid prefix instead of the padded buffer — the optimization that matters once EP is large and padded sort becomes pure waste.</p>
+
+<div class="callout do"><div class="ct">Set ragged_buffer_factor ≈ 3.0 and enable ragged-sort</div>
+  <p>The 32× worst-case dropless buffer is far larger than real imbalance ever is. Set <code>ragged_buffer_factor ≈ 3.0</code> for a near-dropless, memory-bounded compromise, and turn on the <code>use_ragged_sort</code> Pallas kernels so you sort only the valid prefix — the optimization that pays off once EP is large and the padded buffer dwarfs the real token count.</p></div>
+
+<h2 id="comm-kernels"><span class="sec-num">08</span>Communication kernels and the FP8 dispatch path</h2>
+
+<p>The all-to-all is make-or-break, and the kernel substrate is where the layout's promises get cashed. <strong>DeepEP</strong> gives the measured numbers on Blackwell (SM100): NVLink dispatch/combine of <strong>726/740 GB/s at EP8</strong> (max-perf, 64 SMs) and 643/675 GB/s at the minimal-SM config; SM90/CX7 RDMA is <strong>90/81 GB/s</strong> dispatch/combine (<a href="https://github.com/deepseek-ai/DeepEP">DeepEP</a>). The ~20:1 NVLink:RDMA ratio in these numbers is exactly why EP must stay on NVLink. DeepEP supports <strong>FP8 dispatch with BF16 combine</strong>, halving the dispatch bytes, and the V2 rewrite drops SM consumption from 24 to <strong>4–6 SMs</strong> while unifying the high-throughput and low-latency kernels behind a single <code>ElasticBuffer</code> and an NCCL "Gin" backend (<a href="https://github.com/deepseek-ai/DeepEP">DeepEP</a>). Track the NVIDIA-authored <strong><code>hybrid-ep</code></strong> branch for GB200 — it uses TMA copies and warp-level pipelining to minimize SM occupancy while saturating both NVLink and RDMA (verify SM100 support before committing).</p>
+
+<div class="stats">
+  <div class="stat" data-fam="comms"><div class="v">726<span class="u">GB/s</span></div><div class="l">DeepEP SM100 NVLink dispatch, EP8</div></div>
+  <div class="stat" data-fam="comms"><div class="v">24<span class="u">→4–6</span></div><div class="l">SM cost, V1→V2 low-latency path</div></div>
+  <div class="stat" data-fam="comms"><div class="v">~115<span class="u">KB</span></div><div class="l">all-to-all / token / layer (BF16)</div></div>
+  <div class="stat" data-fam="compute"><div class="v">6144<span class="u">F/B</span></div><div class="l">FLOPs/byte to hide MoE comm</div></div>
+</div>
+
+<p>Per-MoE-layer dispatch moves <code>top_k × tokens</code> activation rows of width <code>d_model</code> out and combine brings them back: bidirectional volume ≈ <code>2 · top_k · d_model · bytes</code> per token, <strong>~115 KB/token/layer in BF16</strong> at top-8, d_model≈7168, dropping to <strong>~86 KB with FP8 dispatch</strong>. The decisive ratio is <strong>~6,144 FLOPs/Byte to fully hide MoE comm under compute</strong> (<a href="https://arxiv.org/html/2606.19348v1">DeepSeek-V4</a>) — design the per-GPU token batch so the expert GEMM FLOPs clear that bar.</p>
+
+<div class="formula"><span class="lbl">comms</span>
+  <span class="eq">AllToAll bytes / token / layer = 2 · top<sub>k</sub> · d<sub>model</sub> · bytes &nbsp;→&nbsp; ratio to beat ≈ 6144 FLOP/byte</span>
+  <span class="note">≈115 KB at BF16 (top-8, d_model≈7168), ≈86 KB with FP8 dispatch. Stay above 6144 FLOP/byte and the expert GEMM hides the all-to-all under compute.</span></div>
+
+<figure class="fig narrow" data-fig="bars">
+  <figcaption class="figcap"><b>Figure 4 — DeepEP SM100 bandwidth: the ~20:1 NVLink:RDMA gap, in one chart.</b> NVLink dispatch/combine sit near 726/740 GB/s on Blackwell, while CX7 RDMA tops out at 90/81 GB/s and cross-node all-to-all sags to ~50 GB/s past 2 nodes — the entire reason EP must stay on NVLink.
+    <span class="meta"><span>Regime · <b>EP8, SM100 + SM90 CX7</b></span><span>Evidence · <b>DeepEP measured</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "ylabel":"GB/s","unit":"GB/s","max":820,
+    "bars":[
+      {"label":"NVLink\ndispatch","value":726,"fam":"comms"},
+      {"label":"NVLink\ncombine","value":740,"fam":"comms"},
+      {"label":"CX7 RDMA\ndispatch","value":90,"fam":"data"},
+      {"label":"CX7 RDMA\ncombine","value":81,"fam":"data"},
+      {"label":"x-node\na2a (2+ nodes)","value":50,"fam":"moe"}
+    ],
+    "ref":{"y":726,"label":"NVLink line"} }</script>
+</figure>
+
+<p>The endgame is the <strong>DeepGEMM MegaMoE</strong> fused kernel that V4 introduced: it fuses EP-dispatch → first <span class="f-prec">FP8×FP4</span> expert GEMM → SwiGLU(+requant) → second GEMM → EP-combine into a single symmetric-memory kernel, overlapping NVLink transfers with tensor-core MMA via expert "waves," for <strong>1.50–1.73× general / up to 1.96× latency-sensitive</strong> speedup over the non-fused baseline (<a href="https://arxiv.org/html/2606.19348v1">DeepSeek-V4</a>). Caveat: FP4×FP8 currently runs at FP8×FP8 <em>speed</em> on existing silicon — the FP4 expert weights are a memory/footprint win on GB200 today, not yet a compute win (<a href="https://arxiv.org/html/2606.19348v1">V4</a>). Megatron-Core's production realization (Flex dispatcher with DeepEP/HybridEP, TEGroupedMLP grouped-GEMM, permutation and router/aux-loss fusion) reports <strong>1,233 TFLOPS/GPU on GB200</strong> for DeepSeek-V3-685B (vs 1,048 on H100) and 974 (GB200) for Qwen3-235B (<a href="https://arxiv.org/abs/2603.07685">Megatron-Core MoE</a>) — the empirical MFU envelope to design against. In JAX/MaxText, the equivalent stack is <code>sparse_matmul</code> + <code>ragged_all_to_all</code> + tokamax/megablox <code>ragged_dot</code>.</p>
+
+<div class="callout warn"><div class="ct">Two systems landmines at this scale</div>
+  <p>DeepEP's low-latency RDMA path floors at <strong>~39 GB/s once you exceed ~256 experts</strong> (each token fans out to more remote domains), and <strong>DeepEP issue #427</strong> reports low-latency dispatch can corrupt under heavily imbalanced expert load — precisely the early-training regime before the auxiliary-loss-free bias balancer (V3's ±γ=0.001 schedule, MaxText's <code>routed_bias_update_rate</code>) has converged (<a href="https://github.com/deepseek-ai/DeepEP">DeepEP</a>; <a href="https://arxiv.org/html/2412.19437v1">V3 report</a>). <span class="conf conf-confirmed">FP4 caveat stated in V4</span></p></div>
+
+<h2 id="reliability"><span class="sec-num">09</span>Reliability forces DP to be the outer, elastic axis</h2>
+
+<p>The last constraint is not a roofline, it is the MTTF. At ~131k GPUs a training job's projected MTTF is <strong>~14 minutes</strong>; SDC affects ~1/1000 machines with corruption events every 1–2 weeks; at 100k accelerators the checkpoint cadence approaches <strong>~967/day (~every 1.5 min)</strong> (<a href="https://arxiv.org/html/2502.12340v1">reliability analysis</a>). GB200 shifts the unit of repair from server to <em>rack</em>. This is the systems reason DP/FSDP must be the <strong>outer</strong> axis: it is the only axis you can elastically resize — drop a failed replica, reform the mesh — without re-laying-out the EP/TP/PP sharded unit. The proposed layout deliberately confines a failure's blast radius to one PP-stage rack inside one DP replica.</p>
+
+<div class="stats">
+  <div class="stat" data-fam="optim"><div class="v">~14<span class="u">min</span></div><div class="l">job MTTF at ~131k GPUs</div></div>
+  <div class="stat" data-fam="mem"><div class="v">~967<span class="u">/day</span></div><div class="l">checkpoint cadence (~every 1.5 min)</div></div>
+  <div class="stat" data-fam="optim"><div class="v">1/1000<span class="u">SDC</span></div><div class="l">machines, corruption every 1–2 wk</div></div>
+</div>
+
+<p>Pair this with asynchronous/in-memory checkpointing. MaxText's <code>common/checkpointing.py</code> provides exactly the machinery: Orbax <span class="k k-mem">CheckpointManager</span>, the <code>EmergencyCheckpointManager</code> and <code>EmergencyReplicatorCheckpointManager</code> (async/in-memory, replica-redundant copies), OCDBT with 2 GB target file size and 96 GB concurrent writes, and <code>enable_autocheckpoint</code> on preemption. ByteDance's infrastructure work (<a href="https://arxiv.org/pdf/2509.16293">arXiv 2509.16293</a>) documents the operational pattern — fast failure detection, in-memory checkpoint, elastic reconfiguration — that makes a DP-outer layout survivable at 10k+ GPUs and necessary at 100k.</p>
+
+<div class="callout miss"><div class="ct">Why DP must be the outermost axis</div>
+  <p>DP/FSDP is the <em>only</em> axis you can elastically resize — drop a failed replica, reform the mesh — without re-laying-out the EP/TP/PP sharded unit. At a ~14-minute MTTF you will exercise this constantly, so the layout deliberately confines a failure's blast radius to one PP-stage rack inside one DP replica.</p></div>
+
+<h2 id="bottom-line"><span class="sec-num">10</span>The opinionated bottom line</h2>
+
+<p>For 10T/200B on 100,000 GB200:</p>
+
+<figure class="fig" data-fig="barshare">
+  <figcaption class="figcap"><b>Figure 5 — Where the 10T/200B parallelism budget is spent.</b> The five axes split the work: EP carries the bulk of the 10T weights, PP shards layers cheaply across IB, TP handles the dense attention parts, DP+ZeRO-1 is the elastic outer shell, CP engages only for long context. Color = fabric tier discipline.
+    <span class="meta"><span>Regime · <b>10T/200B on 100k GB200</b></span><span>Evidence · <b>proposed layout</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "title":"the parallelism budget","unit":"axis weight (illustrative)",
+    "items":[
+      {"label":"EP — routed experts (NVLink)","value":40,"fam":"moe"},
+      {"label":"PP — layers (InfiniBand)","value":22,"fam":"data"},
+      {"label":"TP+SP — attention (NVLink)","value":18,"fam":"compute"},
+      {"label":"DP+ZeRO-1 — replicas (top)","value":14,"fam":"mem"},
+      {"label":"CP — long ctx (folded)","value":6,"fam":"attn"}
+    ],
+    "note":"Each axis shards a different state on a different fabric tier — the discipline that keeps MFU near 40%." }</script>
+</figure>
+
+<ol>
+  <li><strong><span class="f-optim">Muon as primary optimizer</span></strong> (AdamW only on embeddings/heads/norms) to hold the resident state at 120 TB rather than 160 TB — the optimizer state is the binding memory term, not the weights.</li>
+  <li><strong><span class="f-moe">EP is the load-bearing axis.</span></strong> Shard the 10T weights with expert-parallelism, not FSDP. Keep EP×TP ≤ 72, entirely on NVLink.</li>
+  <li><strong>TP=8 for attention, EP up to 64 for experts</strong>, as separate Parallel-Folding meshes over the same rack; expert-shard the FFN (its F≈2,048 is too small to TP-split).</li>
+  <li><strong>PP=16–32 across racks on InfiniBand</strong>, scheduled with <strong>DualPipeV</strong> (or MaxText's circular pipeline with maximized microbatches + delayed activation forwarding) to overlap the all-to-all under compute.</li>
+  <li><strong>DP ~43–87 replicas across islands with ZeRO-1</strong>, as the elastic, fault-isolated outer axis — the only one you resize on failure.</li>
+  <li><strong>CP=2–8 folded onto attention</strong> only at the long-context (64K→1M) stages, riding MLA/DSA's compressed sparse KV.</li>
+  <li><strong>Never</strong> put TP, SP, or EP all-to-all over InfiniBand. The ~50 GB/s cross-node all-to-all cliff is the single biggest way to lose half your MFU.</li>
+</ol>
+
+<figure class="fig" data-fig="flow">
+  <figcaption class="figcap"><b>Figure 6 — The composition rule as dataflow.</b> EP×TP collapse inside one NVL72 (NVLink); PP carries stage-boundary activations across racks (InfiniBand); DP+ZeRO-1 spans islands (top-of-fabric). The hierarchy is strict and one-directional: fast collectives stay innermost.
+    <span class="meta"><span>Regime · <b>strict 3-tier fabric</b></span><span>Evidence · <b>composition rule</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "cols":4,"rows":1,"anim":true,
+    "nodes":[
+      {"id":"a","label":"TP=8\n(NVLink)","fam":"compute","col":0,"row":0},
+      {"id":"b","label":"EP≤64 all-to-all\n(NVLink)","fam":"moe","col":1,"row":0},
+      {"id":"c","label":"PP=16–32 sends\n(InfiniBand)","fam":"data","col":2,"row":0},
+      {"id":"d","label":"DP+ZeRO-1 all-reduce\n(top-of-fabric)","fam":"mem","col":3,"row":0}
+    ],
+    "edges":[
+      {"from":"a","to":"b","label":"in-rack"},
+      {"from":"b","to":"c","label":"cross-rack"},
+      {"from":"c","to":"d","label":"cross-island"}
+    ] }</script>
+</figure>
+
+<p>In MaxText terms: <code>ici_tensor_parallelism=8</code>, <code>ici_expert_parallelism=8</code>, <code>ici_fsdp_parallelism=-1</code>, <code>dcn_pipeline_parallelism=16-32</code>, <code>dcn_data_parallelism=-1</code>, everything else <code>dcn_*=1</code>. That single config block is the entire layout, and the rest of this manual is the justification for why each number is what it is.</p>
+
+<div class="callout key"><div class="ct">The whole layout in one config block</div>
+  <p><code>ici_tensor_parallelism=8 · ici_expert_parallelism=8 · ici_fsdp_parallelism=-1 · dcn_pipeline_parallelism=16–32 · dcn_data_parallelism=-1 · dcn_*=1</code>. EP×TP on NVLink, PP×DP on InfiniBand and top-of-fabric, CP folded onto attention only at long context. Everything else in this chapter is the justification for those numbers.</p></div>
+
+<div class="sources"><h3>Sources</h3><ul>
+  <li>DeepSeek-V3 technical report (PP=16, EP=64, ZeRO-1, no TP; DualPipe; node-limited routing; aux-loss-free bias): <a href="https://arxiv.org/html/2412.19437v1">arxiv.org/html/2412.19437v1</a></li>
+  <li>DeepSeek-V3 hardware co-design retrospective (NVLink:IB cliff, IB-then-NVLink forwarding): <a href="https://arxiv.org/html/2505.09343v1">arxiv.org/html/2505.09343v1</a></li>
+  <li>DualPipe / DualPipeV repository (bubble/memory comparison): <a href="https://github.com/deepseek-ai/DualPipe">github.com/deepseek-ai/DualPipe</a></li>
+  <li>Zero Bubble pipeline (ZB-H1/ZB-H2): <a href="https://arxiv.org/abs/2401.10241">arxiv.org/abs/2401.10241</a></li>
+  <li>PipeOffload (activation offloading for deep PP): <a href="https://arxiv.org/html/2503.01328v1">arxiv.org/html/2503.01328v1</a></li>
+  <li>Vocabulary parallelism for balanced PP: <a href="https://arxiv.org/pdf/2411.05288">arxiv.org/pdf/2411.05288</a></li>
+  <li>DeepEP all-to-all library (NVLink/RDMA numbers, FP8 dispatch, V2/hybrid-ep): <a href="https://github.com/deepseek-ai/DeepEP">github.com/deepseek-ai/DeepEP</a></li>
+  <li>Megatron-Core MoE / Parallel Folding / GB200 TFLOPS: <a href="https://arxiv.org/abs/2603.07685">arxiv.org/abs/2603.07685</a></li>
+  <li>JAX Scaling Book — training rooflines and parallelism: <a href="https://jax-ml.github.io/scaling-book/training/">jax-ml.github.io/scaling-book/training</a></li>
+  <li>JAX Scaling Book — transformer math (FLOPs, params, activations, MoE deltas): <a href="https://jax-ml.github.io/scaling-book/transformers/">jax-ml.github.io/scaling-book/transformers</a></li>
+  <li>JAX Scaling Book — sharding and collective costs: <a href="https://jax-ml.github.io/scaling-book/sharding/">jax-ml.github.io/scaling-book/sharding</a></li>
+  <li>JAX Scaling Book — GPU chapter (NVL72 rooflines, cross-node all-to-all cliff): <a href="https://jax-ml.github.io/scaling-book/gpus/">jax-ml.github.io/scaling-book/gpus</a></li>
+  <li>NVIDIA GB200 NVL72 (HBM, NVLink, dense vs sparse FLOPS): <a href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">nvidia.com/en-us/data-center/gb200-nvl72</a></li>
+  <li>Muon optimizer state quantization (4 B/param momentum): <a href="https://arxiv.org/html/2509.23106v2">arxiv.org/html/2509.23106v2</a></li>
+  <li>DeepSeek-V4 (MegaMoE fused kernel, FP8×FP4, Sqrt(Softplus) routing): <a href="https://arxiv.org/html/2606.19348v1">arxiv.org/html/2606.19348v1</a></li>
+  <li>DeepSeek-V3.2 / DSA sparse attention: <a href="https://arxiv.org/abs/2512.02556">arxiv.org/abs/2512.02556</a></li>
+  <li>Llama-3 405B 4D parallelism reference: <a href="https://arxiv.org/pdf/2407.21783">arxiv.org/pdf/2407.21783</a></li>
+  <li>Reliability at ~131k GPUs (MTTF, checkpoint cadence): <a href="https://arxiv.org/html/2502.12340v1">arxiv.org/html/2502.12340v1</a></li>
+  <li>ByteDance robust LLM training infrastructure: <a href="https://arxiv.org/pdf/2509.16293">arxiv.org/pdf/2509.16293</a></li>
+  <li>MaxText base.yml (mesh axes, ici_/dcn_, pipeline knobs): <a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/MaxText/configs/base.yml">maxtext/src/MaxText/configs/base.yml</a></li>
+  <li>MaxText moe.py (ragged_all_to_all, ragged buffer sizing): <a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/layers/moe.py">maxtext/src/maxtext/layers/moe.py</a></li>
+</ul></div>

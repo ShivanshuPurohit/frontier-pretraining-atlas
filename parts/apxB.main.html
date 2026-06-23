@@ -1,0 +1,293 @@
+<p class="eyebrow">Appendix B · The operational and economic reality</p>
+<h1>Cluster TCO, the 2026–2027 hardware roadmap, multi-datacenter training, and the SemiAnalysis numbers</h1>
+<p class="lede">Everything in the main text — 10T total / 200B active, a 50:1-sparsity MoE on ~100k GB200 GPUs — is a bet on a physical machine that costs real megawatts, fails in characteristic ways, and is already being superseded by the next two silicon generations before the first run finishes. This appendix prices that machine.</p>
+<p class="byline"><span>~30 min read</span><span class="dot">5 figures</span><span class="dot">sourced to the SemiAnalysis archive</span></p>
+<hr />
+
+<p>This appendix is the ledger behind the architecture. The job here is to price the machine: what fraction of its advertised FLOPs you will actually realize (<span class="f-norm">MFU/goodput</span>), what it costs per GPU-hour once downtime and HBM scarcity are folded in, where it sits on the 2026–2027 accelerator roadmap, how the network and optics gate the expert-parallel collectives an MoE lives or dies on, why a frontier run is increasingly forced across building and campus boundaries, and what the "Orion / Claude 3.5 Opus / o1 Pro" episode tells us about whether pretraining scaling is even the right axis to be spending on. Every number below is sourced to the reader's own SemiAnalysis archive and tied back to the 100k-GB200 plan.</p>
+
+<p>A framing number to keep in view: SemiAnalysis ("Scaling Laws — O1 Pro Architecture, Reasoning Training Infrastructure, Orion and Claude 3.5 Opus 'Failures'") calibrates that <strong>100k GB200 &gt; 400k Trainium2 in raw FLOPs</strong>, and that Amazon's $6.5B Project Rainier (400k Trn2 for Anthropic) is therefore <em>smaller</em> than this build in deliverable training FLOPs. The 100k-GB200 target is a genuine top-of-frontier cluster, comparable to roughly 3× the GB200 portion of xAI's Colossus 1 (~30k GB200). It is also, by 2026 standards, a machine that no team running manual ssh-based sysadmin can operate — the entire premise below is that operating it is a software and economics problem at least as much as a hardware one.</p>
+
+<div class="pull">The machine is worth ~1.5× an H100 the day it boots and ~2.7× once the Blackwell software curve matures — but power and HBM4, not GPU allocation, are the binding constraints, and goodput and a hot-spare pool are first-order TCO line items, not afterthoughts.</div>
+
+<div class="stats">
+  <div class="stat" data-fam="compute"><div class="v">100k<span class="u">GB200</span></div><div class="l">&gt; 400k Trainium2 in raw FLOPs</div></div>
+  <div class="stat" data-fam="comms"><div class="v">18<span class="u">×</span></div><div class="l">faster 64-GPU all-to-all on NVL72 vs 64 H100</div></div>
+  <div class="stat" data-fam="mem"><div class="v">9<span class="u">%</span></div><div class="l">HBM shortfall by 2027 — the gating factor</div></div>
+  <div class="stat" data-fam="norm"><div class="v">150–220<span class="u">MW</span></div><div class="l">all-in power for the cluster — the schedule-setter</div></div>
+</div>
+
+<h2 id="mfu-ramp"><span class="sec-num">01</span>GB200 NVL72 vs H100 in practice — real MFU, the software ramp, and what interruptions cost</h2>
+
+<p><strong>The software-maturity curve is the dominant near-term lever, and a new architecture always starts low.</strong> The single most important fact from "H100 vs GB200 NVL72 Training Benchmarks" is that on a fixed H100 cluster, GPT-3 175B BF16 MFU rose from <strong>34% (Jan 2024) to 54% (Dec 2024)</strong> — a +57% throughput gain from nothing but CUDA-stack maturation (fused <span class="k k-compute">wgmma</span> kernels in CuDNN/CuBLAS, NCCL collectives consuming fewer SMs). FP8 over the same window went <strong>29.5% → 39.5% (+34%)</strong>. By Nov 2024 → Apr 2025 Llama3 8B barely moved: Hopper software saturated at roughly 23 months. The implication for GB200 is direct and uncomfortable. As of August 2025, <strong>no large-scale frontier training run had been completed on GB200 NVL72</strong> — only H100/H200 and TPUs had finished frontier-scale pretraining; GB200 was confined to inference, small experiments, and dev jobs. A 100k-GB200 pretrain launching into 2026 is therefore riding the <em>early, steep</em> part of the Blackwell software curve, where most of the realized-throughput gains are still ahead of you and dependent on NVIDIA, NeMo/Megatron-LM, and TorchTitan kernel work landing on schedule.</p>
+
+<figure class="fig narrow" data-fig="line">
+  <figcaption class="figcap"><b>Figure 1 — The software-maturity curve is the lever.</b> On a fixed H100 cluster, GPT-3 175B MFU climbed +57% (BF16) and +34% (FP8) over 2024 from CUDA-stack maturation alone — and GB200 in 2026 is at the steep <em>start</em> of its own curve.
+    <span class="meta"><span>Regime · <b>fixed H100, no hardware change</b></span><span>Evidence · <b>SemiAnalysis H100-vs-GB200 benchmarks</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "xlabel":"month (2024)","ylabel":"GPT-3 175B MFU %",
+    "series":[
+      {"name":"BF16","fam":"compute","pts":[[1,34],[12,54]]},
+      {"name":"FP8","fam":"prec","pts":[[1,29.5],[12,39.5]]}
+    ],
+    "annotations":[{"x":12,"y":54,"text":"+57% from software"},{"x":12,"y":39.5,"text":"+34% FP8"}] }</script>
+</figure>
+
+<p>The crossover trajectory SemiAnalysis measured: GB200 perf/TCO was <strong>below H100 in May 2025</strong> (2 months post mass-deploy), reached <strong>1.5× by July 2025</strong> (5 months), and was <span class="conf conf-rumored">projected</span> to hit <strong>2.7× within a further 3–6 months</strong>. On DeepSeek 670B tokens/s/GPU, GB200 led H100 by only +30% in May, jumped to 2.5× by July, and was projected to reach <strong>4.7× on BF16 by Dec 2025 at 42% MFU</strong>. Read this as a curve, not a point: the machine you commission is worth perhaps 1.5× an H100 on day one and ~2.7× once the stack matures, and the gap between those two numbers is months of kernel and collective engineering you must either do or wait for.</p>
+
+<div class="callout key"><div class="ct">The one number to remember</div>
+  <p>GB200 is worth <strong>~1.5× an H100 on day one, ~2.7× once the Blackwell stack matures</strong>. Everything in this appendix is downstream of the fact that you are commissioning into the <em>steep, early</em> part of that software curve.</p></div>
+
+<p><strong>The MoE-specific story is why this build is on NVL72 at all.</strong> DeepSeek 670B on H100 BF16 sustains only <strong>16.6% MFU</strong>, versus <strong>54.5% for dense Llama3 405B</strong> — a collapse driven entirely by <span class="f-comms">all-to-all expert dispatch/combine</span> communication. MoE comm volume scales <span class="f-comms">O(top_k)</span>: routing each token to 4 experts is 4× the communication. The decisive GB200 advantage is the 72-GPU scale-up world: a <strong>64-GPU all-to-all collective runs 18× faster on GB200 NVL72 than on 64 H100s</strong>. For a 200B-active MoE whose dominant collective is exactly this token-routing all-to-all, the <span class="f-comms">NVL72 NVLink domain</span> is the feature you are paying the premium for. The corollary SemiAnalysis flags: for <em>dense</em> models of ordinary size, vanilla HGX B200/B300 is actually better perf/TCO than GB200 NVL72, and neoclouds are choosing HGX accordingly. GB200 NVL72 only pulls ahead as the model scales, as it goes sparse-MoE, or when RL enters — all three of which describe this plan precisely. Note also the architectural trend the same report observes: frontier labs are moving <em>back to BF16 from FP8</em> for stability while pushing extreme sparsity (very few active params) to cut inference cost — again, exactly the 10T/200B design point.</p>
+
+<div class="stats">
+  <div class="stat" data-fam="moe"><div class="v">16.6<span class="u">%</span></div><div class="l">DeepSeek 670B MoE MFU on H100 BF16</div></div>
+  <div class="stat" data-fam="compute"><div class="v">54.5<span class="u">%</span></div><div class="l">dense Llama3 405B MFU, same H100</div></div>
+  <div class="stat" data-fam="norm"><div class="v">2.2<span class="u">×</span></div><div class="l">GB200 power efficiency vs H100, Jul 2025</div></div>
+</div>
+
+<p><strong>Energy per token, not just speed.</strong> By July 2025 GB200 was already <strong>2.2× more power-efficient than H100</strong>, with a projected <strong>4× lower J/token by Dec 2025</strong> — meaning a fixed 100MW hall trains ~4× more tokens on GB200 than on H100. GB200's direct-to-chip liquid cooling (DLC) lowers PUE on top of that. Since this build is power-bound (§02), <span class="f-norm">J/token</span> is the metric that converts a megawatt budget into a token budget.</p>
+
+<h3 id="reliability">Failure and interruption rates — and what they actually cost</h3>
+
+<p>This is where the GB200 advantage erodes, and the numbers must be in the cost model from the start. GB200 is <em>less</em> reliable per-GPU than Hopper, and its blast radius is 9× larger.</p>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Reliability dimension</th><th>HGX H100/H200/B200</th><th>GB200 NVL72</th></tr></thead>
+  <tbody>
+    <tr><td>MTBI (mean time between interruptions)</td><td class="num">2,000 GPU-days (inexperienced) → 5,000 (advanced)</td><td class="num"><b>1,000–3,000 GPU-days (lower)</b></td></tr>
+    <tr><td>Blast radius of a switch/backplane fault</td><td class="num">8 GPUs (one board)</td><td class="num"><b>72 GPUs (whole rack)</b></td></tr>
+    <tr><td>Compute-tray swap</td><td class="num">&lt;2h board swap</td><td class="num">1–4h (rest of rack keeps running)</td></tr>
+    <tr><td>Switch-tray swap</td><td>n/a</td><td class="num">1–4h, <b>drains whole rack</b></td></tr>
+    <tr><td>Backplane swap</td><td>n/a</td><td class="num"><b>8–24h</b> (remove 10 rack stiffeners)</td></tr>
+    <tr><td>Hot spares held</td><td>typically per-node</td><td class="num"><b>8 of 72 GPUs</b> per rack (Slurm <code>--segment</code> uses 64)</td></tr>
+  </tbody>
+  <caption>The rack is 18 compute trays + 9 NVSwitch trays + 4 copper backplane cartridges. Source: SemiAnalysis "H100 vs GB200 NVL72 Training Benchmarks."</caption>
+</table></div>
+
+<p><span class="k k-comms">XID 149</span> errors from NVLink copper-backplane signal-integrity were widespread; Paladin HD connectors (gold-plated, max <strong>200 mating cycles</strong>) must be torqued precisely or BER/BLER spikes drive NCCL timeouts. Diagnostics (<span class="k k-norm">nvloom</span>, multimode <span class="k k-norm">dcgmi diag</span>, <span class="k k-norm">ubergemm</span>) remain immature, and root-causing which Paladin connector failed can take hours, requiring 3-way coordination (customer on compute tray, hyperscaler on switch tray, NVIDIA support) because clients lack NVSwitch ssh access.</p>
+
+<p>The economic bite: for Llama4 Maverick (May 2025), counting the 8 hot-spare GPUs per rack as a cost <strong>erodes GB200's advantage from 50% cheaper to 20% cheaper</strong>, and spare-rack standby (the larger blast radius needs whole spare racks) erodes it further from <strong>50% → 30% cheaper</strong>. SemiAnalysis's "ClusterMAX 2.0" report adds the root cause and its fix: GB200 NVLink loss-of-sync was traced to a <em>firmware bug</em> (not hardware), stabilized only in <strong>firmware v1.3 (~Oct 2025), a 6–7 month delay</strong> after NVL36×2 volume shipments. NVL36×2 designs (GCP, AWS, Meta Ariel) additionally suffer on the <strong>168 ACC cables</strong> that fuse two NVL36 racks into a logical NVL72. Provisioning a fresh NVL72 rack or backplane from scratch is a 10-step sequence taking <strong>9 hours to multiple days</strong>.</p>
+
+<div class="callout warn"><div class="ct">You cannot run this manually</div>
+  <p>Manual ssh-admin tops out around 512 H100; at NVL72 scale every health check, drain, hot-spare swap, and SerDes recalibration must be automated, which is why SemiAnalysis concludes only top labs, hyperscalers, and CSPs can operate NVL72 <em>training</em> at all.</p></div>
+
+<h2 id="tco"><span class="sec-num">02</span>What a cluster actually costs — TCO, $/GPU-hour, and power as the binding constraint</h2>
+
+<p><strong>Headline capex.</strong> An H100 server is ~$190k (down over 18 months), ~$250k all-in with storage and networking. A GB200 NVL72 rack is ~$3.1M, <strong>~$3.9M all-in</strong>. GB200 all-in capex/GPU is <strong>1.6–1.7× H100</strong>, and total TCO/GPU is ~1.6× — so GB200 must run <strong>≥1.6–1.7× faster than H100 just to break even on perf/TCO</strong>, which (per §01) it only clears once the software matures past the July-2025 crossover. The GB200 chip draws <strong>1200W vs H100's 700W</strong>.</p>
+
+<div class="tcards">
+  <div class="tcard" data-fam="norm"><div class="tn">H100 server</div><div class="ts">~$190k → ~$250k all-in</div><div class="tm">700W/chip; the perf/TCO baseline everything else must beat.</div></div>
+  <div class="tcard" data-fam="compute"><div class="tn">GB200 NVL72 rack</div><div class="ts">~$3.1M → ~$3.9M all-in</div><div class="tm">1.6–1.7× capex/GPU; 1200W/chip; must run ≥1.6–1.7× faster to break even.</div></div>
+  <div class="tcard" data-fam="mem"><div class="tn">storage envelope</div><div class="ts">2 → 25 TB/GPU</div><div class="tm">FSx Lustre 125–1000 MB/s/TiB; ~3× price for 4× throughput.</div></div>
+</div>
+
+<p><strong>But $/GPU-hour is a misleading single number.</strong> SemiAnalysis's "How Much Do GPU Clusters Really Cost?" decomposes TCO into eight line items beyond the GPU rate: storage (sized <strong>2 TB/GPU low to 25 TB/GPU high</strong>; AWS FSx Lustre runs 125–1000 MB/s/TiB, ~3× price for 4× throughput), N–S and E–W networking, control plane, support (hyperscaler graduates <strong>10% → 3%</strong> of bill as spend rises), <strong>goodput expense</strong> (the off-bill cost of downtime), setup expense (weeks-to-months of NCCL+EFA tuning, amortized over the term), and debugging (crossing "4–5 layers of indirection" from PyTorch → driver → NIC/switch firmware). Holding GPU price constant, a gold-tier neocloud's 3-year TCO is <strong>5–15% lower</strong> than silver/hyperscaler for large training; the gap collapses to ~0 only for fault-tolerant single-node inference.</p>
+
+<p>The most relevant quantified scenario (Scenario 1: 5,184 GB300 NVL72 GPUs, a single job at ~80% of the cluster, $4/GPU-hr equal across providers) gives a 3-year TCO ratio of <strong>Gold : Hyperscaler : Silver = 1.00 : 1.10 : 1.15</strong>. The differentiator is almost entirely <span class="f-norm">goodput</span>:</p>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Tier</th><th>FT framework</th><th class="num">Goodput expense</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>Gold</td><td>Clockwork TorchPass</td><td class="num"><b>6.14%</b></td><td>JIT checkpoint over RDMA to idle spare; cost = 32 idle GPUs (4 nodes, 0.62% of cluster)</td></tr>
+    <tr><td>Hyperscaler</td><td>SageMaker HyperPod Checkpointless</td><td class="num">10.53%</td><td>Redundant shard via RDMA-over-EFA; recovery 1m45s vs 15min; ~5% perf hit from memory overhead</td></tr>
+    <tr><td>Silver</td><td>Checkpoint-restart</td><td class="num">20.91%</td><td>60% worse MTBF, 1hr (vs 15min) to ID failure, 1hr (vs 15min) repair</td></tr>
+  </tbody>
+  <caption>Scenario 1: 5,184 GB300 NVL72, single job ~80% of cluster, $4/GPU-hr. The TCO spread is dominated by goodput, not the GPU rate.</caption>
+</table></div>
+
+<figure class="fig" data-fig="bars">
+  <figcaption class="figcap"><b>Figure 2 — Goodput expense is the real $/GPU-hour differentiator.</b> At equal GPU price, the off-bill cost of downtime spans 6.14% (Gold, TorchPass JIT-checkpoint) to 20.91% (Silver, checkpoint-restart) — the line item that drives the 1.00 : 1.10 : 1.15 three-year TCO ratio.
+    <span class="meta"><span>Regime · <b>5,184 GB300, single job ~80%</b></span><span>Evidence · <b>SemiAnalysis "How Much Do GPU Clusters Really Cost?"</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "ylabel":"goodput expense %","max":25,
+    "bars":[
+      {"label":"Gold\n(TorchPass)","value":6.14,"fam":"data"},
+      {"label":"Hyperscaler\n(HyperPod)","value":10.53,"fam":"compute"},
+      {"label":"Silver\n(ckpt-restart)","value":20.91,"fam":"moe"}
+    ],
+    "ref":{"y":6.14,"label":"Gold-tier floor"} }</script>
+</figure>
+
+<p>Two structural facts scale badly to 100k GPUs. First, <strong>larger jobs on larger clusters are punished hardest by single failures</strong>: if 80% of the cluster runs one job, every restart costs 10–15 min of job-init <em>plus all compute since the last checkpoint</em>, and cluster-level MTBF shrinks as the cluster grows because every GPU eventually fails. Second, the fault-tolerance framework choice is itself a multi-percent TCO line: <span class="k k-norm">TorchFT</span>'s GLOO-over-TCP cross-replica allreduce alone adds <strong>&gt;10% per-iteration overhead</strong> and its FSDP shard=16 means one GPU failure idles 16 GPUs.</p>
+
+<div class="callout do"><div class="ct">Budget goodput at Gold tier only if you build for it</div>
+  <p>For 100k GB200, budget goodput at the Gold tier (~6%) <strong>only if</strong> you run TorchPass-class JIT-checkpoint infrastructure with a 2–6% hot-spare pool; absent that, plan for the <strong>10–21% range</strong>, which on a $4B+ cluster is hundreds of millions of dollars a year of idle silicon.</p></div>
+
+<h3 id="power">Power is the binding constraint — not GPUs and not the shell</h3>
+
+<p>This is the clearest lesson of the 2025 buildout reports. From "xAI Colossus 2 — First Gigawatt Datacenter": Colossus 1 (Memphis) is ~200k H100/H200 + ~30k GB200 at ~<strong>300MW, built in 122 days</strong>; Colossus 2's 119 air-cooled chillers reached ~200MW of cooling by Aug 2025, sized for ~110,000 GB200 NVL72 — an implied <strong>~1.8 kW of cooling per GB200 GPU</strong>. Crucially, Memphis <em>blocked on-site turbines politically</em>, so xAI built a gigawatt energy hub across the state line in Southaven, MS (seven 35MW turbines = 245MW; regulators allowed turbines up to 12 months without a permit) and wheeled power in with Tesla Megapack BESS buffering.</p>
+
+<p>The lesson for a 100k-GB200 (~120–180MW of GPU TDP alone, more like 150–220MW all-in) is that <strong>power permitting and interconnect — not chip allocation — set the schedule</strong>, and behind-the-meter rental gas turbines plus grid batteries in a permissive adjacent jurisdiction are the fastest bridge to multi-GW. Meta's "Superintelligence" report confirms the pattern: Prometheus (~1GW Ohio), Hyperion (2GW Louisiana, &gt;1.5GW IT in phase 1), speed-over-redundancy "tent" datacenters with <em>no backup diesel</em>, two 200MW on-site gas plants, and explicit <strong>thermal-driven preemption</strong> — shutting down workloads on the hottest summer days. Synchronized power swings of tens of MW across a cluster (the origin of <span class="k k-norm">PYTORCH_NO_POWERPLANT_BLOWUP=1</span>) and 1–2% diurnal throughput variation are real operational facts at this scale, per ClusterMAX 2.0.</p>
+
+<div class="callout note"><div class="ct">PUE converts contracted megawatts into chip-megawatts</div>
+  <p>From "Multi-Datacenter Training": Google DLC runs <strong>PUE ~1.1</strong>; Microsoft's air-cooled H100 cluster published 1.223 but understated — air-cooled fan power is <strong>15%+ of server power vs &lt;5% for DLC</strong>, so the <em>extra power per watt-to-chip</em> is ~45%+ (Microsoft) vs ~15% (Google). GB200 is L2L liquid-cooled like Google's TPUs, so DLC is table-stakes here purely to get more of your contracted power onto the silicon. AWS's contrarian air-cooling bet (Trainium campuses) argues an air-optimized evaporative design with high inlet temp can hit PUE ~1.2 vs a DLC central-pipe design's ~1.5 on peak days — but GB200's 1200W chips simply cannot be air-cooled, so this build is committed to DLC regardless.</p></div>
+
+<h2 id="roadmap"><span class="sec-num">03</span>The accelerator roadmap — GB200/GB300 → Vera Rubin, and the alt-silicon field</h2>
+
+<p>The 100k-GB200 cluster will be commissioned against a roadmap that doubles per-GPU FP4 throughput and HBM bandwidth within ~18 months, which directly affects depreciation schedules and the decision of whether to migrate mid-program. The figure and table below consolidate the SemiAnalysis teardowns.</p>
+
+<figure class="fig" data-fig="bars">
+  <figcaption class="figcap"><b>Figure 3 — Dense FP4 (or low-precision) per-GPU throughput across the roadmap.</b> The NVIDIA line roughly doubles each generation (GB200 10 → Rubin 35 → Rubin Ultra 100 PFLOPS dense FP4); the alt-silicon parts win on scale-up domain and TCO rather than raw spec.
+    <span class="meta"><span>Regime · <b>per-GPU dense low-precision peak</b></span><span>Evidence · <b>SemiAnalysis teardowns</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "ylabel":"dense FP4 PFLOPS / GPU","max":110,
+    "bars":[
+      {"label":"GB200\nBlackwell","value":10,"fam":"compute"},
+      {"label":"Vera Rubin\nVR200","value":35,"fam":"compute"},
+      {"label":"Rubin Ultra\nVR300","value":100,"fam":"compute"},
+      {"label":"MI400\nHelios","value":12,"fam":"moe"},
+      {"label":"TPUv7\nIronwood","value":9,"fam":"data"},
+      {"label":"Trainium3","value":10,"fam":"prec"}
+    ],
+    "note":"GB200 = 10 PFLOPS dense FP4; Rubin 3.5× that; Rubin Ultra 2× Rubin. Alt-silicon bars are approximate per-class equivalents." }</script>
+</figure>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Accelerator</th><th>Node / availability</th><th>Dense FP4 (or low-prec)</th><th>HBM cap / BW</th><th>Scale-up / BW per GPU</th><th>Chip TDP</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><b>GB200 (Blackwell)</b></td><td>NVL72, shipping 2025</td><td class="num">10 PFLOPS dense FP4</td><td class="num">192GB HBM3e / 8 TB/s</td><td class="num">72 GPUs / 900 GB/s (NVLink5)</td><td class="num">1000–1200W</td><td>Scale-up = 7,200 Gbit/s/GPU; 16.6% MFU MoE on H100-class, 18× faster all-to-all than 64 H100</td></tr>
+    <tr><td><b>GB300 (Blackwell Ultra)</b></td><td>NVL72, 2025</td><td class="num">&gt;50% higher FP4 vs B200</td><td class="num">288GB HBM3e (12-Hi) / 8 TB/s</td><td class="num">72 / 900 GB/s</td><td class="num">~1400W</td><td>CX-8 NIC 800G scale-out; 2.5× MUFU (softmax) vs B200; FP64 ALUs cut</td></tr>
+    <tr><td><b>Vera Rubin (VR200 NVL72)</b></td><td>NVL72 (72 pkg/144 dies), 2026</td><td class="num"><b>35 PFLOPS dense FP4 (3.5× GB200)</b>; ~50 PFLOPS marketed w/ adaptive compression</td><td class="num">288GB HBM4 (flat) / <b>22 TB/s target (~20 initial), 2.75×</b></td><td class="num">72 / <b>1.8 TB/s (NVLink6, 2×)</b></td><td class="num"><b>1,800W (Max-Q) / 2,300W (Max-P)</b></td><td>FP16 only ~1.6× Blackwell — NVIDIA betting training moves to FP8/FP4; 100% liquid-cooled; rack 180–220 kW; ConnectX-9 1.6T scale-out/GPU</td></tr>
+    <tr><td><b>Rubin Ultra (VR300 NVL576)</b></td><td>Kyber rack, 2027</td><td class="num">100 PFLOPS dense FP4 (2× Rubin)</td><td class="num"><b>1 TB HBM4E (16 stacks)</b></td><td class="num">144 pkg / 576 dies</td><td class="num">~higher</td><td>4× denser than NVL72; PCB backplane replaces copper; scale-up world 576</td></tr>
+    <tr><td><b>Google TPUv7 Ironwood</b></td><td>3D torus, GA ~1yr after Blackwell</td><td class="num">~10% below GB200 peak FLOPs</td><td class="num">~192GB HBM3e (8-Hi, = GB200) / ~10% below GB200 BW</td><td class="num"><b>9,216 TPUs in one ICI domain</b></td><td>—</td><td>~44% lower TCO/chip vs GB200 (Google procurement); Anthropic ~40% MFU; OCS-reconfigurable torus</td></tr>
+    <tr><td><b>AWS Trainium3</b></td><td>NL72×2 Switched, GA late 2025</td><td class="num">MXFP8 doubled vs Trn2; MXFP4 = same as MXFP8 (no real FP4 speedup); <b>no NVFP4 HW</b></td><td class="num"><b>144GB HBM3e (12-Hi) / +70% BW (9.6 Gbps)</b></td><td class="num">144 (across 2 racks) / 1.2 TB/s (PCIe Gen6)</td><td class="num">~1,000W</td><td>43% BF16 MFU day-0 dense, 20–30% MoE; ~60% NKI dense, &gt;40% NKI MoE; lower TDP = opex edge</td></tr>
+    <tr><td><b>AMD MI400 "Helios"</b></td><td>UALoE72, H2 2026</td><td class="num">1.2× VR200 FP8/BF16 dense</td><td class="num"><b>288/432GB / 18 TB/s</b></td><td class="num">72 logical / <b>1.8 TB/s (matches VR200)</b></td><td class="num">— (rack 240kW vs VR200 187kW)</td><td>UALink-over-Ethernet (not real UALink); only OCP MXFP4 not NVFP4; TCO only ~4.5% below VR200, or higher w/ same networking</td></tr>
+    <tr><td><b>Huawei Ascend 910C</b></td><td>CloudMatrix CM384</td><td>"impressive, less efficient than Western HW"</td><td class="num">~8 HBM stacks/pkg</td><td class="num">CM384 supernode (384)</td><td>—</td><td>HBM-gated: CXMT can supply only ~250–300k 910C in 2026; system &gt; microarchitecture</td></tr>
+  </tbody>
+  <caption>Consolidated from the SemiAnalysis teardowns (Vera Rubin, TPUv7, Trainium3, AMD MI400, Huawei Ascend). Per-GPU dense FP4 figures where applicable; alt-silicon parts compete on scale-up domain and TCO, not raw spec.</caption>
+</table></div>
+
+<h3 id="rubin">Vera Rubin is the migration target, and its design philosophy validates the FP4 bet</h3>
+
+<p>From "Vera Rubin — Extreme Co-Design": Rubin's 3.5× FP4 uplift (35 PFLOPS dense) comes from SM count <strong>160→224</strong>, doubled Tensor Core width (<strong>32,768 FP4 MACs/clk</strong>), and a +25% clock — but <strong>BF16/TF32 are unchanged, so FP16 is only ~1.6× Blackwell</strong>. NVIDIA is explicitly betting that training moves off BF16 onto <span class="f-prec">FP8/FP4</span>. For a 10T/200B run, this means your low-precision strategy is not optional headroom — it is the only axis on which the next generation gives you 3.5×.</p>
+
+<p>The Rubin TCO is <em>higher</em> per GPU (~45% above GB300, ~14–15% above MI4XX) and its <em>marketed dense PFLOPs</em> are lower than MI4XX, so Rubin only wins on TCO/PFLOP if you harness <strong>sparse FP4 (50 vs 35 PFLOPS, a 35% $/PFLOP cut)</strong> — but the same report's hard data shows software and network maturity dominate spec sheets anyway: B300 (4,500 dense FP8 TFLOPs) beats MI355 (5,000 TFLOPs, a 10% <em>nominal</em> compute disadvantage for NVIDIA) by <strong>~6.3× measured inference throughput</strong> on DeepSeek R1 at only 1.75× TCO. The Rubin rack is <strong>100% liquid-cooled</strong> (vs 85/15 on GB200), draws 180–220 kW, and the industry roadmap points at <strong>1 MW/rack within a couple of years</strong>.</p>
+
+<div class="callout key"><div class="ct">FP4 is the only 3.5× the next gen gives you</div>
+  <p>Rubin doubles FP4 width and clock but leaves BF16/TF32 flat. If your 10T/200B run cannot train in <span class="f-prec">FP8/FP4</span>, the next-generation silicon offers you only ~1.6×, not 3.5×. The low-precision strategy <em>is</em> the migration strategy.</p></div>
+
+<h3 id="tpu">TPUv7 Ironwood is the most credible non-NVIDIA frontier-training part</h3>
+
+<p>Its decisive advantage is the <strong>9,216-TPU single ICI scale-up domain</strong> (vs 72 on NVL72), built from 4×4×4 = 64-TPU cubes wired through optical circuit switches (OCS) that make the torus reconfigurable and fault-routable. Realized economics, per "TPUv7: Google Takes a Swing at the King": <strong>~44% lower TCO/chip</strong> than a GB200 server from Google's procurement view (avoiding NVIDIA's ~4× system markup / ~75% gross margin), and Anthropic hitting <strong>~40% MFU</strong> on Ironwood translates to <strong>~52% lower TCO per effective PFLOP vs GB300 NVL72</strong> on rented TPUs at ~$1.60/TPU-hr — with breakeven at just <strong>19% extracted MFU</strong>.</p>
+
+<p>Gemini 3 was trained <em>entirely</em> on TPUs; Claude Opus/Sonnet 4.5 used TPUs among multiple hardware types. The reader planning a 100k-GB200 build should understand that the TPU path is not hypothetical — it is the substrate two of the three leading labs train on, and OpenAI extracted ~30% off its NVIDIA fleet merely by <em>threatening</em> TPU adoption. The TPU's gating weakness is software (XLA/MegaScaler closed-source, PyTorch historically second-class) and a mild v8 uplift that risks going uncompetitive against Rubin.</p>
+
+<h3 id="hbm">HBM3e/HBM4 supply is the gating factor across the entire table</h3>
+
+<p>It is the single most leverage-sensitive component of the program. From "Memory Mania": total DRAM runs <strong>~7% below demand in 2026</strong>; the HBM-specific shortfall widens <strong>5% (2025) → 6% (2026) → 9% (2027)</strong>, deeper than the 2017–18 supercycle. "Reverse scaling" makes it worse — a commodity DRAM wafer yields ~3× the bits of an HBM3E 12-Hi wafer, widening to ~4× with HBM4. Per-node HBM content is climbing super-linearly (Blackwell→Rubin +~50%, Rubin Ultra to ~1 TB), and HBM4 supply for Rubin's first 12 months is effectively <strong>SK hynix ~60% / Samsung ~30% / Micron ~0%</strong> <span class="conf conf-leaked">supply-chain</span> — a near-single-vendor dependency. Pricing: DDR5 +70% QoQ in 1Q26 (~$14/GB), HBM3E 12-Hi ASP now expected <em>flat</em> in 2026 versus a prior consensus of −15–20%.</p>
+
+<div class="callout do"><div class="ct">Treat HBM4 procurement as a schedule risk equal to GPU allocation</div>
+  <p>The decision: <strong>secure long-term HBM4 volume commitments early</strong>, model 2× DRAM price increases into 2026–27. The Huawei lens ("Huawei Ascend Production Ramp") makes the point in the negative — China's accelerator output is gated <em>entirely</em> by HBM, not logic, with CXMT able to supply only ~250–300k 910C in 2026 — confirming that whoever controls HBM allocation controls realized FLOPs.</p></div>
+
+<h2 id="networking"><span class="sec-num">04</span>Networking and optics — co-packaged optics, the copper wall, and scale-up domain evolution</h2>
+
+<p>The MoE all-to-all collective (§01) is a networking problem, so the scale-up fabric roadmap is an architecture input. From "Co-Packaged Optics (CPO) Book": NVLink5 (Blackwell) scale-up is <strong>900 GB/s = 7,200 Gbit/s unidirectional per GPU — 9× the 800 Gbit/s back-end scale-out</strong> — and it runs entirely on copper. Copper reach is <strong>≤2m at 200G/lane</strong>, which is why the scale-up world stays capped at 1–2 racks. NVLink6 (Rubin) doubles bandwidth <em>without</em> doubling backplane copper by going bidirectional (<strong>224G TX + 224G RX sharing a channel = "448G/lane" effective</strong> with echo-cancellation, ~1m reach) — a deliberate move because doubling the ~5,000-cable backplane to ~10,000 was deemed a reliability nightmare. The SerDes itself has plateaued at 200G, so future scale-up growth comes from intra-rack density (Kyber: up to 144 packages / 576 dies, 4× denser) and, eventually, CPO to break past copper for multi-rack scale-up "well beyond 576 GPUs" in the Feynman generation.</p>
+
+<div class="formula"><span class="lbl">comms</span>
+  <span class="eq">NVLink5 scale-up = 900 GB/s = 7,200 Gbit/s per GPU = 9 × the 800 Gbit/s scale-out</span>
+  <span class="note">Runs entirely on copper, ≤2m reach at 200G/lane — which is exactly why the flat scale-up world is capped at 1–2 racks (72 GPUs).</span></div>
+
+<p><strong>For scale-out, CPO is real but underwhelming as a TCO lever — and that matters for budgeting.</strong> On a 3-layer GB300 InfiniBand cluster, networking is only <strong>15% of total cluster cost and 9% of total cluster power</strong>; the back-end fabric is 85% of networking cost. Optical transceivers are 60% of networking cost and 45% of networking power, and a single 800G DSP transceiver burns <strong>16–17W vs ~4–5W for a CPO optical engine + external laser (a 65–73% transceiver-power cut)</strong>. But because networking is only 9% of cluster power, full CPO yields just <strong>~2% total-cluster power saving (3-layer) / ~4% (2-layer)</strong> and ~3–7% cost saving — and margin stacking on CPO components (60% GM) erodes even that. NVIDIA's scale-out CPO (Quantum-X800 InfiniBand H2 2025, Spectrum-X Ethernet H2 2026) is a "pipe-cleaner," ~10–15k units in 2026.</p>
+
+<p>The genuine CPO payoff is <em>radix-driven topology flattening</em>: higher-radix CPO switches collapse a 3-layer network to 2 layers (Spectrum 6800's 512×800G ports = <strong>131,072 GPUs on a 2-layer net</strong> vs 8,192 on the 102.4T 6810), which on a 400k-GB200 deployment NVIDIA claims at up to <strong>12% total power saving</strong> by cutting transceiver power from 10% to 1% of compute. For a 100k-GPU build the practical guidance is: do not budget meaningful TCO savings from scale-out CPO in 2026, but do exploit high-radix switches to flatten layers, which cuts both latency hops and optics count.</p>
+
+<div class="callout note"><div class="ct">Reliability is the real optics story at 100k scale</div>
+  <p>A ~1M-link cluster sees <strong>dozens of link interruptions per day</strong>, 80% of returned modules are "no trouble found," and pluggable 400G 2×FR4 MTBF is <strong>0.5–1M device-hours vs ~2.6M for CPO (3–5× better)</strong>. Yet Google is the most CPO-hesitant hyperscaler on a reliability-first philosophy — a useful signal that uptime-critical pretraining may rationally prefer mature pluggables over first-gen CPO.</p></div>
+
+<p>The radix lesson recurs in the alt-silicon fabrics: AWS Trainium uses <strong>100G logical ports by default</strong> to reach 8,192 GPUs on a 2-layer net (vs 512 at 400G) and 524,288 on 3-layer, enabling 100k+ multi-building clusters on modest switches at the cost of complex cabling. NVIDIA's own cluster math (ConnectX-9, two 800G logical ports/GPU) reaches <strong>93,312 GPUs single-plane 3-layer, 186,624 two-plane</strong> — i.e., a 100k-GB200 cluster is right at the edge of a single-plane fabric and will likely be built <strong>multi-plane</strong>.</p>
+
+<p>The decisive networking contrast for an MoE is scale-up <em>world size</em>: NVL72's 72 GPUs is the asset (keep <span class="f-moe">expert-parallel collectives</span> inside the NVLink domain, per Meta's "Superintelligence" post-mortem), but it is small next to TPUv7's 9,216-TPU ICI domain and even AWS Trn3's 144-chip switched fabric (NL72×2). Trn3 explicitly <em>added</em> a switched scale-up fabric (abandoning the pure 4×4×4 torus) precisely because torus becomes bandwidth-limited via oversubscription as <strong>MoE message sizes grow from 16KB to 1MB</strong> — independent confirmation that wide-EP MoE needs switched all-to-all, which is exactly what NVL72 provides and what makes it the right (if expensive) choice here.</p>
+
+<h2 id="multi-dc"><span class="sec-num">05</span>Multi-datacenter training — why frontier runs cross building boundaries, and how</h2>
+
+<p>A 100k-GB200 cluster at ~150–220MW all-in is at or beyond the power envelope of a single building in many jurisdictions, which is why "Multi-Datacenter Training — OpenAI's Ambitious Plan To Beat Google's Infrastructure" is load-bearing for this plan. Frontier clusters hit 100k GPUs in 2024 and 300k+ were planned for 2025; single-site synchronous training breaks down on construction, permitting, power-contracting, and Amdahl limits.</p>
+
+<p><strong>The WAN-sync problem is fundamentally latency, not bandwidth.</strong> Speed of light in fiber is 208,188 km/s, giving a US coast-to-coast <strong>RTT of 43.2 ms</strong> — fatal to naive synchronous all-reduce across regions. Bandwidth, by contrast, is cheap: near-term WAN runs ~5 Pbit/s intra-region and ~1 Pbit/s inter-region, at which <strong>400 TB of weights (100T params × FP32) exchanges in 0.64s at line rate</strong> — not the bottleneck versus compute-step time. The latency hierarchy dictates the sync hierarchy.</p>
+
+<figure class="fig" data-fig="compare">
+  <figcaption class="figcap"><b>Figure 4 — Single-DC vs multi-DC training.</b> The WAN problem is latency, not bandwidth: a single tightly-fabric'd site does synchronous pretraining, while a multi-DC topology spills past power ceilings into hierarchical/async sync the farther sites are apart.
+    <span class="meta"><span>Regime · <b>100k GB200 at 150–220MW all-in</b></span><span>Evidence · <b>SemiAnalysis "Multi-Datacenter Training"</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "left":{"title":"Single-DC synchronous","fam":"compute","items":[
+      "Tightly-coupled NVLink + InfiniBand fabric",
+      "Synchronous all-reduce, no WAN latency",
+      "Capped by one building's power envelope (~150–220MW)",
+      "Breaks on permitting, power-contracting, Amdahl limits"
+    ]},
+    "right":{"title":"Multi-DC hierarchical/async","fam":"data","items":[
+      "Sync less the farther apart; weighted-average unequal campus batches",
+      "Master weights in FP32 to avoid accumulation overflow",
+      "Spreads across power found in adjacent jurisdictions",
+      "Merging still unsolved for 175B/1.8T-class models"
+    ]},
+    "rows":[
+      {"k":"Coupling","left":"tight, single fabric","right":"loose, hierarchical"},
+      {"k":"Gating constraint","left":"power per building","right":"WAN latency (43.2 ms coast-to-coast)"},
+      {"k":"Sync cadence","left":"every step","right":"intra-campus &lt;1km → intra-region &lt;100km → cross-region"},
+      {"k":"Open problem","left":"power permitting","right":"weight merging at scale"}
+    ] }</script>
+</figure>
+
+<p>The latency hierarchy dictates the sync hierarchy: intra-campus buildings &lt;1km (sync often) → intra-region &lt;100km (sync less) → cross-region (sync least). The engineering response is hierarchical/async SGD — sync less the farther apart, load-balance unequal campus GPU counts by scaling per-campus batch size and taking a weighted average, with master weights held in FP32 to avoid accumulation overflow. <strong>Merging remains unsolved for 175B/1.8T-class models and is the real open problem.</strong></p>
+
+<p><strong>Stragglers and silent corruption are the dominant hidden costs, worth more than architecture gains.</strong> The canonical case: ByteDance MFU drifted <strong>40% → 30% (a 25% relative drop)</strong> over steps 7.5k–19k as chips one-by-one became ~10% slow and the run became straggler-bound — one chip 10% slow slows the whole synchronous run 10%. At 1M-GPU scale a 25% MFU loss is <strong>250k GPUs idle = &gt;$10B of IT capex wasted</strong>, which is why SemiAnalysis argues fault-tolerance and straggler-detection software is worth more than model-architecture tweaks.</p>
+
+<div class="callout warn"><div class="ct">Silent data corruption is mandatory to check, not optional</div>
+  <p>SDC compounds straggler losses: NVSwitch ALU faults can produce wrong all-reduce results under the <span class="k k-comms">NVLS</span> NCCL algorithm while DCGMI level-4 diagnostics <em>pass</em> — so independent numerical-correctness checks (Google runs SDC prologue/epilogue around every run via Pathways) are mandatory. The default brittleness is stark: one GPU failing out of 100k restarts all 100k from checkpoint unless you have built partial-restart fault tolerance, and TorchX/TorchElastic — the only open library — covers neither the long tail nor 3D parallelism. Every big lab rolls its own.</p></div>
+
+<p><strong>The OpenAI-vs-Google fabric contrast is the strategic frame.</strong> Google is "the master of multi-datacenter training" (per the Colossus 2 report, which explicitly excludes Google from the single-coherent-cluster ranking) via Borg + Pathways + MegaScaler partitioning synchronously across pods within a campus and across campuses within a region, plus DLC at PUE ~1.1 and <strong>&gt;50% higher capacity per building</strong> than Microsoft — letting Google contract less utility power per IT watt and build MW faster. OpenAI's plan is to beat this with aggressive multi-datacenter buildout. Meta's cross-campus backend uses Arista 7808 switches with Broadcom Jericho+Ramon DDC ASICs on one logical backend network.</p>
+
+<div class="callout do"><div class="ct">The four multi-DC decision points</div>
+  <p>For the 100k-GB200 build: <strong>(1)</strong> DLC L2L is table-stakes for chip-level power efficiency; <strong>(2)</strong> run synchronous within a building/campus but design for hierarchical/async sync the moment you spill past a power ceiling into a second building or region; <strong>(3)</strong> invest in custom partial-restart fault tolerance, straggler detection, and independent SDC checks <em>ahead of</em> architecture work; <strong>(4)</strong> long, frequent checkpointing is what makes both fault recovery and multi-DC viability possible at all.</p></div>
+
+<p><strong>Crucially, the RL/reasoning regime makes geo-distribution easier.</strong> Because synthetic-data generation and RL rollouts are forward-pass-heavy and tolerate loose coupling, distributed sites can focus on data generation/pruning while a single tightly-coupled site does synchronous pretraining — "a single large fully-connected scale-out fabric is not as necessary as it was in the past." So the 100k-GB200 cluster remains the centralized, tightly-fabric'd <em>pretraining anchor</em>, while the inference-heavy RL layer (§06) can be spread across whatever power you can find.</p>
+
+<h2 id="scaling"><span class="sec-num">06</span>The scaling narrative — what Orion / Claude 3.5 Opus / o1 Pro mean for this plan</h2>
+
+<p>The final and most strategic input is whether pretraining scaling is even where the marginal compute should go. SemiAnalysis's "Scaling Laws — O1 Pro..." answer is nuanced: pretraining is <strong>not plateauing, but it has shifted from the dominant scaling vector to one of several</strong>, and the "failure" narrative around Orion and Claude 3.5 Opus is, per their reporting, FUD <span class="conf conf-rumored">reporting</span>.</p>
+
+<p><strong>The "failures" were deliberate teacher models.</strong> Claude 3.5 Opus did not fail — Anthropic finished it, it scaled appropriately, and they chose not to <em>release</em> it because it was more economical to use Opus to generate synthetic data and do reward modeling to upgrade the "new 3.5 Sonnet" than to serve a costly Opus directly; inference cost stayed flat while Sonnet quality jumped. Orion (GPT-4.5) is likewise a deliberately huge base model used as a data/verifier engine for cheaper downstream models — "until Blackwell, models like this are not economic to serve given the size."</p>
+
+<div class="callout key"><div class="ct">The single most important strategic implication for a 10T/200B model</div>
+  <p>It may rationally exist primarily as a <strong>teacher and data-generator</strong>, not a directly-served product, until GB200/Blackwell-class serving makes it economic. The 50:1 sparsity (200B active) is exactly the design that lets such a model be cheap enough to <em>eventually</em> serve while large enough to absorb RL and teach smaller models. "Scaling Reinforcement Learning" reinforces the direction: the next-gen runs are described as <em>more sparse</em> (higher total-to-active ratio), which directly validates this build's design point.</p></div>
+
+<p><strong>The data wall reshapes what the run ingests.</strong> High-quality text is exhausted, and trillion-parameter models are now trained <em>below</em> Chinchilla-optimal because data growth lags compute. Mitigations that bear on this run: synthetic data (now integral across all frontier labs), video (<strong>YouTube alone uploads 720,000 hours/day</strong> of largely untapped tokens), and proprietary corpora (Meta ~100× the public internet). Two consequences for the cluster: synthetic-data <em>generation</em> is itself a massive inference workload to be colocated with or adjacent to training, and Meta's Behemoth post-mortem ("Superintelligence") warns concretely about the operational hazards — switching mid-run from Common Crawl to an uncleaned internal crawler, and chunked attention creating block-boundary blind spots that broke long-CoT reasoning.</p>
+
+<div class="callout miss"><div class="ct">Two lessons for a 10T run from Meta's Behemoth post-mortem</div>
+  <p>Validate data pipelines <em>before</em> switching sources mid-run, and lock in reasoning-length evals and a contamination-free held-out set <em>before</em> committing attention and data choices at scale.</p></div>
+
+<p><strong>Overtraining is economically rational for a served MoE.</strong> ~2 orders of magnitude of extra training FLOPs buys ~1 order of magnitude of inference-cost reduction — so for a model served to millions at 200B active, deliberate overtraining past Chinchilla (as GPT-4o and Llama did) is the right call. This is the lever that makes the 50:1-sparse, overtrained design coherent: spend training FLOPs to shrink the served-model cost.</p>
+
+<p><strong>Budget post-training FLOPs ≥ pretraining FLOPs.</strong> For reasoning models, post-training/RL "takes nearly as much compute as pre-training, and in many cases already exceeds it" — because the forward:backward ratio in RL is far above pretraining's 1:1 (each backward needs many forwards across generator + reward models + verifiers, often re-run due to pruning). o1's "berry training" generated hundreds of trillions of tokens across <strong>~10M problems</strong>. This reframes cluster sizing: the 100k-GB200 machine must be provisioned for an RL/generation workload at least as large as the pretrain, and the workload mix shifts toward inference-style generation — which is precisely where NVL72's large NVLink domain and <strong>2:1 Grace-CPU:GPU ratio</strong> (vs HGX's 4:1, ideal for hosting RL functional-verifier sandboxes — code execution, math checkers, LEAN provers — that don't run on GPUs) become assets rather than overhead. The RL layer is also where memory-bandwidth-bound alt-silicon (Trainium, "highly competitive on TCO per TB/s of bandwidth") wins, which is why Anthropic split its stack across vendors — a multi-silicon hedge this plan should at least cost out.</p>
+
+<figure class="fig" data-fig="timeline">
+  <figcaption class="figcap"><b>Figure 5 — Where the compute goes across the full program.</b> Post-training/RL "takes nearly as much compute as pre-training, and in many cases already exceeds it" — the 100k-GB200 machine must be provisioned for a generation-heavy RL workload at least as large as the pretrain.
+    <span class="meta"><span>Regime · <b>full 10T/200B program lifecycle</b></span><span>Evidence · <b>SemiAnalysis "Scaling Laws — O1 Pro"</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "segments":[
+      {"label":"pretrain","frac":45,"fam":"data","sub":"below Chinchilla, overtrained"},
+      {"label":"RL / post-train","frac":45,"fam":"optim","sub":"≥ pretrain FLOPs; gen-heavy"},
+      {"label":"synth-data gen","frac":10,"fam":"compute","sub":"teacher-model inference"}
+    ] }</script>
+</figure>
+
+<div class="callout do"><div class="ct">Net synthesis for the 100k-GB200 / 10T / 200B plan</div>
+  <p>The machine is worth ~1.5× an H100 the day it boots and ~2.7× once the Blackwell software curve matures, with the entire MoE case resting on NVL72's 18×-faster all-to-all and its 72-GPU NVLink domain. It will be less reliable per-GPU than Hopper with a 9×-larger blast radius, so goodput (6% Gold-tier vs 10–21% otherwise) and a 2–6% hot-spare pool are first-order TCO line items, not afterthoughts. <strong>Power and HBM4 — not GPU allocation — are the binding constraints</strong> and the items to lock down first. The run will likely cross building boundaries, demanding hierarchical/async sync, partial-restart fault tolerance, straggler detection, and independent SDC checks worth more than any architecture tweak. And the 10T/200B model itself should be planned as a sparse, overtrained teacher whose RL/generation workload consumes as much compute as the pretrain — which is the workload NVL72 was, in the end, built for.</p></div>
+
+<div class="sources"><h3>Sources</h3><ul>
+  <li>SemiAnalysis, "H100 vs GB200 NVL72 Training Benchmarks — Power, TCO, Reliability, Software Improvement Over Time"</li>
+  <li>SemiAnalysis, "NVIDIA Tensor Core Evolution: From Volta To Blackwell"</li>
+  <li>SemiAnalysis, "Dissecting NVIDIA Blackwell: Tensor Cores, PTX, SASS, Floorsweep, Yield"</li>
+  <li>SemiAnalysis, "How Much Do GPU Clusters Really Cost?"</li>
+  <li>SemiAnalysis, "Scaling Laws — O1 Pro Architecture, Reasoning Training Infrastructure, Orion and Claude 3.5 Opus 'Failures'"</li>
+  <li>SemiAnalysis, "xAI Colossus 2 — First Gigawatt Datacenter, Unique RL Methodology, Capital Raise"</li>
+  <li>SemiAnalysis, "Huawei Ascend Production Ramp — Die Banks, HBM Bottleneck"</li>
+  <li>SemiAnalysis, "Amazon's AI Resurgence — AWS &amp; Anthropic Multi-Gigawatt Trainium Expansion"</li>
+  <li>SemiAnalysis, "Memory Mania — How a Once-in-Four-Decades Shortage Is Fueling a Memory Boom"</li>
+  <li>SemiAnalysis, "Scaling Reinforcement Learning — Environments, Reward Hacking, Agents, Scaling Data"</li>
+  <li>SemiAnalysis, "Multi-Datacenter Training — OpenAI's Ambitious Plan To Beat Google's Infrastructure"</li>
+  <li>SemiAnalysis, "Vera Rubin — Extreme Co-Design: An Evolution from Grace Blackwell Oberon"</li>
+  <li>SemiAnalysis, "TPUv7: Google Takes a Swing at the King"</li>
+  <li>SemiAnalysis, "AWS Trainium3 Deep Dive — A Potential Challenger Approaching"</li>
+  <li>SemiAnalysis, "AMD Advancing AI — MI350X and MI400 UALoE72, MI500 UAL256"</li>
+  <li>SemiAnalysis, "Co-Packaged Optics (CPO) Book — Scaling with Light"</li>
+  <li>SemiAnalysis, "ClusterMAX 2.0 — The Industry Standard GPU Cloud Rating System"</li>
+  <li>SemiAnalysis, "Meta Superintelligence — Leadership Compute, Talent, and Data"</li>
+  <li>SemiAnalysis, "NVIDIA GTC 2025 — Built For Reasoning, Vera Rubin, Kyber, CPO, Dynamo, Feynman"</li>
+</ul></div>

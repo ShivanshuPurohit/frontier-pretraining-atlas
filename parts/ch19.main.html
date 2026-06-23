@@ -1,0 +1,307 @@
+<p class="eyebrow">Chapter 19 · Reading the leaderboard of sprints</p>
+<h1>Public throughput signals: MLPerf Training, MFU leaderboards, and reading the tea leaves</h1>
+<p class="lede">The public throughput record is a hall of mirrors: "10 minutes on 5,120 Blackwell GPUs" is a real number that answers the wrong question. This chapter extracts what MLPerf legitimately tells a planner sizing a 10T-total / 200B-active MoE on 100,000 GB200 GPUs — a generation multiplier and a per-GPU ceiling — names what it structurally conceals, and re-anchors the planning number on the one honest signal: DeepSeek-V3's ~21% FP8 MFU over a full 14.8T-token MoE run.</p>
+<p class="byline"><span>~22 min read</span><span class="dot">5 figures</span><span class="dot">grounded in MLPerf v5.0/v5.1 + SemiAnalysis tracking</span></p>
+<hr />
+
+<p>MLPerf Training headlines — "10 minutes on 5,120 Blackwell GPUs" — are engineered to be read as performance leadership, and they are real numbers produced by real silicon. But every one of them is a <strong>sub-convergence sprint on a dense model</strong>, tuned for the test, with the precision story laundered into a single time-to-train figure. For a planner sizing a 10T-total / 200B-active <span class="f-moe">MoE</span> on 100,000 <span class="f-compute">GB200</span> GPUs, the danger is not that these numbers are wrong; it is that they are <em>right about the wrong question</em>. They answer "how fast can clean silicon hit a fixed loss target on a 405B <em>dense</em> model over ~450 steps?" Your question is "what <em>sustained</em> MFU will a heavy-routing MoE hold over 10T tokens across a multi-week run on a 1,389-rack fault domain?" The gap between those two questions is the entire content of this chapter. We will extract what MLPerf legitimately tells you (a per-GPU peak-efficiency ceiling and a clean generation multiplier), name what it structurally conceals (<span class="f-moe">MoE all-to-all</span>, failure blast radius, long-horizon convergence, precision management at scale), and then re-anchor your planning numbers on the more honest signals: SemiAnalysis's sustained-MFU tracking, framework benchmark tables, and the single most load-bearing public datapoint of all — DeepSeek-V3's ~21% FP8 MFU over a full 14.8T-token MoE run.</p>
+
+<div class="pull">The public throughput record is a leaderboard of sprints, run by capacity vendors, on dense models, at one-twentieth your scale, with precision gains folded invisibly into the clock. For what your run will actually sustain, ignore the 10-minute headline and write down 21%.</div>
+
+<div class="callout warn"><div class="ct">The structural caveat that frames the whole chapter</div>
+  <p>Every large MLPerf run is a <strong>sub-30-minute, ~450-step, dense-model sprint on a clean cluster</strong> — two to three orders of magnitude shorter than a 10T-token production run, with no MoE benchmark anywhere in the suite. These are short non-frontier runs by construction. Treat every efficiency number backed out of them as a ceiling, never a budget.</p></div>
+
+<div class="stats">
+  <div class="stat" data-fam="compute"><div class="v">10<span class="u">min</span></div><div class="l">v5.1 record, 5,120 Blackwell GPUs, 405B</div></div>
+  <div class="stat" data-fam="data"><div class="v">~450<span class="u">steps</span></div><div class="l">sub-convergence sprint length</div></div>
+  <div class="stat" data-fam="optim"><div class="v">20×<span class="u">smaller</span></div><div class="l">public record vs your 100k-GPU target</div></div>
+  <div class="stat" data-fam="moe"><div class="v">21<span class="u">%</span></div><div class="l">DeepSeek-V3 FP8 MFU — the real anchor</div></div>
+</div>
+
+<h2 id="what-mlperf-measures"><span class="sec-num">01</span>What MLPerf Training v5.0/v5.1 actually measure</h2>
+
+<p>MLPerf Training is a <strong>closed-loop, fixed-quality benchmark</strong>: every submission trains to a predetermined eval-loss or accuracy target and reports only <strong>time-to-train</strong>. It deliberately publishes no MFU, no throughput, no TFLOPS. This is a defensible methodological choice — it makes submissions comparable across wildly different hardware — but it means every efficiency number you want must be <em>backed out</em>, and the back-out is fragile for reasons we will make precise.</p>
+
+<p>The suite has been actively reshaped to track the frontier. <strong>v5.0</strong> (results 2025-06-04) executed the pivotal substitution: it retired the long-standing <strong>GPT-3 175B</strong> pretraining benchmark and introduced <strong>Llama 3.1 405B</strong> pretraining as "the largest model in the suite," drawing 201 submissions from 20 organizations and debuting Blackwell silicon (GB200, B200-SXM-180GB) alongside AMD MI300X/MI325X and TPU Trillium (<a href="https://mlcommons.org/2025/06/mlperf-training-v5-0-results/">MLCommons v5.0</a>). <strong>v5.1</strong> (results 2025-11-12) retired BERT in favor of <strong>Llama 3.1 8B</strong> pretraining and replaced Stable Diffusion v2 with <strong>Flux.1</strong>, an 11.9B-param transformer diffusion model; it logged 65 unique systems, 12 accelerators, 20 orgs, with roughly half of submissions multi-node — an <strong>86% jump in multi-node share over v4.1</strong> (<a href="https://mlcommons.org/2025/11/training-v5-1-results/">MLCommons v5.1</a>). The LLM triad you should anchor on:</p>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Benchmark</th><th>Role as a signal</th><th>Scale band</th></tr></thead>
+  <tbody>
+    <tr><td><b>Llama 3.1 405B pretraining</b></td><td>Frontier-scale signal; the only large-cluster datapoint</td><td class="num">512 → 5,120 GPUs</td></tr>
+    <tr><td><b>Llama 2 70B LoRA fine-tuning</b></td><td>Single-rack / single-node signal</td><td class="num">8 → 72 GPUs</td></tr>
+    <tr><td><b>Llama 3.1 8B pretraining</b></td><td>Single-node accessibility signal</td><td class="num">8 → 64 GPUs</td></tr>
+  </tbody>
+  <caption>The entire MLPerf LLM track is dense. Note what is <em>not</em> here.</caption>
+</table></div>
+
+<p>Note what is <em>not</em> here: <strong>there is no MoE pretraining benchmark at any scale</strong>. The entire MLPerf LLM track is dense. For a reader whose binding constraints are <span class="f-moe">expert-parallel all-to-all</span> and routing imbalance, the suite measures a different workload class than the one you will run. That is the first and largest caveat, and it is structural, not incidental.</p>
+
+<div class="callout miss"><div class="ct">The dense/MoE mismatch is structural</div>
+  <p>MLPerf prices the pipeline bubble and data-parallel comms of a dense transformer, but it has <em>no</em> mechanism to price MoE token dispatch/combine, routing imbalance, or token drop — because there is no MoE benchmark. Your binding constraint is invisible to the suite by design.</p></div>
+
+<h2 id="headline-record"><span class="sec-num">02</span>The headline time-to-train record</h2>
+
+<p>The public record reads as a clean two-generation story, and on its own terms it is impressive.</p>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Round</th><th>Submitter</th><th class="num">GPUs</th><th>Benchmark</th><th class="num">Time-to-train</th></tr></thead>
+  <tbody>
+    <tr><td>v5.0</td><td>NVIDIA reference</td><td class="num">512 GB200</td><td>Llama 3.1 405B</td><td class="num">~20.8 min</td></tr>
+    <tr><td>v5.0</td><td>CoreWeave + NVIDIA + IBM</td><td class="num"><b>2,496 GB200</b></td><td>Llama 3.1 405B</td><td class="num"><b>27.3 min</b></td></tr>
+    <tr><td>v5.1</td><td>NVIDIA</td><td class="num">2,560 Blackwell</td><td>Llama 3.1 405B</td><td class="num">18.79 min</td></tr>
+    <tr><td>v5.1</td><td>NVIDIA "Tyche"</td><td class="num"><b>5,120 Blackwell</b></td><td>Llama 3.1 405B</td><td class="num"><b>10.0 min</b></td></tr>
+  </tbody>
+  <caption>The cleanest apples-to-apples scaling point across rounds is the 2,560-GPU → 18.79-min intermediate, ~45% faster than v5.0's 2,496-GPU run at near-identical scale.</caption>
+</table></div>
+
+<p>The <strong>v5.0</strong> largest submission — CoreWeave + NVIDIA + IBM at <strong>2,496 GB200 GPUs completing Llama 3.1 405B in 27.3 minutes</strong> — was billed as the largest GB200 NVL72 cluster ever benchmarked under MLPerf, "34× larger than the only other cloud-provider submission" (<a href="https://investors.coreweave.com/news/news-details/2025/CoreWeave-NVIDIA-and-IBM-Submit-Largest-Ever-MLPerf-Results-on-NVIDIA-GB200-Grace-Blackwell-Superchips/default.aspx">CoreWeave</a>). NVIDIA reported a <strong>2.2× per-GPU Blackwell-over-Hopper</strong> speedup on this benchmark (<strong>121.09 vs 269.12 minutes at 512 GPUs</strong>). In <strong>v5.1</strong>, NVIDIA set the record at <strong>10 minutes on 5,120 Blackwell GPUs</strong>, a 2.7× improvement over its best v5.0 Blackwell result, and claimed <strong>85% scaling efficiency from 512 → 5,120 GPUs</strong> (a 10× GPU-count increase) (<a href="https://developer.nvidia.com/blog/nvidia-blackwell-architecture-sweeps-mlperf-training-v5-1-benchmarks/">NVIDIA v5.1</a>). The cleanest apples-to-apples scaling datapoint across rounds is the <strong>2,560-GPU → 18.79-min</strong> intermediate point, ~45% faster than v5.0's 2,496-GPU run at near-identical scale.</p>
+
+<figure class="fig" data-fig="bars">
+  <figcaption class="figcap"><b>Figure 1 — The two-generation time-to-train story on Llama 3.1 405B.</b> Real MLPerf numbers, but every bar is a ~450-step dense sprint on a clean cluster — the 2,496-GPU and 5,120-GPU runs are at different scales, so the drop is GPU count <em>and</em> precision, not a like-for-like speedup.
+    <span class="meta"><span>Regime · <b>dense 405B, sub-convergence</b></span><span>Evidence · <b>MLPerf v5.0/v5.1</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "ylabel":"time-to-train (min)","max":30,
+    "bars":[
+      {"label":"v5.0\n512 GB200","value":20.8,"fam":"data"},
+      {"label":"v5.0\n2,496 GB200","value":27.3,"fam":"compute"},
+      {"label":"v5.1\n2,560 BW","value":18.79,"fam":"compute"},
+      {"label":"v5.1 Tyche\n5,120 BW","value":10.0,"fam":"prec"}
+    ],
+    "ref":{"y":27.3,"label":"largest v5.0 run"} }</script>
+</figure>
+
+<p>The single biggest lever between rounds was <strong>not</strong> a hardware change — it was <span class="f-prec">precision</span>. v5.1 was the <strong>first MLPerf Training round to use NVFP4</strong> (4-bit) for the bulk of the math, holding the final training iterations in FP8 ("healing") to land the loss target (<a href="https://developer.nvidia.com/blog/nvidia-blackwell-architecture-sweeps-mlperf-training-v5-1-benchmarks/">NVIDIA v5.1</a>). Blackwell does <span class="k k-prec">FP4</span> at <strong>2× its FP8 rate</strong>; Blackwell Ultra (GB300) at <strong>3×</strong>. This single fact should govern how you read the 2.7× round-over-round jump: <strong>a large fraction of it is a 2× FP4-over-FP8 throughput artifact that only holds because the run is short enough that the FP8 healing tail stays cheap.</strong> More on why that matters in §04.</p>
+
+<div class="formula"><span class="lbl">prec</span>
+  <span class="eq">FP4 throughput = 2 × FP8 (Blackwell) · 3 × FP8 (GB300)</span>
+  <span class="note">The v5.1 round's 2.7× jump is part FP4 hardware, part numerical: most of training ran in 4-bit, with an FP8 "healing" tail short enough to be free over ~450 steps. Over 10T tokens the tail is not free.</span></div>
+
+<p>At the single-rack/node end, the LoRA and 8B signals fill in the lower scale band and — importantly — provide the only credible non-NVIDIA primary data. v5.0 NVIDIA single-node <strong>8×GB200 hit Llama 2 70B LoRA in ~0.56 min</strong> against a widely-cited FP8 reference of <strong>11.145 min at 8 GPUs</strong>. In v5.1, GB300 delivered <strong>~5× over Hopper</strong> at equal GPU count; Lambda's GB300 NVL72 converged <strong>1.27× faster than the best GB200 NVL72</strong> and <strong>1.6× faster than the top 64×B200</strong>. Independent <strong>Nebius</strong> numbers — <strong>8×B300 LoRA = 8.48 min, 32×B200 = 3.10 min</strong> (~3.1× scaling 8→32 GPUs) — show Blackwell Ultra averaging <strong>~12.6% training-time reduction over Blackwell</strong> (<a href="https://nebius.com/blog/posts/mlperf-training-v5-1-results">Nebius</a>). And the genuine cross-vendor hedge: <strong>AMD MI355X completed Llama 2 70B LoRA in 10.18 min (8 GPUs)</strong> in v5.1, within 3% of B200 FP8 and ~10% faster than NVIDIA's 11.145-min v5.0 FP8 result, on ROCm 7.0 / PyTorch 2.8 / TE v2.2 (<a href="https://rocm.blogs.amd.com/artificial-intelligence/mlperf-training-v5.1/README.html">AMD ROCm</a>). MI355X is the only non-NVIDIA primary LLM-training signal at this generation, and it lands close enough to matter as a second source against single-vendor framing.</p>
+
+<h2 id="who-submits"><span class="sec-num">03</span>Who submits at frontier scale — and who conspicuously does not</h2>
+
+<p>The composition of the submitter list is itself a signal, and it cuts against the grain of how the market is usually described. The frontier-scale submitters are now <strong>neoclouds, not hyperscalers</strong>: CoreWeave (2,496 GB200 in v5.0), Nebius, Lambda (GB300 NVL72), plus NVIDIA's own internal clusters ("Tyche," the source of the 5,120-GPU record). <strong>No hyperscaler submitted a frontier-scale GB200 pretraining run.</strong> Google submitted only TPU Trillium results, not a 405B-at-scale entry.</p>
+
+<p>Two reads follow. First, the entities actually willing to expose large GB200 clusters to a public, audited benchmark are the ones <em>selling capacity</em>, for whom a leaderboard placement is marketing — not the ones running their own frontier models, for whom benchmark exposure is pure downside. Second, and more consequential for you: <strong>the public MLPerf record tops out around 5,120 GPUs on a single benchmark — roughly 20× smaller than your 100,000-GB200 target — and every large run is a sub-30-minute sprint.</strong> There is no public, audited datapoint within a factor of 20 of your cluster size, and none of any duration resembling a real run.</p>
+
+<figure class="fig" data-fig="line">
+  <figcaption class="figcap"><b>Figure 2 — The extrapolation gap.</b> NVIDIA's 85% scaling efficiency is measured over one decade of GPU count (512 → 5,120). Your 100k-GB200 target sits ~20× beyond the public record, in a regime where inter-rack DCN — not NVLink — carries pipeline and DP traffic. The 85% figure does not extrapolate.
+    <span class="meta"><span>Regime · <b>scaling efficiency vs cluster size</b></span><span>Evidence · <b>NVIDIA v5.1 + planner target</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "xlabel":"GPU count","ylabel":"GPUs (record vs target)","logx":true,"logy":true,
+    "series":[
+      {"name":"public MLPerf record","fam":"compute","pts":[[512,512],[2496,2496],[5120,5120]]},
+      {"name":"your target","fam":"moe","dash":true,"pts":[[100000,100000]]}
+    ],
+    "annotations":[{"x":5120,"y":5120,"text":"record tops out (85% eff.)"},{"x":100000,"y":100000,"text":"100k GB200 — 20× beyond"}] }</script>
+</figure>
+
+<p>When NVIDIA reports 85% scaling efficiency from 512 → 5,120 GPUs, you are watching the curve over <em>one decade</em> of GPU count; you need it over nearly <em>three decades</em>, into a regime where the inter-rack network — not NVLink — carries pipeline and data-parallel traffic, and where the <strong>1,389-rack failure surface is live the entire time</strong>. The 85% figure does not extrapolate, and treating it as if it does is the most common way a planner gets burned by this data.</p>
+
+<div class="callout warn"><div class="ct">Do not extrapolate the 85% scaling figure</div>
+  <p>85% efficiency over 512 → 5,120 GPUs says nothing about 5,120 → 100,000, where DCN replaces NVLink for PP/DP traffic and the 1,389-rack fault domain is continuously live. Extrapolating it is the single most common planner error against this dataset.</p></div>
+
+<h2 id="backing-out-mfu"><span class="sec-num">04</span>Backing out MFU — and the three reasons the number is a trap</h2>
+
+<p>You <em>can</em> recover an effective efficiency figure from time-to-train: take FLOPs-per-token × tokens ÷ time ÷ GPUs ÷ peak. NVIDIA's own v5.0 405B reference quotes <strong>~1,960 effective TFLOPS per GPU (FP8)</strong> — roughly <strong>40–50% of B200's dense-FP8 peak</strong> — and the reproduction guide publishes the exact run string needed to compute it independently: <strong>TP4-CP2-PP8-DP{n}, GBS=896 (GA112), micro-batch 1, FP8_PARAM_GATHER, TP_COMM_OVERLAP, MAX_STEPS≈450, eval-loss target 5.6</strong>, NeMo on NGC 25.04 (<a href="https://developer.nvidia.com/blog/reproducing-nvidia-mlperf-v5-0-training-scores-for-llm-benchmarks/">NVIDIA reproduce</a>). That ~40–50% looks like a usable planning ceiling. It is not, for three structural reasons, each of which independently disqualifies it as a number you'd budget against.</p>
+
+<div class="code-cap">yaml — the v5.0 405B reference recipe (the exact knobs you'd back MFU out of)</div>
+<pre class="code"><code># MLPerf v5.0 Llama-3.1-405B reference — short-run-optimal, NOT a real run
+model: llama3.1-405b
+parallelism:
+  tensor_parallel:   4      # TP4
+  context_parallel:  2      # CP2
+  pipeline_parallel: 8      # PP8
+  data_parallel:     auto   # DP{n} fills the cluster
+global_batch_size:   896    # GBS, grad-accum GA112
+micro_batch_size:    1
+precision:           fp8
+flags: [FP8_PARAM_GATHER, TP_COMM_OVERLAP]
+max_steps:           450    # sub-convergence: ~2 days of real training, extrapolated
+eval_loss_target:    5.6    # train only until "further training would converge"
+# absent by design: checkpoint-restart, fault recovery, SDC detection, elastic reconfig
+</code></pre>
+
+<div class="code-cap">python — backing effective FP8 efficiency out of a time-to-train headline</div>
+<pre class="code"><code># MLPerf reports ONLY time-to-train; recover effective efficiency by hand.
+flops_per_token = 6 * 405e9            # 405B dense, 6ND approximation
+tokens         = 896 * 8192 * 450     # GBS=896 * seq * ~450 sub-convergence steps
+time_s         = 27.3 * 60            # v5.0 2,496-GPU run
+gpus, peak_fp8 = 2496, 1979e12        # B200 dense-FP8 peak (TFLOPS)
+
+eff_tflops = flops_per_token * tokens / time_s / gpus / 1e12   # ~1,960 TFLOPS (NVIDIA)
+mfu_fp8    = (eff_tflops * 1e12) / peak_fp8                     # ~0.40-0.50 — a CEILING
+# ...but this is dense, ~450 steps, clean, and FP4-inflated in v5.1. Do NOT budget on it.
+</code></pre>
+
+<h3 id="trap-1">(1) Sub-convergence sprints</h3>
+<p>MLPerf LLM benchmarks train a <em>fraction</em> of the data to a point "indicating further training would converge," not to convergence. The v5.0 405B run is <strong>~450 steps at GBS=896</strong>. For the retired GPT-3 175B benchmark, MosaicML's Abhi Venigalla estimated the 11-minute record extrapolated to <strong>~2 days of real full-scale training</strong> (<a href="https://spectrum.ieee.org/large-language-models-training-benchmark">IEEE Spectrum</a>) — i.e., the benchmark is two to three orders of magnitude shorter than a production run. Everything that dominates a 10T-token run — long-horizon optimizer-state dynamics, late-training loss-spike recovery, learning-rate-decay-phase behavior — happens entirely <em>outside</em> the measured window. A 450-step efficiency figure tells you about steady-state GEMM throughput on a warm cluster and nothing about the integral over a real run.</p>
+
+<h3 id="trap-2">(2) Tuned-for-the-test parallelism</h3>
+<p>The reference configs are short-run-optimal and omit every long-run mechanism. <span class="k k-compute">TP4-CP2-PP8</span> with micro-batch 1 is chosen to minimize wall-clock over 450 steps on a clean cluster; the LoRA reference runs CP8 on a single 72-GPU rack. There is <strong>no checkpoint-restart, no fault recovery, no silent-data-corruption detection, no elastic reconfiguration</strong> in any of these runs — because over 10–30 minutes you will not hit a failure, so you do not pay for resilience. Over a multi-week run on 1,389 racks where the whole 72-GPU NVLink domain is a single failure domain, you pay for all of it continuously, and it is a real <span class="f-mem">MFU tax</span> that MLPerf structurally cannot show.</p>
+
+<h3 id="trap-3">(3) Precision laundering</h3>
+<p>This is the subtlest and, in v5.1, the most important. The "10 min on 5,120 GPUs" headline conflates a <em>hardware</em> gain (Blackwell's <span class="f-prec">FP4 tensor cores</span>) with a <em>numerical</em> gain (running the bulk of training in 4-bit). The 2× FP4-over-FP8 throughput only fully cashes out because the run is short enough that the FP8 "healing" tail is a negligible fraction of total steps. At 10T-token scale, the precision-management overhead is <em>not</em> negligible: the <span class="k k-prec">NVFP4</span> pretraining recipe requires a <strong>BF16/FP8 decay tail over roughly the last ~18% of tokens</strong> to keep loss error in check (§07), plus Random Hadamard transforms and 2D weight scaling that erode the nominal FLOP advantage. MLPerf proves NVFP4 survives ~450 steps plus a short heal; it proves nothing about FP4 numerical stability over 10T tokens.</p>
+
+<div class="callout key"><div class="ct">The one mistake to refuse</div>
+  <p><strong>Do not credit the FP4 throughput multiplier to your steady-state MFU as if the healing tail were free.</strong> The 2× FP4 artifact in the v5.1 headline holds only because ~450 steps make the FP8 heal tail negligible. Over 10T tokens, the ~18% precision-decay tail is a first-order cost.</p></div>
+
+<p>A methodological landmine compounds all three: <strong>MFU is ill-defined under low precision at all.</strong> TorchTitan explicitly <em>refuses</em> to report MFU when Float8 is enabled because the metric becomes "not well-defined" (<a href="https://arxiv.org/html/2410.06511v1">TorchTitan</a>). The peak-FLOPS denominator differs by 2× between FP8 and FP4, so an "effective TFLOPS" computed against one peak is not comparable to a BF16 framework MFU computed against another. Comparing v5.1's FP4 "effective TFLOPS" to a BF16 MFU table is a <strong>category error</strong> — exactly the trap a GB200 planner falls into when stacking MLPerf headlines against framework numbers.</p>
+
+<div class="formula"><span class="lbl">compute</span>
+  <span class="eq">MFU = FLOPs/token · tokens ÷ time ÷ GPUs ÷ peak<sub>HW</sub></span>
+  <span class="note">peak<sub>HW</sub> differs 2× between FP8 and FP4. An "effective TFLOPS vs FP4 peak" is not comparable to a "BF16 MFU vs BF16 peak" — TorchTitan refuses to report MFU under Float8 for exactly this reason.</span></div>
+
+<h2 id="framework-signal"><span class="sec-num">05</span>The more honest framework signal</h2>
+
+<p>Framework-reported MFU, measured over realistic step counts, is more load-bearing than MLPerf for sizing a real run — though still dense, and still mostly Hopper.</p>
+
+<ul>
+  <li><strong>Megatron-Core / NeMo (H100, BF16/FP8):</strong> up to <strong>~47% MFU</strong>, but the shape matters more than the peak. MFU <em>rises</em> with model size (<strong>41% → 47–48%</strong>) then <em>falls</em> with scale as DP-exposed comms grow. The Llama-3 team's own 405B run used three distinct 4D recipes, and <strong>doubling cluster size dropped MFU 43% → 41%</strong> once intra-node TP saturated and marginal GPUs spilled into slower data-parallel comms (<a href="https://github.com/NVIDIA/Megatron-LM">Megatron-LM</a>). The gap-to-100% decomposes as roughly ~15% pipeline bubble, ~10–15% comms, ~5–10% recompute, plus non-GEMM and host overhead. That decomposition is your mental model for where MFU goes; note that <strong>none of those four buckets includes MoE all-to-all</strong>, which is additive on top for your workload.</li>
+  <li><strong>TorchTitan (H100 95GiB):</strong> reports BF16-equivalent <strong>33–42% MFU</strong> for Llama-3.1-8B FSDP, and declines to report MFU at all under Float8. Its 405B 3D config (FSDP4-TP8-PP16, 512 GPUs) yields <strong>~130 tokens/s/GPU</strong> — useful strictly as a tokens/GPU anchor, not an MFU one (<a href="https://arxiv.org/html/2410.06511v1">TorchTitan</a>).</li>
+  <li><strong>MaxText (JAX/TPU):</strong> defines <span class="k k-compute">MFU = train-step-FLOPs ÷ step-time ÷ peak-HW-FLOPS</span> and tokens/s = global-tokens ÷ step-time ÷ devices. It recently corrected its TFLOPS formula (<strong>PR #1988</strong>) to account for causal attention — a pointed reminder that <strong>published MFUs are sensitive to the attention-FLOP convention</strong> (causal halving) and the 6ND-vs-exact-profiling debate. Two papers reporting "MFU" may differ by several points purely on FLOP-counting convention, before any hardware difference.</li>
+</ul>
+
+<p>The codecard below makes the convention sensitivity concrete: this is the shape of MaxText's per-step MFU accounting, where the causal-attention halving (the PR #1988 fix) is the line that moves a reported MFU by several points before any hardware enters the comparison.</p>
+
+<div class="codecard">
+  <div class="src-meta"><span class="file">MaxText — train-step MFU accounting</span><span class="tag">PR #1988 (causal halving)</span><span class="tag">illustrative</span></div>
+  <div class="annot-grid">
+<pre class="code"><code># MFU = train-step FLOPs / step-time / peak-HW-FLOPS  (MaxText definition)
+def per_token_flops(n_params, d_model, n_layers, seq_len):
+    dense = 6 * n_params                                   # [1] 6ND approximation
+    # exact attention term, halved for causality (PR #1988):
+    attn  = 12 * n_layers * d_model * seq_len * 0.5        # [2] causal halving
+    return dense + attn
+
+def mfu(step_flops, step_time_s, devices, peak_flops):    # [3]
+    return step_flops / step_time_s / devices / peak_flops  # peak differs 2x FP8 vs FP4
+
+tokens_per_s = global_tokens / step_time_s / devices      # [4] the MFU-free anchor
+</code></pre>
+    <div class="annot-list">
+      <div class="annot"><p><span class="badge">1</span><span class="anh">6ND is an approximation.</span> The flat <code>6·N·D</code> rule omits the attention term entirely; "MFU" reported on it differs from exact profiling by the 6ND-vs-profiling debate the source flags.</p></div>
+      <div class="annot"><p><span class="badge">2</span><span class="anh">The causal halving (PR #1988).</span> Attention is half-masked, so its FLOPs halve — the correction that shifts a published MFU by several points before any hardware difference enters.</p></div>
+      <div class="annot"><p><span class="badge">3</span><span class="anh">The 2× denominator trap.</span> <code>peak_flops</code> is 2× larger for FP4 than FP8; an "effective TFLOPS vs FP4 peak" is not comparable to a BF16-peak MFU — the §04 category error in code.</p></div>
+      <div class="annot"><p><span class="badge">4</span><span class="anh">tokens/s is convention-free.</span> Unlike MFU, tokens/s/GPU needs no peak or FLOP convention — which is why TorchTitan's ~130 tok/s/GPU survives as an anchor where its Float8 MFU does not.</p></div>
+    </div>
+  </div>
+</div>
+
+<figure class="fig narrow" data-fig="barshare">
+  <figcaption class="figcap"><b>Figure 3 — Where dense MFU goes (Megatron decomposition).</b> The gap-to-100% on a well-tuned dense Hopper run breaks down into bubble, comms, recompute and overhead — but <em>none</em> of these buckets is MoE all-to-all, which is additive on top for your workload. This is illustrative apportionment of the ~47% peak.
+    <span class="meta"><span>Regime · <b>dense H100, well-tuned</b></span><span>Evidence · <b>Megatron-LM MFU shape</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "title":"dense MFU budget (~47% peak)","unit":"% of step",
+    "items":[
+      {"label":"useful GEMM (MFU)","value":47,"fam":"compute"},
+      {"label":"pipeline bubble","value":15,"fam":"data"},
+      {"label":"comms (TP/DP)","value":13,"fam":"comms"},
+      {"label":"recompute","value":8,"fam":"mem"},
+      {"label":"non-GEMM + host","value":17,"fam":"norm"}
+    ],
+    "note":"None of the loss buckets is MoE all-to-all — that is additive for a 200B-active MoE." }</script>
+</figure>
+
+<p>The through-line: well-tuned <em>dense</em> framework MFU on the prior generation lives in the <strong>high-30s to high-40s</strong>, degrades with scale, and is reported against conventions that vary by several points. None of these tables includes a 200B-active MoE, and none is at GB200 maturity.</p>
+
+<h2 id="semianalysis"><span class="sec-num">06</span>SemiAnalysis: the sustained-MFU cross-check</h2>
+
+<p>If MLPerf is a sprint stopwatch, SemiAnalysis's <strong>"H100 vs GB200 NVL72 Training Benchmarks"</strong> is the only public artifact that measures <em>sustained</em> MFU and exposes the software-maturity curve MLPerf hides. It is the indispensable cross-check, for four reasons.</p>
+
+<h3 id="maturity-curve">1 · Fresh-architecture MFU is a moving target — and the move is enormous</h3>
+<p>On <em>identical</em> H100 silicon, GPT-3 175B BF16 MFU rose <strong>34% → 54% from Jan → Dec 2024</strong> (and <strong>29.5% → 39.5% in FP8</strong>) — pure software, same chips (<a href="https://newsletter.semianalysis.com/p/h100-vs-gb200-nvl72-training-benchmarks">SemiAnalysis</a>). A <strong>20-point MFU swing in eleven months</strong> from nothing but kernel, compiler, and framework maturation. GB200 in mid-2025 sat <em>early</em> on the equivalent curve. This is the most important single fact in the chapter for your timeline: whatever MFU GB200 shows at your cluster's first light, expect it to be <strong>10–20 points below where it lands a year later</strong>, and budget a multi-month software-maturity ramp accordingly.</p>
+
+<figure class="fig" data-fig="line">
+  <figcaption class="figcap"><b>Figure 4 — The software-maturity curve MLPerf hides.</b> Same H100 silicon, same GPT-3 175B workload: BF16 MFU climbed 34% → 54% and FP8 29.5% → 39.5% across 2024 — purely from kernel, compiler, and framework maturation. GB200 in mid-2025 sat early on this curve; the dashed line marks the ~20-point swing you should budget over a year.
+    <span class="meta"><span>Regime · <b>identical H100, pure software</b></span><span>Evidence · <b>SemiAnalysis H100 vs GB200</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "xlabel":"2024 month","ylabel":"GPT-3 175B MFU %","max":60,
+    "series":[
+      {"name":"BF16 MFU","fam":"compute","pts":[[1,34],[6,45],[12,54]]},
+      {"name":"FP8 MFU","fam":"prec","pts":[[1,29.5],[6,35],[12,39.5]]}
+    ],
+    "annotations":[{"x":1,"y":34,"text":"Jan 2024 · 34%"},{"x":12,"y":54,"text":"Dec 2024 · 54% (+20 pts)"}] }</script>
+</figure>
+
+<h3 id="sustained-anchors">2 · Sustained dense MFU anchors</h3>
+<p>Llama-3 405B sustained MFU ≈ <strong>41–43%</strong> across cluster sizes; Llama-3 70B ≈ <strong>53–54% BF16 / ~35–38% FP8</strong> (<a href="https://newsletter.semianalysis.com/p/h100-vs-gb200-nvl72-training-benchmarks">SemiAnalysis</a>). These are real, multi-hour-or-longer figures, not 450-step sprints — and they are <em>below</em> the MLPerf-implied 40–50%+ once you account for the full run.</p>
+
+<h3 id="cost-grounding">3 · Cost/energy grounding</h3>
+<p>405B BF16 ≈ <strong>$1.95/M tokens, 8.8 J/token</strong> on a 2,304-GPU H100 cluster — concrete $/token and J/token anchors you can re-base for GB200.</p>
+
+<h3 id="killer-caveat">4 · The killer caveat for your project</h3>
+<p>As of that analysis, <strong>"there are no large-scale production training runs yet on GB200 NVL72."</strong> Software immaturity and <strong>NVLink-backplane reliability</strong> — the entire 72-GPU rack is one failure domain, and one bad component drains the whole rack — were actively blocking frontier deployments. And the economic bar: GB200 NVL72 TCO is <strong>~1.6× H100's</strong>, so <strong>GB200 must be ≥1.6× faster than H100 per-GPU just to break even on TCO</strong> (<a href="https://newsletter.semianalysis.com/p/h100-vs-gb200-nvl72-training-benchmarks">SemiAnalysis</a>). The MLPerf 2.2× per-GPU sprint speedup clears that bar; the question is whether <em>sustained</em> GB200 MFU does, early on the maturity curve, with MoE comms layered on. SemiAnalysis's <strong>ClusterMAX 2.0</strong> scores 80+ providers across the accelerator landscape, with <strong>CoreWeave the lone Platinum cloud</strong> — a useful read on which neoclouds can actually deliver the uptime that a multi-week run on 1,389 racks demands.</p>
+
+<div class="callout note"><div class="ct">The real economic bar is 1.6×, not 2.2× <span class="conf conf-confirmed">SemiAnalysis</span></div>
+  <p>GB200 NVL72 TCO ≈ 1.6× H100, so GB200 must sustain ≥1.6× H100 per-GPU just to break even. The MLPerf 2.2× <em>sprint</em> multiplier clears it on clean silicon — but no public datapoint yet confirms that <em>sustained</em> GB200 MoE throughput clears 1.6× early on the maturity curve.</p></div>
+
+<h2 id="deepseek-v3"><span class="sec-num">07</span>The DeepSeek-V3 reality check — weight this above everything</h2>
+
+<p>The most honest MoE-at-scale public number is not in MLPerf and not in any framework table. It is DeepSeek-V3: <strong>14.8T tokens, 2,048 H800, 2.788M GPU-hours, FP8.</strong> Reconstructing effective MFU from the published GPU-hours via FLOP profiling (not the 6ND approximation) lands at <strong>~21.4% FP8 MFU (≈42.9% BF16-equivalent)</strong> — about <strong>424 effective TFLOP/s/GPU against a 1,979-TFLOPS FP8 peak</strong> (<a href="https://medium.com/@dlrover/what-is-the-mfu-for-deepseek-v3-training-0d9ea4d42eb4">dlrover</a>). This is <strong>sub-25% FP8 MFU on a 671B-total / 37B-active MoE over a <em>full</em> 14.8T-token run</strong> — the closest public analog to your workload class that exists, and it should be weighted far above any MLPerf 405B-dense sprint.</p>
+
+<div class="callout key"><div class="ct">The one number to write down</div>
+  <p>DeepSeek-V3: <strong>~21% FP8 MFU over a full 14.8T-token MoE run.</strong> Not a 450-step sprint, not a dense model, not a clean cluster — a real MoE over a real horizon on real silicon. This is your anchor; everything in MLPerf is a ceiling above it.</p></div>
+
+<figure class="fig" data-fig="bars">
+  <figcaption class="figcap"><b>Figure 5 — The MFU signal ladder, against the MLPerf-implied ceiling.</b> Backed-out MLPerf 405B sits at ~45% (dense, ~450 steps, FP4-inflated); mature dense Hopper anchors at 41–47%; the only full-horizon MoE datapoint — DeepSeek-V3 — sits at ~21% FP8. Calibrate the 200B-active run to the 20–35% band, far below the headline.
+    <span class="meta"><span>Regime · <b>FP8 MFU, weighted by relevance</b></span><span>Evidence · <b>MLPerf / Megatron / SemiAnalysis / V3</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "ylabel":"FP8 MFU %","max":60,
+    "bars":[
+      {"label":"MLPerf v5.1\n405B (backed out)","value":45,"fam":"prec"},
+      {"label":"Megatron\ndense ceiling","value":47,"fam":"compute"},
+      {"label":"SemiAnalysis\n405B sustained","value":42,"fam":"data"},
+      {"label":"DeepSeek-V3\nMoE, 14.8T tok","value":21,"fam":"moe"}
+    ],
+    "ref":{"y":35,"label":"top of planning band"} }</script>
+</figure>
+
+<p>Why is it so much lower than the 41–47% dense framework ceiling? Because everything that makes an MoE an MoE shows up as MFU loss: <strong>expert-parallel <span class="f-comms">all-to-all</span></strong> (token dispatch and combine, twice per layer, on the critical path), <strong>routing imbalance and token drop</strong> (under-utilized experts and dropped tokens are wasted FLOPs), and the load-balancing machinery itself. The dense framework tables price the pipeline bubble and DP comms but <em>not</em> the all-to-all; MLPerf prices none of it because it has no MoE benchmark. DeepSeek-V3 is the number that prices all of it, over a real horizon, on real silicon. For a 200B-active model at 10T tokens — roughly <strong>5.4× the active params and ~0.68× the tokens of V3</strong> — the routing-comms and imbalance penalties scale <em>unfavorably</em> with active param count and expert count, not favorably. There is no reason to expect your sustained MFU to land <em>above</em> V3's; the honest planning assumption is at or below it on the FP8 axis, before GB200's NVLink5 EP-locality advantage claws some back.</p>
+
+<p>That NVLink5 clawback is real and is the one structural reason GB200 should beat a Hopper MoE by <em>more</em> than the raw FLOP ratio: with the entire expert-parallel group able to live inside the <strong>72-GPU, 1.8-TB/s NVLink domain (EP ≤ 72)</strong>, the all-to-all stays on NVLink instead of spilling to InfiniBand at ~1/4 the bandwidth, as it does on Hopper above EP=8. So the V3 ~21% floor is a <em>Hopper</em> MoE floor; <strong>GB200 EP-locality is the lever that lifts it. But it lifts it from that floor, not from the 40–50% MLPerf headline.</strong></p>
+
+<div class="callout do"><div class="ct">Calibrate to a 20–35% sustained-FP8 band</div>
+  <p>DeepSeek-V3's ~21% is the floor; the well-tuned dense ~47% is a ceiling you will not reach with heavy routing; GB200 NVLink5 EP-locality is the lever pushing you toward the <em>upper</em> end of that band, not above it. A 200B-active MoE at 10T tokens scales the routing/imbalance penalty unfavorably vs V3 — anchor low.</p></div>
+
+<h2 id="honest-read"><span class="sec-num">08</span>The honest read for the 10T/200B run on 100k GB200</h2>
+
+<p>Pulling the threads together into planning numbers.</p>
+
+<p><strong>MLPerf gives you a generation-multiplier and a per-GPU peak-efficiency ceiling — not a planning number.</strong> The 2.2× (v5.0) / 2.7× (v5.1) Blackwell-over-Hopper figures are legitimate <em>relative</em> signals; the absolute 40–50% effective FP8 efficiency is a clean-cluster, 450-step, dense-405B, FP4-inflated ceiling that will not survive contact with your run.</p>
+
+<p><strong>Your binding constraints are absent from MLPerf entirely.</strong> MoE all-to-all / EP comms, GB200 NVLink-domain failure blast radius (one bad component drains a 72-GPU rack), checkpoint/restart and silent-data-corruption recovery at 100k scale, long-horizon optimizer-state and convergence dynamics, and FP4/FP8 numerical stability over 10T tokens — none of these appear in a benchmark that proves a ~450-step sprint plus an FP8 healing tail.</p>
+
+<p><strong>A planning table, with the right anchors:</strong></p>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Signal</th><th class="num">Reported MFU</th><th>What it actually represents</th><th>Weight for your run</th></tr></thead>
+  <tbody>
+    <tr><td>MLPerf v5.1 405B "10 min"</td><td class="num">~40–50% eff. FP8 (backed out)</td><td>Dense, ~450 steps, clean cluster, FP4 + heal</td><td>Ceiling only; do not budget against</td></tr>
+    <tr><td>Megatron/NeMo dense ceiling</td><td class="num">~47% (→ ~41% at scale)</td><td>Dense, realistic steps, Hopper</td><td>Upper bound on a <em>dense</em> run</td></tr>
+    <tr><td>SemiAnalysis 405B sustained</td><td class="num">~41–43% BF16</td><td>Dense, sustained, mature Hopper software</td><td>Mature-software dense reference</td></tr>
+    <tr><td><b>DeepSeek-V3 (the anchor)</b></td><td class="num"><b>~21% FP8 / ~43% BF16-eq</b></td><td><b>671B/37B MoE, full 14.8T tokens, FP8</b></td><td><b>Weight highest</b></td></tr>
+  </tbody>
+  <caption>Stacking MLPerf headlines against framework BF16 tables is a category error — the peak denominators differ 2×. Weight the bottom row above all.</caption>
+</table></div>
+
+<p><strong>Calibrate to a ~20–35% sustained-FP8 band for a 200B-active MoE</strong> — DeepSeek-V3's ~21% as the floor, the well-tuned dense framework ~47% as a ceiling you will not reach with heavy routing, and GB200 NVLink5 EP-locality as the lever that pushes you toward the upper end of that band rather than the lower. This is materially below the 40–50%+ that stacking MLPerf headlines would imply, and the gap is the cost of being an MoE at scale.</p>
+
+<p><strong>Budget a multi-month software-maturity ramp.</strong> Mirror the H100 34% → 54% BF16 curve: expect GB200 to come online <strong>10–20 MFU-points below its eventual plateau</strong>, and plan the first quarter or two of the run as a ramp, not steady state. The single most valuable thing this whole body of public data tells you is that fresh-architecture MFU is a moving target that moves ~20 points in a year — so the worst time to lock your throughput model is at first light.</p>
+
+<p><strong>Treat the 1.6× TCO break-even as the real bar, not the 2.2× sprint.</strong> GB200 wins on perf/TCO only if <em>sustained</em> per-GPU throughput on your actual MoE clears 1.6× H100's — a much harder test than the MLPerf sprint multiplier, and one no public datapoint yet confirms at MoE-at-scale. The competitive hedge to keep live: <strong>TPU v7 Ironwood</strong>'s 3D-torus-plus-OCS topology is arguably <em>better</em> for very large EP than NVL72's 72-GPU island and carries a SemiAnalysis-estimated <strong>~30–44% lower TCO</strong> — the one alternative whose public efficiency story, if it materializes at scale, could make the GB200 break-even bar bind against you.</p>
+
+<div class="callout miss"><div class="ct">The competitive hedge to keep live <span class="conf conf-rumored">estimated</span></div>
+  <p>TPU v7 Ironwood's 3D-torus + OCS topology may suit very-large EP better than NVL72's 72-GPU island, at a SemiAnalysis-estimated ~30–44% lower TCO. If that efficiency story materializes at scale, it raises the bar GB200 must clear to justify itself for your run.</p></div>
+
+<p>The final tea-leaf reading: <strong>the public throughput record is a leaderboard of sprints, run by capacity vendors, on dense models, at one-twentieth your scale, with precision gains folded invisibly into the clock.</strong> It is genuinely useful for exactly two things — ranking silicon generations and bounding per-GPU peak efficiency — and genuinely misleading for the one thing you most want, which is <em>what your run will actually sustain</em>. For that, ignore the 10-minute headline and write down 21%.</p>
+
+<div class="sources"><h3>Sources</h3><ul>
+  <li>MLCommons — MLPerf Training v5.0 results: <a href="https://mlcommons.org/2025/06/mlperf-training-v5-0-results/">mlcommons.org/2025/06/mlperf-training-v5-0-results</a></li>
+  <li>MLCommons — MLPerf Training v5.1 results: <a href="https://mlcommons.org/2025/11/training-v5-1-results/">mlcommons.org/2025/11/training-v5-1-results</a></li>
+  <li>NVIDIA — Blackwell sweeps MLPerf Training v5.1 (10 min / 5,120 GPUs; NVFP4; 85% scaling): <a href="https://developer.nvidia.com/blog/nvidia-blackwell-architecture-sweeps-mlperf-training-v5-1-benchmarks/">developer.nvidia.com/blog/…v5-1-benchmarks</a></li>
+  <li>NVIDIA — Reproducing MLPerf v5.0 Training Scores (exact configs; ~1,960 TFLOPS): <a href="https://developer.nvidia.com/blog/reproducing-nvidia-mlperf-v5-0-training-scores-for-llm-benchmarks/">developer.nvidia.com/blog/reproducing-…v5-0</a></li>
+  <li>CoreWeave — Largest-ever MLPerf submission on GB200 (2,496 GPUs / 27.3 min): <a href="https://investors.coreweave.com/news/news-details/2025/CoreWeave-NVIDIA-and-IBM-Submit-Largest-Ever-MLPerf-Results-on-NVIDIA-GB200-Grace-Blackwell-Superchips/default.aspx">investors.coreweave.com — largest-ever MLPerf GB200</a></li>
+  <li>IEEE Spectrum — GPT-3 time trials; MosaicML ~2-day extrapolation: <a href="https://spectrum.ieee.org/large-language-models-training-benchmark">spectrum.ieee.org/large-language-models-training-benchmark</a></li>
+  <li>SemiAnalysis — H100 vs GB200 NVL72 Training Benchmarks (sustained MFU; 1.6× TCO; NVLink reliability): <a href="https://newsletter.semianalysis.com/p/h100-vs-gb200-nvl72-training-benchmarks">newsletter.semianalysis.com/p/h100-vs-gb200-nvl72-training-benchmarks</a></li>
+  <li>dlrover — MFU for DeepSeek-V3 training (~21.4% FP8 / ~42.9% BF16-equiv): <a href="https://medium.com/@dlrover/what-is-the-mfu-for-deepseek-v3-training-0d9ea4d42eb4">medium.com/@dlrover — MFU for DeepSeek-V3</a></li>
+  <li>TorchTitan paper (MFU undefined under Float8; 33–42% BF16; 405B tokens/GPU): <a href="https://arxiv.org/html/2410.06511v1">arxiv.org/html/2410.06511v1</a></li>
+  <li>NVIDIA Megatron-LM (dense MFU shape; 43% → 41% on cluster doubling): <a href="https://github.com/NVIDIA/Megatron-LM">github.com/NVIDIA/Megatron-LM</a></li>
+  <li>AMD ROCm — MLPerf Training v5.1 (MI355X LoRA 10.18 min): <a href="https://rocm.blogs.amd.com/artificial-intelligence/mlperf-training-v5.1/README.html">rocm.blogs.amd.com — MLPerf Training v5.1</a></li>
+  <li>Nebius — MLPerf Training v5.1 results (B200/B300 LoRA scaling): <a href="https://nebius.com/blog/posts/mlperf-training-v5-1-results">nebius.com/blog/posts/mlperf-training-v5-1-results</a></li>
+</ul></div>

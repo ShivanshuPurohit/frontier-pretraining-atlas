@@ -1,0 +1,555 @@
+<h1
+id="02-the-100k-gpu-machine-gb200-nvl72-blackwell-numerics-and-what-an-exaflop-class-cluster-actually-is">02.
+The 100k-GPU machine: GB200 NVL72, Blackwell numerics, and what an
+exaflop-class cluster actually is</h1>
+<p>The single most important fact about the machine you are about to
+commit to is that the unit of compute is no longer the GPU, and no
+longer the eight-GPU node. It is the rack. The <a
+href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">GB200
+NVL72</a> is engineered so that a 72-GPU, fully NVLink-coherent domain
+is the atomic building block, and almost every architectural decision in
+your 10T-total / 200B-active MoE run — where experts live, how large the
+expert-parallel group can be, where the all-to-all traffic spills from
+copper to optics, how the parameter and optimizer-state footprint shards
+— follows from that one design choice. This chapter establishes what the
+hardware actually is (not what the spec sheet markets), what Blackwell's
+FP4 numerics buy a trillion-scale MoE in 2026, what MFU and MBU you
+should realistically plan against, how GB200 compares to the credible
+alternatives (B300, TPU v7, Trainium3, Ascend/CloudMatrix), and what
+concretely changes versus a Hopper fleet for a run of this size.</p>
+<h2 id="the-rack-as-the-scale-up-domain">The rack as the scale-up
+domain</h2>
+<p>A GB200 NVL72 packs <strong>72 Blackwell GPUs — 36 GB200 superchips,
+each pairing two Blackwell dies with one Grace CPU — plus 36 Grace CPUs
+into a single liquid-cooled rack</strong> (<a
+href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">NVIDIA</a>).
+Each "GPU" here is itself a dual-die multi-chip module: two
+reticle-limited dies on one package, stitched together by a 10 TB/s
+NV-HBI die-to-die link and presented to software as one coherent device.
+This matters for your kernel authors — the chip you program against is
+already an internally-distributed system whose two halves communicate at
+bandwidth no external fabric can match, which is why CUTLASS/CuteDSL
+grouped-GEMM kernels for the expert layer should be written to keep an
+expert's weights resident on-package wherever the sharding allows.</p>
+<p>The defining feature of the rack — the number to anchor every
+parallelism decision on — is <strong>NVLink5: 1.8 TB/s bidirectional per
+GPU</strong> (18 links × 100 GB/s each), aggregating through nine
+NVSwitch5 trays into a <strong>130 TB/s all-to-all NVLink domain
+spanning all 72 GPUs</strong> (<a
+href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">NVIDIA</a>).
+The fabric is a copper backplane — roughly 5,000 cables, no optics
+inside the rack — which is exactly why the scale-up domain stops at 72
+and why it is so cheap and reliable relative to optical scale-out.
+Compare to Hopper: an H100 NVLink4 node offers 900 GB/s per GPU across
+an 8-GPU domain (<a
+href="https://www.spheron.network/blog/nvidia-h100-vs-h200/">Spheron</a>).
+Blackwell therefore delivers <strong>~9× the per-GPU scale-up bandwidth
+across a domain that is itself 9× larger</strong>. For the
+expert-parallel all-to-all that dominates MoE communication, the entire
+EP group can live inside one NVLink domain up to <strong>EP=72</strong>
+— versus EP≤8 on Hopper before the all-to-all spills onto InfiniBand at
+roughly a quarter of the bandwidth. This is the single largest systems
+lever Blackwell hands you, and the rest of this report's parallelism
+advice is downstream of it.</p>
+<p>Memory follows the same rack-as-unit logic. Each GPU carries
+<strong>192 GB of HBM3e</strong>, aggregating to <strong>~13.4–13.8 TB
+of HBM per rack at ~576 TB/s</strong> (8 TB/s/GPU) (<a
+href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">NVIDIA</a>).
+The 36 Grace CPUs add ~17 TB of LPDDR5X, producing the marketed "~30 TB
+fast memory" figure — a coherent pool that changes how you think about
+expert placement and offload. For a 10T-parameter weight set plus
+optimizer state, the doubling of per-GPU capacity versus H100 (80 GB) or
+H200 (141 GB) directly shrinks the minimum sharding factor and relaxes
+the ZeRO/FSDP partitioning math relative to a Hopper-era plan.</p>
+<h2 id="power-and-cooling-the-binding-physical-constraint">Power and
+cooling: the binding physical constraint</h2>
+<p>A fully loaded NVL72 draws <strong>~120–132 kW of IT load</strong>
+(commonly cited near 120 kW, up to ~140 kW for higher-power SKUs), and
+it is <strong>liquid-cooled by mandate</strong> — direct-to-chip cold
+plates fed by ~45 °C facility water, with no air-cooling option for the
+GPU trays (<a
+href="https://introl.com/blog/gb200-nvl72-deployment-72-gpu-liquid-cooled">Introl</a>).
+Provisioned cooling capacity, including overhead, runs in the ~2.3–2.4
+MW class per rack when you account for CDUs, secondary loops, and
+redundancy. The practical consequence for the build: you are not
+designing a GPU cluster that happens to need cooling; you are designing
+a 200+ MW thermal plant that happens to run GPUs. Megawatts, not
+silicon, are the gating resource (see the cluster section below).</p>
+<h2
+id="blackwell-numerics-what-fp4-actually-buys-a-10t200b-moe">Blackwell
+numerics: what FP4 actually buys a 10T/200B MoE</h2>
+<p>The most consequential change from Hopper is not raw FLOPs — it is
+that <strong>4-bit floating point is now a training format, not merely
+an inference format</strong>, and the empirical case for betting a
+10T-token run on it is, as of mid-2026, settled rather than speculative.
+Two microscaling formats matter, and you will use both.</p>
+<p><strong>MXFP8</strong> (OCP microscaling): blocks of 32 elements
+share a single <strong>UE8M0</strong> power-of-two scale (<a
+href="https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/">NVIDIA
+NVFP4 blog</a>). This is the safe production default for the bulk of
+your GEMMs. NVIDIA and multiple labs report 50–60% throughput gains over
+BF16 with BF16-matching convergence when you combine power-of-two block
+scaling with stochastic rounding. MXFP8 is the format you reach for when
+you want to de-risk a layer without dropping to 4-bit.</p>
+<p><strong>NVFP4</strong>: block size <strong>16</strong>, element
+format <strong>E2M1</strong>, and a <strong>two-level scale</strong> —
+an E4M3 per-block micro-scale on top of an FP32 per-tensor scale (<a
+href="https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/">NVIDIA
+NVFP4 blog</a>). The combination of a tighter block (16 vs. MXFP4's 32)
+and a higher-fidelity E4M3 scale (vs. MXFP4's E8M0) is precisely what
+makes NVFP4 survive <em>training</em> and not just inference. The finer
+granularity captures block-level dynamic range that MXFP4 throws
+away.</p>
+<p>The load-bearing result — and the one you should treat as the
+template for your steady-state recipe — is NVIDIA's <a
+href="https://arxiv.org/pdf/2509.25149"><em>Pretraining Large Language
+Models with NVFP4</em></a>, which trained a 12B Mamba-Transformer to
+<strong>10T tokens, the exact horizon of your run</strong>, and held
+validation loss within <strong>~1% of an FP8 baseline through the stable
+phase</strong>, widening to ~1.5% in the decay phase. The recipe is
+concrete and should be copied wholesale:</p>
+<ol type="1">
+<li><strong>Keep numerically sensitive layers in higher
+precision</strong> — final layers and embeddings stay in BF16/FP8; do
+not quantize them to 4-bit.</li>
+<li><strong>Random Hadamard transforms</strong> applied before
+quantization to spread block-level outliers across the block, so a
+single large activation does not blow out the shared scale.</li>
+<li><strong>2D block scaling on weights</strong>, so the forward and
+backward passes see a consistent quantization of the same weight tensor
+(asymmetry here is a silent convergence killer).</li>
+<li><strong>Stochastic rounding</strong> on the gradient path for
+unbiased low-precision gradients.</li>
+<li><strong>A mixed-precision decay tail</strong>: switch the forward
+pass from NVFP4 back to BF16 at roughly the last 18% of tokens (in their
+run, at 8.2T of 10T), which <strong>cut the relative loss error from
+1.5% down to 0.5%</strong> (<a
+href="https://arxiv.org/pdf/2509.25149">NVIDIA NVFP4</a>).</li>
+</ol>
+<p>For your 10T-total / 200B-active MoE, the engineering directive is:
+<strong>plan FP4 for the steady state and budget an explicit BF16/FP8
+decay tail</strong> over the final ~15–20% of tokens. At 30T tokens that
+is roughly the last 5–6T tokens in higher precision — a non-trivial
+fraction of the compute budget, so size your throughput projections
+against a blended precision, not pure FP4.</p>
+<p>For the expert GEMMs specifically, the empirically-validated recipe
+is <strong>asymmetric across the forward/backward split</strong>:
+aggressive FP4 in the forward pass, conservative FP8 in the backward and
+communication paths. The <a
+href="https://arxiv.org/pdf/2603.02731"><em>Practical FP4 Training for
+Large-Scale MoE Models</em></a> work demonstrates exactly this on a
+<strong>671B DeepSeek-class MoE</strong> — MXFP4 (E2M1, block-32, UE8M0
+scale) forward GEMMs paired with FP8 (E4M3, block-128) backward —
+yielding <strong>+0.61% relative loss versus BF16 after 160B
+tokens</strong> alongside a <strong>16.0% throughput speedup over BF16
+and 12.5% over the best FP8 configuration</strong> (1157 → 1302
+tokens/GPU/s), plus a <strong>14.8% peak activation-memory
+reduction</strong>. The crucial subtext: that result was achieved on
+<strong>Hopper, which has no native FP4 tensor cores</strong> — the
+speedup came purely from the memory and bandwidth side. Blackwell's
+native FP4 tensor cores leave substantially more on the table, so treat
+the +16% Hopper number as a floor, not a ceiling, for what FP4 gives
+your expert layer.</p>
+<h2 id="realized-throughput-mfu-and-mbu-reality-on-blackwell">Realized
+throughput: MFU and MBU reality on Blackwell</h2>
+<p>Spec sheets are not telemetry. The best independent grounding for
+your MFU/MBU assumptions comes from <a
+href="https://arxiv.org/html/2512.02189v2"><em>Microbenchmarking
+NVIDIA's Blackwell Architecture</em></a>, which measured a B200 in
+isolation. The tensor cores essentially hit their marks: <strong>96.2%
+of peak FP4 (7,700 TFLOPS), 96.3% of peak FP8 (3,851 TFLOPS), and 96.3%
+of peak BF16 (1,926 TFLOPS)</strong> in isolated GEMMs. The new
+warp-level matrix instruction, <strong><code>tcgen05.mma</code>, has a
+single-instruction latency of 11.0–11.4 cycles versus Hopper's
+<code>wgmma</code> at 32–128 cycles</strong> — a 2.9–11.2× reduction
+that is a genuine, underappreciated win for the small, latency-bound
+expert GEMMs that dominate a high-sparsity MoE (your config activates a
+small fraction of experts per token, so individual expert matmuls are
+narrow and latency-sensitive).</p>
+<p>The sobering counterpart is memory. The same study measured
+<strong>STREAM Triad HBM bandwidth at only 4.14 TB/s — 51.8% of the 8
+TB/s spec</strong> (<a
+href="https://arxiv.org/html/2512.02189v2">microbenchmark</a>).
+Memory-bound kernels will not see anything close to peak bandwidth. The
+discipline this enforces: for the decode, attention, and
+all-to-all-bound phases, <strong>MBU (memory-bandwidth utilization), not
+MFU, is the governing metric</strong>, and a realized ~52% of nameplate
+HBM is the planning assumption, not 100%.</p>
+<p>A critical correction on the headline FLOP numbers, because they are
+routinely misquoted: NVIDIA's marketed per-rack figures of <strong>1,440
+PFLOPS FP4 / 720 PFLOPS FP8 / 360 PFLOPS BF16 are <em>with-sparsity</em>
+(2:4) numbers</strong>, footnoted on NVIDIA's own page as "Dense is
+one-half sparse spec shown" (<a
+href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">NVIDIA</a>).
+For dense training FLOPs — what you actually compute against for
+<code>6 × active-params × tokens</code> — the honest per-rack figures
+are <strong>~360 PFLOPS dense FP8 and ~180 PFLOPS dense BF16</strong>,
+i.e. <strong>~4.5 PFLOPS dense FP8 / ~2.25 PFLOPS dense BF16 per B200
+GPU</strong>. Carry the dense numbers and state the sparse caveat
+explicitly; do not let a 2× sparsity marketing factor inflate your
+throughput model.</p>
+<div class="tablewrap"><table class="data">
+<thead>
+<tr>
+<th>Precision</th>
+<th>Per B200 GPU (dense)</th>
+<th>Per B200 GPU (sparse)</th>
+<th>Per NVL72 rack (dense)</th>
+<th>Measured efficiency</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FP4</td>
+<td>~10 PFLOPS</td>
+<td>~20 PFLOPS</td>
+<td>~720 PFLOPS</td>
+<td>96.2% of peak</td>
+</tr>
+<tr>
+<td>FP8/FP6</td>
+<td>~4.5 PFLOPS</td>
+<td>~9 PFLOPS</td>
+<td>~360 PFLOPS</td>
+<td>96.3% of peak</td>
+</tr>
+<tr>
+<td>BF16</td>
+<td>~2.25 PFLOPS</td>
+<td>~4.5 PFLOPS</td>
+<td>~180 PFLOPS</td>
+<td>96.3% of peak</td>
+</tr>
+<tr>
+<td>HBM BW</td>
+<td>8 TB/s nominal</td>
+<td>—</td>
+<td>~576 TB/s</td>
+<td>51.8% (STREAM Triad)</td>
+</tr>
+</tbody>
+</table></div>
+<p>End-to-end, a large MoE on GB200 in BF16/FP8 realistically lands in
+the <strong>~30–45% MFU</strong> band, with heavy-routing MoE often at
+the lower end (~18–35%) because the all-to-all and grouped-GEMM
+overheads eat into the tensor-core duty cycle. FP8 MFU for large MoE
+rose roughly from ~29.5% to ~39.5% over 2024 as kernels matured, so
+~35–40% FP8 is a defensible 2025–2026 planning figure —
+<strong>referenced against the dense peak, never the sparse
+one</strong>. Note the counterintuitive FP4 dynamic: switching to NVFP4
+typically <em>lowers</em> nominal MFU, because the dequant, Hadamard,
+and scale-management overhead means you do not realize the full 2× FLOP
+advantage — yet it <em>raises</em> tokens/sec. The correct optimization
+targets are therefore <strong>tokens/GPU/s and $/token, not
+MFU</strong>. MFU is a diagnostic, not a goal; a run that drops MFU by
+10 points while raising tokens/sec by 15% is a win.</p>
+<h2 id="the-accelerator-landscape-moe-relevant-deltas">The accelerator
+landscape: MoE-relevant deltas</h2>
+<p>You are buying GB200, but a 100k-class commitment is large enough
+that the alternatives are a real decision, not a footnote — chiefly
+because the binding constraint is power and TCO, where the gaps are
+wide.</p>
+<div class="tablewrap"><table class="data">
+<thead>
+<tr>
+<th>Accelerator</th>
+<th>Dense FP8</th>
+<th>Dense FP4</th>
+<th>HBM cap / BW</th>
+<th>Scale-up domain &amp; BW</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>H100 SXM</strong></td>
+<td>~1,979 TFLOPS</td>
+<td>— (no FP4)</td>
+<td>80 GB HBM3 / 3.35 TB/s</td>
+<td>8-GPU, 900 GB/s NVLink4</td>
+</tr>
+<tr>
+<td><strong>H200 SXM</strong></td>
+<td>~1,979 TFLOPS</td>
+<td>—</td>
+<td>141 GB HBM3e / 4.8 TB/s</td>
+<td>8-GPU, 900 GB/s</td>
+</tr>
+<tr>
+<td><strong>B200</strong></td>
+<td>~4.5 PFLOPS</td>
+<td>~10 PFLOPS</td>
+<td>192 GB HBM3e / 8 TB/s</td>
+<td>NVL72, 1.8 TB/s</td>
+</tr>
+<tr>
+<td><strong>B300 (Ultra)</strong></td>
+<td>~5 PFLOPS</td>
+<td>~15 PFLOPS</td>
+<td>288 GB HBM3e / 8 TB/s</td>
+<td>NVL72, 1.8 TB/s, ConnectX-8 800G</td>
+</tr>
+<tr>
+<td><strong>TPU v7 Ironwood</strong></td>
+<td>4,614 TFLOPS</td>
+<td>(FP8-class)</td>
+<td>192 GB HBM3e / 7.38 TB/s</td>
+<td>9,216-chip pod, 1.2 TB/s ICI, 3D torus + OCS</td>
+</tr>
+<tr>
+<td><strong>Trainium3</strong></td>
+<td>2.52 PFLOPS (MXFP8)</td>
+<td>2.52 PFLOPS (=FP8)</td>
+<td>144 GB HBM3e / ~4.9 TB/s</td>
+<td>NL72×2 = 144 chips, 1.2 TB/s</td>
+</tr>
+<tr>
+<td><strong>Ascend 910C</strong></td>
+<td>~0.78 PFLOPS BF16/die</td>
+<td>—</td>
+<td>128 GB HBM3 / 3.2 TB/s</td>
+<td>CloudMatrix 384 (UB all-to-all)</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>B300 / GB300 NVL72 (Blackwell Ultra)</strong> is the obvious
+upgrade path: 72× B300 with <strong>288 GB HBM3e each (20 TB total HBM
+per rack)</strong>, ~1.1–1.4 EFLOPS sparse FP4 (≈1.5× GB200), and
+<strong>ConnectX-8 at 800 Gb/s per GPU</strong> for scale-out, with each
+B300 rated ~15 PFLOPS dense FP4 at a 1,400 W TDP (<a
+href="https://www.nvidia.com/en-us/data-center/gb300-nvl72/">NVIDIA
+GB300</a>). For a 10T-parameter model the <strong>50% larger HBM (288
+vs. 192 GB)</strong> is the standout — it materially eases weight +
+optimizer-state placement and lets you keep more experts resident per
+GPU. If your procurement window allows, GB300 is the better substrate
+for a model this large; the HBM headroom alone changes the sharding
+calculus.</p>
+<p><strong>TPU v7 Ironwood</strong> is the only credible at-scale
+alternative, and it is a serious one. Per chip: <strong>2,307 BF16 /
+4,614 FP8 TFLOPS, 192 GB HBM3e, 7.38 TB/s, 1.2 TB/s bidirectional
+ICI</strong>, deployed in a <strong>9,216-chip pod arranged as a 3D
+torus with optical circuit switching (OCS)</strong> — reconfigurable
+topology, no blast radius from a failed link, roughly 1.5 optical
+transceivers per chip at 800G routed through 48 144×144 OCS switches (<a
+href="https://docs.cloud.google.com/tpu/docs/tpu7x">Google</a>; <a
+href="https://newsletter.semianalysis.com/p/tpuv7-google-takes-a-swing-at-the">SemiAnalysis</a>).
+SemiAnalysis estimates Ironwood at <strong>~30–44% lower TCO than
+GB200/GB300</strong>. For very large expert parallelism the
+torus-plus-OCS design is arguably <em>better</em> than NVL72's 72-GPU
+copper island: you are not capped at a 72-device scale-up domain, and
+OCS lets you reconfigure the topology around failures rather than
+absorbing a blast radius. The cost is leaving CUDA — you trade the most
+mature kernel ecosystem on Earth for JAX/Pathways and Google's stack.
+For a single-vendor 100k commitment, Ironwood is the alternative that
+should actually keep you up at night on TCO grounds; the reason most
+labs still pick GB200 is software maturity and the CUDA moat, not raw
+efficiency.</p>
+<p><strong>Trainium3</strong> (TSMC N3P) is a genuine cost challenger on
+paper — <strong>2.52 PFLOPS FP8 per chip, 144 GB HBM3e, ~4.9 TB/s,
+NeuronLink 1.2 TB/s scale-up</strong>, with the Trn3 UltraServer scaling
+to 144 chips / 362 PFLOPS FP8 / 20.7 TB HBM / 706 TB/s (<a
+href="https://aws.amazon.com/about-aws/whats-new/2025/12/amazon-ec2-trn3-ultraservers/">AWS</a>).
+But it has a disqualifying property for <em>your</em> run: <strong>FP4
+throughput equals FP8 throughput — there is no FP4 speedup</strong> (a
+systolic-array geometry choice, 512×128 vs. 128×128). For a run whose
+central efficiency bet is native 4-bit pretraining, a part that gives
+you nothing for going to 4-bit blunts the whole thesis. Trainium4
+reportedly promises ≥6× FP4, which is the part to wait for; Trainium3 is
+a strong choice for an FP8 run and the wrong choice for a 4-bit one.</p>
+<p><strong>Huawei CloudMatrix 384 / Ascend 910C</strong> is the
+brute-force answer and the worst-case power reference point:
+<strong>~300 PFLOPS BF16 and 49.2 TB HBM at the system level</strong>
+across 384 Ascend 910C dies, with a three-plane UB/RDMA/VPC fabric for
+all-to-all — but at <strong>~4.1× the power and ~2.5× worse
+power-per-FLOP of a GB200 NVL72</strong> (<a
+href="https://newsletter.semianalysis.com/p/huawei-ai-cloudmatrix-384-chinas-answer-to-nvidia-gb200-nvl72">SemiAnalysis</a>).
+It uses HBM3 with no FP4 path. Outside China, and outside the 4-bit
+regime, it is irrelevant to your decision — but it is a useful
+illustration of how far you can fall behind on power-per-FLOP if you
+optimize for raw HBM and bandwidth while ignoring the precision and
+efficiency frontier.</p>
+<h2 id="building-a-100000-gb200-cluster">Building a 100,000-GB200
+cluster</h2>
+<p>100,000 GB200 GPUs is <strong>~1,389 NVL72 racks</strong>. At
+~120–132 kW IT per rack, and budgeting **~150–180 kW per rack all-in**
+once cooling, networking, and PUE overhead are included, the facility
+lands at <strong>~200 MW IT / ~250 MW facility power</strong>. The
+cleanest real-world reference is xAI's Colossus 2: SemiAnalysis
+reconstructs <strong>~200 MW of cooling supporting roughly 110k GB200
+NVL72 GPUs</strong>, while Colossus 1's ~300 MW carried ~200k Hopper
+plus ~30k GB200 (<a
+href="https://newsletter.semianalysis.com/p/xais-colossus-2-first-gigawatt-datacenter">SemiAnalysis</a>).
+For a clean 100k GB200 design, <strong>plan ~200 MW IT and ~250 MW at
+the facility meter</strong>.</p>
+<p><strong>Topology.</strong> With NVLink5 confined to 72 GPUs, racks
+group into <strong>pods of typically 8–16 NVL72 racks</strong> behind a
+scale-out layer (NDR/XDR InfiniBand or 800G Spectrum-X Ethernet), then a
+fat-tree or rail-optimized spine connects pods. The crucial design fact:
+because the coherent NVLink domain stops at the rack, <strong>the
+inter-rack network is the bottleneck for all pipeline-parallel and
+data-parallel traffic</strong> — everything that crosses a rack boundary
+runs at scale-out bandwidth, roughly a quarter or less of intra-rack
+NVLink. The standard compromise is <strong>1:1 rail-optimized
+non-blocking connectivity at the pod level with a tapered
+(oversubscribed) spine across pods</strong>, exploiting the fact that DP
+gradient all-reduce traffic is more tolerant of taper than the EP
+all-to-all (which you have already confined inside the rack). Your
+parallelism layout should therefore map EP onto the NVLink domain,
+pipeline stages onto rails within a pod, and data parallelism across the
+tapered spine.</p>
+<p><strong>Capex order of magnitude.</strong> GB200 NVL72 racks run
+<strong>~<span
+class="math inline">3–3.5<em>M</em><em>e</em><em>a</em><em>c</em><em>h</em> * *<em>a</em><em>t</em><em>s</em><em>t</em><em>r</em><em>e</em><em>e</em><em>t</em><em>p</em><em>r</em><em>i</em><em>c</em><em>e</em><em>s</em>, <em>p</em><em>u</em><em>t</em><em>t</em><em>i</em><em>n</em><em>g</em> * * </span>4.5–5B
+into 1,389 racks of compute alone</strong>, with networking, storage,
+and datacenter shell pushing the <strong>total to ~<span
+class="math inline">6–8<em>B</em> * *—<em>c</em><em>o</em><em>n</em><em>s</em><em>i</em><em>s</em><em>t</em><em>e</em><em>n</em><em>t</em><em>w</em><em>i</em><em>t</em><em>h</em><em>t</em><em>h</em><em>e</em> </span>7B
+figure cited for the 200k-GPU Colossus build (<a
+href="https://en.wikipedia.org/wiki/Colossus_(supercomputer)">Colossus</a>).
+And the recurring cost is dominated by power: **~250 MW continuous is on
+the order of $120M+/yr in electricity at industrial rates</strong>
+before any cooling or staffing overhead. The strategic read is
+unambiguous — <strong>power, not silicon, is the binding
+constraint</strong>. You can buy the GPUs faster than you can energize
+and cool them.</p>
+<p><strong>A reliability caveat you must price in.</strong> As of late
+2025, SemiAnalysis reported that <strong>no large-scale training run had
+yet completed on GB200 NVL72</strong>, citing software and reliability
+immaturity, and put GB200 all-in cost-per-GPU at ~1.6–1.7× H100 —
+meaning the platform needs to clear a ~1.6× throughput-per-GPU
+break-even just to match Hopper economics (<a
+href="https://newsletter.semianalysis.com/p/h100-vs-gb200-nvl72-training-benchmarks">SemiAnalysis</a>).
+By mid-2026 the picture has improved — the <a
+href="https://microsoft.ai/pdf/mai-thinking-1.pdf">MAI-Thinking-1
+report</a> documents a from-scratch 1T-total MoE trained to 30T+ tokens
+on 8,192 production GB200 GPUs, which is the existence proof that the
+platform is now viable for serious runs — but the lesson stands:
+<strong>goodput and determinism tooling matter more than peak FLOPs at
+this scale</strong>. MAI devotes an entire "Cluster Environment" section
+to goodput for a reason. Budget for failure-domain isolation, fast
+checkpoint/restart, and silent-data-corruption detection as first-class
+engineering, not afterthoughts; on a ~250 MW machine, every percentage
+point of goodput is worth millions.</p>
+<h2 id="compute-budget-for-the-10t200b-target">Compute budget for the
+10T/200B target</h2>
+<p>Training FLOPs scale as <code>6 × active-params × tokens</code>, so
+the 200B-active figure — not the 10T total — is what drives the compute
+bill. At dense FP8 peak, a 100k GB200 cluster is <strong>~0.45
+EFLOP/s</strong> (100,000 × ~4.5 PFLOPS dense FP8); the "~1.0 EFLOP/s
+FP8" figure that circulates is the <em>sparse</em> number and should not
+be used for dense training FLOP accounting. Working examples for 200B
+active:</p>
+<div class="tablewrap"><table class="data">
+<thead>
+<tr>
+<th>Tokens</th>
+<th>Training FLOPs</th>
+<th>Wall-clock @ ~40% MFU, ~0.45 EFLOP/s dense FP8</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>20T</td>
+<td>~2.4e25</td>
+<td>~17 days</td>
+</tr>
+<tr>
+<td>30T</td>
+<td>~3.6e25</td>
+<td>~26 days</td>
+</tr>
+<tr>
+<td>60T</td>
+<td>~7.2e25</td>
+<td>~52 days</td>
+</tr>
+</tbody>
+</table></div>
+<p>A 30T-token run lands at roughly <strong>GPT-5-pretrain scale (~3e25
+FLOP)</strong> but with ~2× the active parameters (<a
+href="https://epochai.substack.com/p/notes-on-gpt-5-training-compute">Epoch
+AI</a>). The over-training math is sobering for an active budget this
+large: a TPP (tokens-per-active-parameter) of even 100–200 implies
+20–40T tokens, and chasing the 500–1000 TPP regime MAI used for its
+35B-active model would demand 100–200T tokens — <strong>infeasible on
+clean data</strong>. With 200B active you are structurally in the
+mild-over-training regime, and <strong>data, not compute, becomes the
+binding constraint above ~40–50T tokens</strong>. The FP4 steady-state
+plus BF16 decay-tail recipe is what keeps the compute side tractable;
+the data side is a separate problem that no amount of GB200 solves.</p>
+<h2 id="what-concretely-changes-versus-hopper-for-the-10t-run">What
+concretely changes versus Hopper for the 10T run</h2>
+<ol type="1">
+<li><strong>Expert parallelism fits inside the rack.</strong> NVLink5's
+72-GPU, 1.8 TB/s coherent domain keeps the EP all-to-all on-NVLink up to
+EP=72, versus EP≤8 on Hopper before spilling to InfiniBand at ~1/4 the
+bandwidth. This is the single largest architectural change, and it is
+why a Blackwell MoE beats a Hopper MoE by <em>more</em> than the raw
+FLOP ratio. Set EP to the NVLink domain and place experts to keep
+all-to-all on copper.</li>
+<li><strong>FP4 is a training format now.</strong> NVFP4 (block-16, E4M3
+scale) with Random Hadamard transforms, stochastic rounding, 2D weight
+scaling, and sensitive-layer carve-outs holds &lt;1% loss to 10T tokens;
+budget a BF16/FP8 decay tail over the final ~18% of tokens. Hopper had
+no native FP4 tensor cores, so this lever simply did not exist before
+Blackwell.</li>
+<li><strong>Per-GPU capacity doubles</strong> (192 GB vs. 80/141 GB, 288
+GB on B300), shrinking the parameter-sharding factor and easing the
+10T-weight + optimizer-state footprint. The coherent ~13.8 TB rack
+memory pool (~20 TB on GB300) changes where experts live.</li>
+<li><strong>The bottleneck moves from FLOPs to bandwidth and
+power.</strong> Tensor cores hit ~96% of peak; HBM hits ~52% of
+nameplate; the win is gated by MBU and by the ~250 MW facility envelope.
+Optimize for <strong>tokens/GPU/s and $/token</strong>, plan the build
+around megawatts, and treat <strong>NVL72 EP-locality and the NVFP4
+decay-tail recipe as the two highest-leverage decisions</strong> in the
+entire run.</li>
+</ol>
+<p>The summary judgment: GB200 NVL72 is not a faster H100 — it is a
+different unit of compute, a 72-GPU coherent rack whose NVLink domain
+and native FP4 reshape the parallelism and numerics of a trillion-scale
+MoE. Plan EP inside the rack, FP4 in the steady state with a
+higher-precision tail, and the build around power. If your procurement
+timeline reaches GB300, take the 288 GB HBM. And keep one eye on
+Ironwood's TCO — it is the only number on the competitive board large
+enough to make a 100k-GB200 commitment something other than the obvious
+default.</p>
+<h2 id="sources">Sources</h2>
+<ul>
+<li>NVIDIA GB200 NVL72 — <a
+href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">https://www.nvidia.com/en-us/data-center/gb200-nvl72/</a></li>
+<li>NVIDIA GB300 NVL72 (Blackwell Ultra) — <a
+href="https://www.nvidia.com/en-us/data-center/gb300-nvl72/">https://www.nvidia.com/en-us/data-center/gb300-nvl72/</a></li>
+<li>Blackwell microarchitecture (per-GPU FP4/FP8 figures) — <a
+href="https://en.wikipedia.org/wiki/Blackwell_(microarchitecture)">https://en.wikipedia.org/wiki/Blackwell_(microarchitecture)</a></li>
+<li>Microbenchmarking NVIDIA's Blackwell Architecture (arXiv 2512.02189)
+— <a
+href="https://arxiv.org/html/2512.02189v2">https://arxiv.org/html/2512.02189v2</a></li>
+<li>Pretraining Large Language Models with NVFP4 (arXiv 2509.25149) — <a
+href="https://arxiv.org/pdf/2509.25149">https://arxiv.org/pdf/2509.25149</a></li>
+<li>Practical FP4 Training for Large-Scale MoE Models on Hopper (arXiv
+2603.02731) — <a
+href="https://arxiv.org/pdf/2603.02731">https://arxiv.org/pdf/2603.02731</a></li>
+<li>Introducing NVFP4 (NVIDIA developer blog) — <a
+href="https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/">https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/</a></li>
+<li>Google TPU v7 Ironwood (tpu7x docs) — <a
+href="https://docs.cloud.google.com/tpu/docs/tpu7x">https://docs.cloud.google.com/tpu/docs/tpu7x</a></li>
+<li>SemiAnalysis: TPUv7 (Ironwood) deep dive — <a
+href="https://newsletter.semianalysis.com/p/tpuv7-google-takes-a-swing-at-the">https://newsletter.semianalysis.com/p/tpuv7-google-takes-a-swing-at-the</a></li>
+<li>AWS Trn3 UltraServers launch — <a
+href="https://aws.amazon.com/about-aws/whats-new/2025/12/amazon-ec2-trn3-ultraservers/">https://aws.amazon.com/about-aws/whats-new/2025/12/amazon-ec2-trn3-ultraservers/</a></li>
+<li>SemiAnalysis: Huawei CloudMatrix 384 vs GB200 NVL72 — <a
+href="https://newsletter.semianalysis.com/p/huawei-ai-cloudmatrix-384-chinas-answer-to-nvidia-gb200-nvl72">https://newsletter.semianalysis.com/p/huawei-ai-cloudmatrix-384-chinas-answer-to-nvidia-gb200-nvl72</a></li>
+<li>SemiAnalysis: xAI Colossus 2 (power/build math) — <a
+href="https://newsletter.semianalysis.com/p/xais-colossus-2-first-gigawatt-datacenter">https://newsletter.semianalysis.com/p/xais-colossus-2-first-gigawatt-datacenter</a></li>
+<li>SemiAnalysis: H100 vs GB200 NVL72 training benchmarks — <a
+href="https://newsletter.semianalysis.com/p/h100-vs-gb200-nvl72-training-benchmarks">https://newsletter.semianalysis.com/p/h100-vs-gb200-nvl72-training-benchmarks</a></li>
+<li>Introl: GB200 NVL72 deployment (power/cooling) — <a
+href="https://introl.com/blog/gb200-nvl72-deployment-72-gpu-liquid-cooled">https://introl.com/blog/gb200-nvl72-deployment-72-gpu-liquid-cooled</a></li>
+<li>Spheron: NVIDIA H100 vs H200 — <a
+href="https://www.spheron.network/blog/nvidia-h100-vs-h200/">https://www.spheron.network/blog/nvidia-h100-vs-h200/</a></li>
+<li>Epoch AI: Notes on GPT-5 training compute — <a
+href="https://epochai.substack.com/p/notes-on-gpt-5-training-compute">https://epochai.substack.com/p/notes-on-gpt-5-training-compute</a></li>
+<li>MAI-Thinking-1 technical report — <a
+href="https://microsoft.ai/pdf/mai-thinking-1.pdf">https://microsoft.ai/pdf/mai-thinking-1.pdf</a></li>
+<li>Colossus (supercomputer) — <a
+href="https://en.wikipedia.org/wiki/Colossus_(supercomputer)">https://en.wikipedia.org/wiki/Colossus_(supercomputer)</a></li>
+</ul>

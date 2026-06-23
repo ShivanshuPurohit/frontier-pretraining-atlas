@@ -1,0 +1,376 @@
+<p class="eyebrow">Chapter 11 · Instability is a budgeted line item</p>
+<h1>Training stability and failure modes for trillion-scale MoE</h1>
+<p class="lede">At 10T-total / 200B-active on 100,000 GB200 GPUs, a divergence that forces a rollback costs order $10<sup>5</sup> per recoverable hour — and the unrecoverable mode, silent weight drift, has no checkpoint to return to because you never saw it happen. This is the field manual for engineering against instability from step zero: the taxonomy, the mitigation stack, the router decision, the Kimi K2 zero-spike mechanism, and the exact MaxText knobs that implement all of it.</p>
+<p class="byline"><span>~28 min read</span><span class="dot">6 figures</span><span class="dot">grounded in MaxText <code>qk_clip_utils.py</code> / <code>optimizers.py</code> / <code>max_utils.py</code></span></p>
+<hr />
+
+<p>At 10T total / 200B active on 100k GB200s, instability is not a tail risk you patch reactively — it is a budgeted line item you engineer against from step zero. A single divergence that forces a rollback to the last good checkpoint costs, conservatively, hours of a fleet whose dense FP8 peak is ~0.45 EFLOP/s (100k B200 dies at ~4.5 PFLOP/s dense FP8 each; the headline 720 PFLOP/s-per-rack figures NVIDIA publishes are 2:4-sparse, and dense is exactly half that, so do not budget against them). At ~35–40% large-MoE FP8 MFU, every recoverable hour is order $10<sup>5</sup> in opportunity cost, and the unrecoverable failure mode — silent weight drift to a worse optimum — has no checkpoint to roll back to because you never saw it happen. The governing fact of the modern literature, from Wortsman et al.'s small-scale proxies (<a href="https://arxiv.org/abs/2309.14322">arXiv:2309.14322</a>) through Kimi K2's 15.5T-token zero-spike run (<a href="https://arxiv.org/abs/2507.20534">arXiv:2507.20534</a>), is that the instabilities that kill trillion-scale runs are <strong>late-emergent</strong>: they surface only at high token counts or high learning rate that a small-scale proxy with identical hyperparameters never reaches. The job is therefore preventive instrumentation plus structural fixes, with a runtime backstop for the residual. This chapter gives the taxonomy, the mitigation stack, the router-stability decision, the Kimi K2 zero-instability mechanism dissected, and the exact MaxText knobs that implement all of it.</p>
+
+<div class="pull">Trillion-scale stability is a composition property, not a single trick: each mitigation closes exactly one failure family, and the run is stable only when all five are closed simultaneously. Diagnose by family, instrument the canaries, and never let a runtime guard quietly absorb a root cause.</div>
+
+<div class="stats">
+  <div class="stat" data-fam="comms"><div class="v">5<span class="u">families</span></div><div class="l">mechanistically distinct instabilities</div></div>
+  <div class="stat" data-fam="optim"><div class="v">15.5<span class="u">T tok</span></div><div class="l">Kimi K2 zero-spike, zero-instability</div></div>
+  <div class="stat" data-fam="attn"><div class="v">1000<span class="u">+</span></div><div class="l">max attention logit under vanilla Muon</div></div>
+  <div class="stat" data-fam="mem"><div class="v">1<span class="u">/15</span></div><div class="l">bad nodes ABFT checksums caught</div></div>
+</div>
+
+<figure class="fig" data-fig="flow">
+  <figcaption class="figcap"><b>Figure 1 — The mitigation stack, end to end.</b> Five distinct failure families, each closed by exactly one structural fix, with <span class="f-comms">skip-step-on-spike</span> as the runtime backstop and the SDC recomputation layer on top — the run is stable only when every leg holds.
+    <span class="meta"><span>Regime · <b>10T/200B on 100k GB200</b></span><span>Evidence · <b>this chapter's synthesis</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "cols":4,"rows":3,"anim":true,
+    "nodes":[
+      {"id":"f1","label":"(1) attn logit\nexplosion","fam":"attn","col":0,"row":0},
+      {"id":"qk","label":"QK-Clip /\nQK-norm","fam":"attn","col":1,"row":0},
+      {"id":"f4","label":"(4) bf16\nnumerics","fam":"prec","col":0,"row":1},
+      {"id":"zl","label":"z-loss +\nfp32 state","fam":"prec","col":1,"row":1},
+      {"id":"f5","label":"(5) head/embed\nnorm growth","fam":"norm","col":0,"row":2},
+      {"id":"sc","label":"final-logit\nsoft-cap","fam":"norm","col":1,"row":2},
+      {"id":"f2","label":"(2) router\ncollapse","fam":"moe","col":2,"row":0},
+      {"id":"bias","label":"aux-loss-free\nbias","fam":"moe","col":3,"row":0},
+      {"id":"res","label":"residual-stream\ngrowth","fam":"optim","col":2,"row":1},
+      {"id":"mhc","label":"sandwich norm\n+ mHC","fam":"optim","col":3,"row":1},
+      {"id":"f3","label":"(3) grad-norm\nspike / SDC","fam":"comms","col":2,"row":2},
+      {"id":"skip","label":"skip-step\n+ recompute","fam":"comms","col":3,"row":2}
+    ],
+    "edges":[
+      {"from":"f1","to":"qk"},
+      {"from":"f4","to":"zl"},
+      {"from":"f5","to":"sc"},
+      {"from":"f2","to":"bias"},
+      {"from":"res","to":"mhc"},
+      {"from":"f3","to":"skip"}
+    ] }</script>
+</figure>
+
+<h2 id="taxonomy"><span class="sec-num">01</span>A five-family taxonomy of trillion-scale instability</h2>
+
+<p>Every loss spike you will see decomposes into one of five mechanistically distinct families. Conflating them is the most common operational error: <span class="k k-prec">z-loss</span> does nothing for attention-logit explosion, QK-Clip does nothing for a poisoned data batch, and gradient clipping does nothing for silent data corruption. Diagnose the family first.</p>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Family</th><th>Mechanism</th><th>Primary monitored signal</th><th>Targeted mitigation</th></tr></thead>
+  <tbody>
+    <tr><td>(1) Attention logit explosion</td><td>S = QKᵀ/√d grows unbounded via Wq·Wk singular-value product; softmax saturates, head gradient vanishes, bf16 exponent rounding diverges</td><td>per-head max attention logit</td><td>QK-norm / QK-Clip / soft-cap</td></tr>
+    <tr><td>(2) Router collapse / dead experts</td><td>Self-reinforcing favoritism → load imbalance, dropped tokens, stragglers; plus router-logit grad spikes</td><td>expert-load entropy, max/min load ratio, dropped-token fraction</td><td>aux-loss-free bias balancing</td></tr>
+    <tr><td>(3) Gradient-norm spikes</td><td>Often a <em>symptom</em>; frequently a data pathology (repeated n-grams) not an optimizer one</td><td>global grad-norm rolling z-score</td><td>skip-step-on-spike + dedup</td></tr>
+    <tr><td>(4) bf16 underflow/overflow</td><td>(4a) log-Z drift → bf16 logit rounding; (4b) Adam second-moment underflow in fp16</td><td>log-Z / z-loss value</td><td>z-loss; fp32 optimizer state</td></tr>
+    <tr><td>(5) Embedding/output-head norm growth</td><td>Untied output embeddings and final logits grow unbounded, coupling into (1) and (4)</td><td>output-logit RMS, embedding norm</td><td>z-loss + final-logit soft-cap</td></tr>
+  </tbody>
+  <caption>Five mechanistically distinct families. The cardinal rule: diagnose the family before reaching for a mitigation — each fix closes exactly one.</caption>
+</table></div>
+
+<figure class="fig" data-fig="barshare">
+  <figcaption class="figcap"><b>Figure 2 — The trillion-scale failure-mode taxonomy.</b> Attention-logit explosion (family 1) is the dominant trillion-scale failure and the single most-monitored stability scalar; router collapse (family 2) is co-equal for a 256–384-expert MoE design.
+    <span class="meta"><span>Regime · <b>200B-active fine-grained MoE</b></span><span>Evidence · <b>Wortsman / K2 / OLMo-2 priorities</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "title":"trillion-scale instability, by family","unit":"% priority share",
+    "items":[
+      {"label":"(1) attention logit explosion","value":34,"fam":"attn"},
+      {"label":"(2) router collapse / dead experts","value":28,"fam":"moe"},
+      {"label":"(3) grad-norm spikes (data)","value":16,"fam":"comms"},
+      {"label":"(4) bf16 numerics","value":12,"fam":"prec"},
+      {"label":"(5) head/embedding norm growth","value":10,"fam":"norm"}
+    ],
+    "note":"Families (1) and (2) are co-dominant; the rest are real but lower-rate. Numbers are priority weighting, not incidence." }</script>
+</figure>
+
+<p><strong>Family (1), attention logit explosion, is the dominant trillion-scale failure</strong> and the single most-monitored stability scalar. The pre-softmax score grows because nothing in standard scaled-dot-product attention regularizes the product of the Wq and Wk singular values. Once max-logit exceeds ~O(10³), the softmax saturates, gradients vanish for that head, and bf16 rounding of the exponent triggers divergence. Wortsman et al. first showed this is reproducible in small models at high LR and is the <em>same</em> instability seen at scale (<a href="https://arxiv.org/abs/2309.14322">arXiv:2309.14322</a>). The Kimi K2 team reports that under vanilla <span class="f-optim">Muon</span>, max attention logits "rapidly exceed 1000" at a 9B-activated proxy scale (<a href="https://arxiv.org/abs/2507.20534">arXiv:2507.20534</a>). This is critical for our target because <strong>Muon — the near-mandatory optimizer at this scale — actively amplifies family (1)</strong>: its Newton-Schulz orthogonalization equalizes update RMS across all singular directions, which is precisely the dynamic that drives the Wq·Wk product to grow. Choosing Muon for its large-batch data-efficiency persistence (<a href="https://arxiv.org/abs/2505.02222">arXiv:2505.02222</a>) means you have signed up for QK-side logit control as a non-negotiable.</p>
+
+<div class="callout key"><div class="ct">The one scalar to remember</div>
+  <p>The per-head <strong>max attention logit</strong> is your canary — the earliest-firing, highest-signal stability scalar, and on a Muon run the one most likely to move. Wire it to a hard alert at &gt;100–500. Everything in §03 exists to keep it bounded.</p></div>
+
+<p><strong>Family (2), router collapse,</strong> is structurally unique to <span class="f-moe">MoE</span> and gets worse with expert count. At 256+ experts with expert parallelism (EP) sharded across thousands of GB200s, a slightly-favored expert receives more tokens, its gradients improve faster, the router favors it more, and the rest atrophy. Beyond the quality loss of dead experts, this produces catastrophic load imbalance: stragglers stall the all-to-all, and tokens overflow expert capacity and are dropped. A distinct sub-mode is <strong>gradient-norm spikes from the router logits themselves</strong> — the gate is a tiny matrix whose logits can blow up independently of the experts, so a grad-norm spike does not always implicate the experts. For a 200B-active design with the DeepSeek-V3-style ~256–384 fine-grained experts, this family is co-equal with (1) in priority.</p>
+
+<p><strong>Family (3), gradient-norm spikes,</strong> is most often the <em>symptom</em> the skip-step machinery keys on rather than a root cause. OLMo-2's most actionable finding traced many spikes to specific data batches containing long repeated n-gram sequences — a data pathology, not an optimizer pathology (<a href="https://arxiv.org/abs/2501.00656">arXiv:2501.00656</a>). The engineering implication is two-layered: aggressive corpus-level deduplication offline, plus a runtime spike guard that rejects the occasional pathological batch that slips through.</p>
+
+<p><strong>Family (4), bf16 numerics,</strong> splits cleanly. (4a) is the softmax normalizer log-Z drifting far from zero so output logits round badly in bf16 — the original motivation for z-loss. (4b) is Adam second-moment / update underflow, which is largely solved by keeping optimizer state in fp32 (<span class="k k-prec">mu_dtype=float32</span>). On GB200, the <span class="f-prec">FP8</span> attention and GEMM paths re-introduce overflow risk and make max-logit control mandatory rather than optional; if you push to <span class="f-prec">FP4</span> on the Blackwell tensor cores, the dynamic-range margin shrinks further.</p>
+
+<p><strong>Family (5)</strong> is the slow structural leak: untied output embeddings and final logits grow without bound and couple into both (1) and (4). Gemma-2's final-logit soft-cap (30.0) and z-loss both target this surface (<a href="https://arxiv.org/abs/2408.00118">arXiv:2408.00118</a>).</p>
+
+<h2 id="zloss"><span class="sec-num">02</span>z-loss: the bf16-numerics and output-head anchor</h2>
+
+<p>z-loss adds <code>λ·(log Z)²</code> to the cross-entropy, where Z is the softmax partition function, penalizing drift of the log-partition from zero. In MaxText this is implemented directly inside the stabilized cross-entropy at <code>src/maxtext/utils/max_utils.py</code> (<span class="k k-prec">cross_entropy_with_logits</span>), which computes <code>log_z = logsumexp(logits)</code> and adds <code>z_loss · square(log_z)</code>, surfaced through the <span class="k k-prec">z_loss_multiplier</span> config (default 0.0). The docstring states both purposes verbatim: keep the logits from drifting too far from zero so bf16 roundoff stays bounded, and encourage the logits to be normalized log-probabilities. The canonical coefficient is <strong>10⁻⁴·log²Z</strong> — OLMo-2 uses it (<a href="https://arxiv.org/abs/2501.00656">arXiv:2501.00656</a>), and the PaLM/Chinchilla-era runs used the same value. This is the fix for families (4a) and (5).</p>
+
+<div class="formula"><span class="lbl">prec</span>
+  <span class="eq">L<sub>total</sub> = L<sub>CE</sub> + λ · (log Z)² ,  Z = Σ<sub>v</sub> exp(logit<sub>v</sub>) ,  λ ≈ 10⁻⁴</span>
+  <span class="note">Penalizes drift of the log-partition from zero so bf16 roundoff of output logits stays bounded. Applies to the output softmax only — orthogonal to attention-logit control.</span></div>
+
+<div class="code-cap">jax — MaxText z-loss inside cross_entropy_with_logits (src/maxtext/utils/max_utils.py)</div>
+<pre class="code"><code># logits: [..., vocab].  z_loss == z_loss_multiplier (config, default 0.0)
+log_z      = jax.nn.logsumexp(logits, axis=-1)            # the softmax log-partition
+log_softmax = logits - log_z[..., None]
+xent       = -jnp.sum(targets * log_softmax, axis=-1)     # stabilized cross-entropy
+total      = xent + z_loss * jnp.square(log_z)            # +1e-4 * (log Z)^2
+</code></pre>
+
+<div class="callout warn"><div class="ct">The load-bearing caveat — z-loss is NOT your attention-stability story</div>
+  <p>z-loss is applied to the output softmax only; it does <strong>nothing</strong> for attention logit explosion (family 1). Engineers routinely set <code>z_loss_multiplier=1e-4</code>, watch the output-logit RMS stabilize, and assume they are protected against divergence — then a head's pre-softmax score blows past 1000 and the run dies anyway. z-loss and QK-side intervention are orthogonal and both required. Set <code>z_loss_multiplier=1e-4</code> as a default and treat it as table stakes, not as your attention-stability story.</p></div>
+
+<h2 id="qk-stack"><span class="sec-num">03</span>The QK-side stack: QK-norm, soft-caps, and QK-Clip</h2>
+
+<p>Three techniques attack family (1) at different points in the forward/update path. They are largely <em>alternatives</em>, and the choice has real consequences at scale.</p>
+
+<div class="tcards">
+  <div class="tcard" data-fam="attn"><div class="tn">QK-norm</div><div class="ts">RMSNorm Q,K pre-dot</div><div class="tm">Cheapest structural option, free at inference, FA-compatible. Bounds activations, not the weight SV product — softer under Muon.</div></div>
+  <div class="tcard" data-fam="norm"><div class="tn">attention soft-cap</div><div class="ts">C·tanh(logits/C)</div><div class="tm">Gemma-2 legacy. Breaks the fused-softmax path; Gemma-3 removed it. Survives only as the final-logits cap.</div></div>
+  <div class="tcard" data-fam="attn"><div class="tn">QK-Clip (MuonClip)</div><div class="ts">post-hoc weight rescale</div><div class="tm">Trillion-scale state of the art. Per-head, conditional, becomes a no-op once logits settle. The K2 default with Muon+MLA.</div></div>
+</div>
+
+<p><strong>QK-norm</strong> applies RMSNorm to Q and K per head before the dot product, bounding ‖q‖ and ‖k‖ so the logit cannot grow via activation magnitude. MaxText gates this with <span class="k k-attn">use_qk_norm</span> in <code>src/maxtext/layers/attentions.py</code>. OLMo-3 uses a <em>global</em> variant (a single RMSNorm over the flattened heads·dim) where other implementations use per-head. The crucial OLMo-2 result is that <strong>QK-norm and reordered-norm yield no stability gain in isolation</strong> — only together do they tame gradient-norm growth and spikiness (<a href="https://arxiv.org/abs/2501.00656">arXiv:2501.00656</a>). QK-norm is the cheapest structural option, costs nothing at inference, and is compatible with FlashAttention; it is the default choice for a dense-attention model and is what Gemma-3 switched <em>to</em> after dropping soft-caps. Its limitation: it bounds the activation magnitudes but not the weight-singular-value product directly, so under Muon's orthogonalized updates it is a softer guarantee than QK-Clip.</p>
+
+<p><strong>Attention soft-cap</strong> (Gemma-2) replaces the raw logits with <code>C·tanh(logits/C)</code>, using C=50.0 for attention and C=30.0 for the final head (<a href="https://arxiv.org/abs/2408.00118">arXiv:2408.00118</a>). MaxText implements this inside the attention kernels (<code>splash_attention_kernel.py</code>, <code>jax_flash_attention.py</code>) and exposes <span class="k k-attn">attn_logits_soft_cap</span> / <span class="k k-norm">final_logits_soft_cap</span>. The drawback is decisive for a 100k-GB200 build: <strong>tanh-capping is incompatible with the fused-softmax path in Flash/Splash attention in some configurations</strong>, and you cannot afford an unfused softmax at this throughput. Gemma-3 itself <em>removed</em> the attention soft-cap in favor of QK-norm. Treat soft-cap as legacy; the only place it survives in a modern recipe is the final-logits cap as a cheap belt-and-suspenders for family (5), and even there z-loss subsumes most of its value.</p>
+
+<p><strong>QK-Clip (MuonClip)</strong> is the trillion-scale state of the art and the right default if you run Muon with MLA. Rather than altering the forward pass, it <em>post-hoc rescales the projection weights</em> after each optimizer step. Per head h, define <code>S_max^h = (1/√d)·max</code> over batch,i,j of <code>Qᵢ^h·Kⱼ^hᵀ</code>; if <code>S_max^h &gt; τ</code>, compute <code>γ_h = min(1, τ/S_max^h)</code> and apply <code>Wq^h ← γ^α Wq^h</code>, <code>Wk^h ← γ^(1−α) Wk^h</code> with α=0.5 so each projection absorbs √γ (<a href="https://arxiv.org/html/2507.20534v1">arXiv:2507.20534v1</a>). Only the heads exceeding τ are touched — "only a small subset of heads exhibit exploding logits" — so it is per-head and conditional, becoming a no-op once logits settle. For MLA, the decomposition matters: the non-RoPE components q^C and k^C are each scaled by √γ, the <em>decoupled per-head</em> RoPE query q^R is scaled by the full γ, and the <em>shared</em> RoPE key k^R is <strong>left untouched</strong> to avoid cross-head coupling (clipping a shared component would contaminate every head). Kimi K2 used <strong>τ=100</strong>.</p>
+
+<div class="formula"><span class="lbl">attn</span>
+  <span class="eq">S<sub>max</sub><sup>h</sup> = (1/√d) · max<sub>b,i,j</sub> Q<sub>i</sub><sup>h</sup>·K<sub>j</sub><sup>hᵀ</sup> ;  γ<sub>h</sub> = min(1, τ/S<sub>max</sub><sup>h</sup>) ;  W<sub>q</sub><sup>h</sup> ← √γ · W<sub>q</sub><sup>h</sup>, W<sub>k</sub><sup>h</sup> ← √γ · W<sub>k</sub><sup>h</sup></span>
+  <span class="note">Per-head, conditional, post-optimizer. α=0.5 splits γ symmetrically across the two projections. A no-op once S<sub>max</sub><sup>h</sup> ≤ τ.</span></div>
+
+<p>MaxText implements exactly this in <code>src/maxtext/utils/qk_clip_utils.py</code>. The key routines:</p>
+
+<ul>
+  <li><span class="k k-attn">_scale_from_max_logits</span><code>(max_logits_batch, τ)</code> computes <code>s_max = max over batch</code> then returns <code>min(1.0, τ/(s_max + 1e-6))</code> — the γ factor, per head, with an epsilon guard.</li>
+  <li><span class="k k-attn">_clip_mla_weight</span><code>(layer_name, param, scale, qk_nope)</code> splits the kernel into a head slice <code>[..., :qk_nope]</code> (the nope/non-RoPE part) and a tail. The nope slice is multiplied by <code>√scale</code>. For <code>wq_b</code>, the tail is the q^R RoPE slice and is multiplied by the <em>full</em> <code>scale</code>; for <code>wkv_b</code>, the tail is the V slice and is <strong>left untouched</strong> (<code>tail_new = tail</code>).</li>
+  <li><span class="k k-attn">calculate_max_logit_metric</span> extracts the global max logit across all layers from sown intermediates, supporting both the Linen sow shape <code>(array,)</code> and the NNX <code>nnx.Intermediate(array)</code> shape.</li>
+</ul>
+
+<div class="codecard">
+  <div class="src-meta"><span class="file">src/maxtext/utils/qk_clip_utils.py</span><span class="tag">MuonClip / QK-Clip</span><span class="tag">MLA-aware rescale</span><span class="tag">trimmed</span></div>
+  <div class="annot-grid">
+<pre class="code"><code>def _scale_from_max_logits(max_logits_batch, tau):            # [1]
+    s_max = jnp.max(max_logits_batch, axis=0)                 # per-head max over batch
+    return jnp.minimum(1.0, tau / (s_max + 1e-6))            # gamma, eps-guarded
+
+def _clip_mla_weight(name, param, scale, qk_nope):           # [2]
+    nope, tail = param[..., :qk_nope], param[..., qk_nope:]
+    nope_new = nope * jnp.sqrt(scale)                         # non-RoPE: sqrt(gamma)
+    if name == "wq_b":                                       # [3]
+        tail_new = tail * scale                               # decoupled q^R: full gamma
+    else:                                                    # wkv_b
+        tail_new = tail                                       # shared k^R / V: UNTOUCHED
+    return jnp.concatenate([nope_new, tail_new], axis=-1)
+
+# applied post-optimizer, only to heads exceeding tau; no-op once logits settle
+</code></pre>
+    <div class="annot-list">
+      <div class="annot"><p><span class="badge">1</span><span class="anh">γ, not a gradient.</span> The scale is read from sown max-logits with a <code>+1e-6</code> epsilon guard and clamped to ≤1 — a multiplicative weight rescale, never a loss term.</p></div>
+      <div class="annot"><p><span class="badge">2</span><span class="anh">nope gets √γ.</span> The non-RoPE head slice <code>[..., :qk_nope]</code> on both Wq and Wk absorbs √scale, splitting γ symmetrically (α=0.5).</p></div>
+      <div class="annot"><p><span class="badge">3</span><span class="anh">RoPE asymmetry.</span> The decoupled per-head q^R tail takes the full γ; the <em>shared</em> RoPE key k^R (and the V slice in <code>wkv_b</code>) is left untouched so clipping cannot contaminate every head.</p></div>
+    </div>
+  </div>
+</div>
+
+<p>A config guard in <code>types.py</code> <strong>forbids <code>use_qk_clip</code> together with <code>attn_logits_soft_cap</code></strong>, because QK-Clip must read the <em>raw</em> dot products to compute S_max — a soft-cap would clamp the very signal QK-Clip needs to measure. The max logits are sown from the attention op (<code>attention_mla.py</code>, <code>record_max_logits=use_qk_clip</code>), and <code>_check_attention_type</code> enforces that QK-Clip is only valid for <code>attention_type='mla'</code>.</p>
+
+<div class="callout do"><div class="ct">Recommendation for the 10T/200B target</div>
+  <p>If your attention is <span class="f-attn">MLA</span> (it should be, for KV-cache economy at 200B active) and your optimizer is Muon (it should be), run QK-Clip with <strong>τ=100</strong> as the primary family-(1) defense, and add per-head QK-norm only if you observe residual spikiness in the proxy sweeps. <strong>Do not stack soft-cap on top</strong> — the guard will reject it, and rightly so.</p></div>
+
+<h2 id="residual"><span class="sec-num">04</span>Residual-stream stability: init scaling, sandwich norm, and DeepSeek-V4 mHC</h2>
+
+<p>Residual-stream growth across depth is the structural analog of logit growth, and at 100+ layers it is its own failure surface. The classical fixes are <strong>1/√(2L) residual scaling</strong> (so the per-layer contribution shrinks with depth) and <strong>sandwich/post-norm placement</strong>, which bound the residual's growth rate. These remain the baseline and you should ship them: sandwich norm (RMSNorm before <em>and</em> after each sublayer's residual add) plus depth-scaled init is cheap insurance.</p>
+
+<p>The 2026 advance is <strong>mHC — Manifold-Constrained Hyper-Connections</strong> (<a href="https://arxiv.org/abs/2512.24880">arXiv:2512.24880</a>, Xie et al., Dec 31 2025), shipped in DeepSeek-V4-Pro (1.6T total / 49B active) and V4-Flash (284B / 13B active). Plain Hyper-Connections (ByteDance) widen the residual stream by an expansion rate n to give parallel mixing paths, but the learned mixing matrix breaks the identity-mapping property: the paper reports a loss surge at ~12k steps in a 27B model with the composite gain magnitude peaking near <strong>~3000</strong> — a residual explosion correlated with gradient-norm instability. mHC constrains the residual mixing matrix H^res ∈ ℝ^{n×n} to be <strong>doubly stochastic</strong> (rows and columns non-negative and summing to 1 — the Birkhoff polytope), enforced by <strong>20 Sinkhorn-Knopp projection iterations</strong>. Double-stochasticity guarantees the spectral norm ‖H^res‖₂ ≤ 1, making each composite layer non-expansive and conserving the feature mean, so the residual neither explodes nor collapses with depth — recovering the identity-residual benefit while permitting rich cross-path mixing. The bound on composite gain drops from HC's ~3000 to mHC's <strong>~1.6</strong>. At n=4 (a 4× wider residual stream) the overhead is only <strong>6.7% of training time</strong>, with gating init α=0.01. MaxText ships an mHC-lite variant in <code>src/maxtext/layers/mhc.py</code> (<span class="k k-optim">sinkhorn</span><code>(t, iters=20)</code>, <code>get_permutation_matrices</code> over the Birkhoff vertices, expand/reduce broadcast), following the mHC-lite note's explicit permutation-matrix parameterization rather than the full Sinkhorn-projected form.</p>
+
+<div class="stats">
+  <div class="stat" data-fam="optim"><div class="v">~3000<span class="u">→1.6</span></div><div class="l">composite gain bound, HC → mHC</div></div>
+  <div class="stat" data-fam="optim"><div class="v">20<span class="u">iters</span></div><div class="l">Sinkhorn-Knopp projection per step</div></div>
+  <div class="stat" data-fam="optim"><div class="v">6.7<span class="u">%</span></div><div class="l">training-time overhead at n=4</div></div>
+</div>
+
+<p>For the 10T/200B target this is a genuine decision point. mHC is recent (the primary paper is dated Dec 31 2025) and DeepSeek-V4 is the only public production validation. A community reimplementation exists, which lets you ablate the n=4 / 20-iter Sinkhorn / α=0.01 choices on a proxy <em>before</em> committing 100k GPUs.</p>
+
+<div class="callout note"><div class="ct">The recommendation — validate, then adopt <span class="conf conf-confirmed">DeepSeek-V4 validated</span></div>
+  <p>Validate mHC on a 9B–27B proxy at the full target depth (depth is the weak transfer axis — see §07), and if it reproduces the residual-norm flattening, adopt n=4; the 6.7% overhead buys you out of an entire failure family. If you cannot validate in time, fall back to <strong>sandwich norm + 1/√(2L) init</strong>, which is well-trodden and safe.</p></div>
+
+<h2 id="skip-step"><span class="sec-num">05</span>skip-step-on-spike: the runtime backstop and momentum-poisoning subtlety</h2>
+
+<p>Structural fixes prevent families (1), (4), (5), and the residual mode. They do not prevent a single pathological data batch (family 3) or a silently corrupted node (§08) from injecting one catastrophic update. The runtime backstop is <strong>skip-step-on-spike</strong>, and MaxText's implementation in <code>src/maxtext/optimizers/optimizers.py</code> (<span class="k k-comms">skip_step_on_spikes</span>) is a faithful port of OLMo-core's <code>skip_step_optimizer</code> with the critical correctness property intact.</p>
+
+<figure class="fig narrow" data-fig="line">
+  <figcaption class="figcap"><b>Figure 3 — A loss spike and grad-norm excursion, caught and recovered.</b> A pathological batch drives both loss and grad-norm past the mean + 6σ band; skip-step zeros the update via <code>lax.cond</code>, the state is unchanged, and the next step resumes on the prior trajectory — momentum never sees the spike.
+    <span class="meta"><span>Regime · <b>interval=128, scaling=6.0</b></span><span>Evidence · <b>MaxText skip_step_on_spikes</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "xlabel":"step","ylabel":"value",
+    "series":[
+      {"name":"loss","fam":"optim","pts":[[0,2.40],[20,2.31],[40,2.26],[55,2.24],[60,3.18],[62,2.23],[80,2.19],[100,2.15]]},
+      {"name":"grad-norm","fam":"comms","pts":[[0,0.42],[20,0.40],[40,0.39],[55,0.38],[60,2.90],[62,0.37],[80,0.36],[100,0.35]]},
+      {"name":"mean + 6σ band","fam":"norm","dash":true,"pts":[[0,0.95],[100,0.92]]}
+    ],
+    "annotations":[{"x":60,"y":3.18,"text":"spike → step skipped"},{"x":62,"y":2.23,"text":"recovered, state unchanged"}] }</script>
+</figure>
+
+<p>The mechanism: the wrapper keeps rolling buffers of the last <code>interval</code> losses and grad-norms, computes their mean and <strong>Bessel-corrected</strong> std (<code>_compute_rolling_stats</code>, using N−1 to align with <code>torch.std</code>), and on each step checks <code>(loss − mean) ≤ scaling_factor·std</code> AND the analogous condition for grad-norm. If either is violated, it zeros the update via <span class="k k-comms">lax.cond</span> — <code>do_update</code> calls the inner optimizer, <code>skip_update</code> returns zero updates <em>and the unchanged inner state</em>. The default <span class="k k-comms">skip_step_scaling_factor</span> is <strong>6.0</strong> and <span class="k k-comms">skip_step_interval</span> is <strong>128</strong>.</p>
+
+<div class="codecard">
+  <div class="src-meta"><span class="file">src/maxtext/optimizers/optimizers.py</span><span class="tag">skip_step_on_spikes</span><span class="tag">port of OLMo-core skip_step_optimizer</span><span class="tag">trimmed</span></div>
+  <div class="annot-grid">
+<pre class="code"><code>mean_l, std_l = _compute_rolling_stats(losses)       # Bessel-corrected (N-1)  # [1]
+mean_g, std_g = _compute_rolling_stats(grad_norms)
+ok = ((loss - mean_l) &lt;= scaling_factor * std_l) &amp; \
+     ((gnorm - mean_g) &lt;= scaling_factor * std_g)    # default scaling=6.0
+
+is_warmup = (count + 1) &lt; min_history               # max(2, interval//2)      # [2]
+updates, new_state = lax.cond(                       # [3]
+    ok | is_warmup,
+    lambda: inner.update(grads, state, params),      # do_update
+    lambda: (zeros_like(grads), state))              # skip_update: state UNCHANGED
+
+new_losses = losses.at[idx].set(loss)                # spike still appended      # [4]
+</code></pre>
+    <div class="annot-list">
+      <div class="annot"><p><span class="badge">1</span><span class="anh">Bessel-corrected std.</span> <code>_compute_rolling_stats</code> uses N−1 to align exactly with <code>torch.std</code>, so the 6σ band matches the OLMo-core reference.</p></div>
+      <div class="annot"><p><span class="badge">2</span><span class="anh">Warmup guard.</span> A warmup of <code>max(2, interval//2)</code> steps prevents the guard firing before the buffer has enough history to give a meaningful std — avoiding spurious early skips.</p></div>
+      <div class="annot"><p><span class="badge">3</span><span class="anh">Zero, not clip.</span> On a spike, <code>skip_update</code> returns zero updates <em>and the unchanged inner state</em> — the corrupt batch never enters Adam's or Muon's moment buffers.</p></div>
+      <div class="annot"><p><span class="badge">4</span><span class="anh">Spike becomes baseline.</span> The skipped loss is still appended so a legitimately shifted regime (data-mix change, WSD decay onset) is not rejected forever.</p></div>
+    </div>
+  </div>
+</div>
+
+<p>The subtlety that makes this strictly superior to global gradient clipping: <strong>zeroing the update means the spike batch never enters Adam's (or Muon's momentum buffer's) moments.</strong> A clipped-but-nonzero update still injects a corrupt <em>direction</em> into the first-moment EMA, where it persists for ~1/(1−β₁) steps and biases every subsequent update; clipping limits the magnitude but not the poisoning. skip-step rejects the whole batch, so momentum is never contaminated. Two further details from the MaxText source matter operationally:</p>
+
+<ul>
+  <li><strong>The spike value is still appended to the rolling buffer</strong> (<code>new_losses = losses.at[idx].set(loss)</code>) even when the step is skipped — "so spikes can become the new baseline." This prevents the guard from getting stuck permanently rejecting a legitimately shifted loss regime (e.g., after a data-mix change or a WSD decay phase begins).</li>
+  <li><strong>A warmup of <code>max(2, interval//2)</code> steps</strong> (<code>is_warmup = (count + 1) &lt; min_history</code>) prevents the guard from firing before the buffer has enough history to give a meaningful std, avoiding spurious early skips.</li>
+</ul>
+
+<div class="callout do"><div class="ct">Recommendation — treat skip-step as containment, not cure</div>
+  <p>Enable <code>skip_step_on_spikes</code> with <code>interval=128</code>, <code>scaling_factor=6.0</code>. Monitor the <em>fraction of skipped steps</em> as a first-class health metric (§09) — a rising skip rate is your earliest warning that data quality or hardware is degrading. If it fires repeatedly, find and fix the root cause (a bad shard, a degrading node) rather than letting it silently absorb a steady stream of corruption.</p></div>
+
+<h2 id="router"><span class="sec-num">06</span>Router stability: aux-loss versus aux-loss-free bias</h2>
+
+<p>The MoE router is the other co-dominant failure surface, and MaxText supports both regimes.</p>
+
+<p><strong>Aux-loss balancing</strong> is the Switch/GShard approach. MaxText's <span class="k k-moe">load_balance_loss</span> (<code>src/maxtext/layers/moe.py</code>) computes <code>num_experts² · mean(density · density_prob)</code> where density is the fraction of tokens dispatched per expert and density_prob the mean routing probability, weighted by <code>load_balance_loss_weight</code> (default 0). Its drawback, isolated cleanly by the Auxiliary-Loss-Free Load Balancing paper (<a href="https://arxiv.org/abs/2408.15664">arXiv:2408.15664</a>), is <strong>interference gradients</strong>: the balance term is in the gradient path, so it trades model quality for load balance on every step.</p>
+
+<p><strong>Aux-loss-free bias balancing</strong> (DeepSeek-V3) is the recommended default at trillion scale. MaxText's <span class="k k-moe">calculate_load_balance_updates</span> (<code>src/maxtext/layers/moe.py</code>) computes <code>expert_counts = bincount(top_k_indices)</code>, <code>average_load = total_tokens / num_experts</code>, <code>direction = sign(average_load − expert_counts)</code>, and returns <code>direction · rate</code>. This nudges a <em>per-expert routing bias</em> by <code>±routed_bias_update_rate</code>; the bias steers the top-k selection but is <strong>not in the gradient path</strong>, so balance is decoupled from the loss surface entirely (<a href="https://arxiv.org/abs/2412.19437">arXiv:2412.19437</a>). No interference gradients, no quality tax.</p>
+
+<figure class="fig" data-fig="compare">
+  <figcaption class="figcap"><b>Figure 4 — Aux-loss vs aux-loss-free bias balancing.</b> The Switch/GShard aux loss sits in the gradient path and trades quality for balance every step; DeepSeek-V3's bias nudge steers selection without touching the gradient — no interference, no quality tax.
+    <span class="meta"><span>Regime · <b>200B active, ~256–384 experts</b></span><span>Evidence · <b>arXiv:2408.15664 / 2412.19437</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "left":{"title":"aux-loss (Switch/GShard)","fam":"moe","items":["num_experts² · mean(density · density_prob)","in the gradient path → interference gradients","trades quality for balance every step","load_balance_loss_weight (default 0)"]},
+    "right":{"title":"aux-loss-free bias (DeepSeek-V3)","fam":"compute","items":["direction = sign(avg_load − counts); ±rate","NOT in the gradient path → no quality tax","decoupled from the loss surface","routed_bias_update_rate, applied post-optimizer"]},
+    "rows":[
+      {"k":"gradient interference","left":"yes","right":"none"},
+      {"k":"quality cost","left":"per-step tax","right":"zero"},
+      {"k":"recommended at 1T","left":"guardrail only","right":"primary"}
+    ] }</script>
+</figure>
+
+<p>For 200B active across 100k GPUs there is a second-order choice that matters: <strong>global (cross-DP) balancing of the bias statistics versus purely sequence-local balancing.</strong> Per-sequence balance over-constrains the router and hurts expert specialization — you want experts to specialize, which means accepting per-sequence imbalance as long as the <em>global</em> batch is balanced. DeepSeek-V3 uses global bias balancing plus a <em>negligible-weight</em> complementary sequence-wise aux loss purely as a guardrail against any single sequence's pathological imbalance. Replicate that: aux-loss-free global bias as the primary mechanism, with <code>load_balance_loss_weight</code> set to a tiny value (DeepSeek-V3 territory) as a sequence-level safety net, not as the main balancer.</p>
+
+<div class="callout warn"><div class="ct">Aggregate the bias statistics across the DP mesh — don't re-introduce locality</div>
+  <p>Aggregate the bias-update statistics across the DP mesh <em>before</em> applying — a per-shard update would re-introduce the locality problem you are trying to avoid. The bias is a control signal applied post-optimizer, not a learned parameter; conflating the two re-couples balance to the loss surface.</p></div>
+
+<h2 id="kimi-k2"><span class="sec-num">07</span>The Kimi K2 zero-instability mechanism, dissected</h2>
+
+<p>Kimi K2 (1.04T total / 32B active, 384 experts top-8) was pretrained on 15.5T tokens with <strong>zero loss spikes and zero training instability</strong> (<a href="https://arxiv.org/abs/2507.20534">arXiv:2507.20534</a>). This is the single most important existence proof for the trillion-scale stability stack, and the claim is not luck — it is the <em>composition</em> of four interlocking pieces:</p>
+
+<ol>
+  <li><strong>MuonClip's QK-Clip preventively caps the one failure mode Muon amplifies.</strong> Muon's orthogonalized updates equalize update RMS across singular directions, which is exactly what drives the Wq·Wk product growth that produces attention logit explosion. QK-Clip (τ=100) clamps it before it can compound. The two are co-designed: you adopt Muon for its large-batch persistence, and QK-Clip is the tax you pay for it.</li>
+  <li><strong>Weight decay 0.1 plus consistent-RMS scaling</strong> (the 0.2·√max(A,B) factor that rescales every matrix's update to RMS≈0.2) bounds weight norms globally, so no single projection drifts.</li>
+  <li><strong>A constant-then-decay WSD schedule</strong> (constant 2e-4 for 10T tokens, then cosine to 2e-5 over the final 5.5T) avoids the late-training LR transients that classically trigger spikes — there is no cosine mid-run LR ramp to perturb a settled basin.</li>
+  <li><strong>67M-token batches</strong> sit near the critical batch size where Muon's data-efficiency advantage persists.</li>
+</ol>
+
+<figure class="fig" data-fig="line">
+  <figcaption class="figcap"><b>Figure 5 — The pin-then-decay signature.</b> Under Muon + QK-Clip(τ=100) the max attention logit pins at τ early, then decays on its own to a normal operating range with no retuning — the tell that the weights relaxed into a stable basin rather than being held down by a hard clamp. After ~30% of steps the clip is a no-op.
+    <span class="meta"><span>Regime · <b>Kimi K2, 15.5T tokens</b></span><span>Evidence · <b>arXiv:2507.20534</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "xlabel":"fraction of training","ylabel":"max attention logit",
+    "series":[
+      {"name":"max logit (QK-Clip τ=100)","fam":"attn","pts":[[0.0,42],[0.03,100],[0.10,100],[0.18,100],[0.30,92],[0.45,71],[0.65,54],[1.0,46]]},
+      {"name":"τ = 100 clip","fam":"norm","dash":true,"pts":[[0.0,100],[1.0,100]]},
+      {"name":"vanilla Muon (no clip)","fam":"optim","dash":true,"pts":[[0.0,42],[0.05,210],[0.10,640],[0.14,1000]]}
+    ],
+    "annotations":[{"x":0.10,"y":100,"text":"pinned at τ"},{"x":0.45,"y":71,"text":"self-decay → no-op"},{"x":0.14,"y":1000,"text":"vanilla diverges"}] }</script>
+</figure>
+
+<p>The empirical signature is the tell that the system found a stable basin rather than being permanently clamped: <strong>logits pin at τ=100 early in training, then decay on their own to a normal operating range with no retuning of τ.</strong> A system that were merely being held down by a hard clamp would stay pinned; the self-decay means the weights relaxed into a configuration where the logits are naturally bounded and the clip stops binding (after ~30% of steps it becomes a no-op). For the 10T/200B target, this is the blueprint: <strong>Muon + QK-Clip(τ=100) + λ=0.1 + consistent-RMS + WSD</strong>, and watch for the pin-then-decay signature in your max-logit trace as confirmation the basin is stable.</p>
+
+<p>One forward-looking note: DeepSeek-V4 reaches the same zero-spike end state by a <em>different</em> route — it discards QK-Clip and instead applies RMSNorm directly to attention queries and KV entries (structural QK-norm rather than post-hoc clip), pairs it with a <strong>two-stage Newton-Schulz</strong> (8 aggressive steps then 2 near-identity polishing steps, the latter to handle the steep M^−0.96 spectral degradation of final-layer projections), and rescales update RMS to 0.18 (<a href="https://arxiv.org/html/2606.04058">arXiv:2606.04058</a>). Both stacks work. QK-Clip is the more battle-tested public recipe (15.5T tokens, fully described, with a correct MaxText implementation); QK-norm is structurally simpler and FlashAttention-compatible.</p>
+
+<div class="callout key"><div class="ct">Do not mix the two QK stacks blindly</div>
+  <p>If you value reproducing a known-good run, take K2's <strong>QK-Clip</strong>; if you value forward-pass simplicity and are willing to ablate, take V4's <strong>QK-norm</strong>. They are alternatives that attack family (1) at different points — pick one deliberately and validate it, do not stack them.</p></div>
+
+<h2 id="sdc"><span class="sec-num">08</span>Silent data corruption: the failure with no checkpoint</h2>
+
+<p>At 100k GB200s, <span class="f-mem">silent data corruption</span> (SDC) is a first-class stability risk and the deepest reason skip-step and gradient-replay exist. Meta's Llama-3 54-day run saw <strong>466 interruptions</strong> (419 unexpected, 78% hardware), with ~6 attributed to SDC; Google reports SDC "every week or two" in Gemini training (<a href="https://arxiv.org/html/2502.12340v1">arXiv:2502.12340v1</a>). Over a multi-month run on 100k GPUs, permanent-fault probability approaches certainty, and the controlled 2026 SDC study using 15 known-bad production nodes is sobering:</p>
+
+<ul>
+  <li>SDC is <strong>silent</strong>: corrupted nodes can show loss curves "identical" to healthy ones, and do not necessarily produce NaNs — so aggregate statistics are unreliable as a detector.</li>
+  <li><strong>ABFT checksums detected only 1 of 15 bad nodes.</strong> Checksum-based detection is nearly useless here.</li>
+  <li>Observed submodule corruption rates reach <strong>2.89e-2</strong> (forward attention) with mismatch severity up to <strong>3.79e11×</strong>, and worst-case gradient noise-to-signal of <strong>5.1%</strong>.</li>
+</ul>
+
+<div class="callout miss"><div class="ct">The failure with no checkpoint — treat "mysterious late spikes" as a hardware problem</div>
+  <p>The effect is not a clean crash; it is <strong>slow weight drift to a worse optimum</strong>, occasionally surfacing late as a loss spike — which is why "mysterious late spikes" should be treated as a hardware-detection problem, not only an optimizer one. The only reliable detection is <strong>recomputation</strong>: shadow DP replicas comparing gradients during all-reduce, or deterministic replay (Gemini's hot-standby scanners).</p></div>
+
+<div class="callout warn"><div class="ct">skip-step alone will NOT catch SDC — the "new baseline" behavior is a liability here</div>
+  <p>For the 10T/200B build, budget explicitly for cross-DP gradient comparison plus periodic golden-value stress tests, and treat skip-step-on-spike as the containment layer that prevents an SDC-corrupted batch from poisoning Adam/Muon momentum <em>before</em> the offending node is quarantined. The skip-step buffer's "spike becomes the new baseline" behavior is a liability here — a slowly drifting corruption can normalize into the rolling mean, so skip-step alone will not catch SDC; you need the recomputation layer on top.</p></div>
+
+<h2 id="monitor"><span class="sec-num">09</span>What to monitor on 100k GB200s</h2>
+
+<p>Log these primary scalars every step. Each maps to a failure family and has an alert threshold.</p>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Scalar</th><th>Family</th><th>Alert / action</th></tr></thead>
+  <tbody>
+    <tr><td><b>Per-head max attention logit</b></td><td>(1)</td><td>Alert &gt;100–500; drives QK-Clip. Watch for the pin-then-decay signature</td></tr>
+    <tr><td><b>Global grad-norm + rolling z-score</b></td><td>(3)</td><td>Drives skip-step at mean + 6σ</td></tr>
+    <tr><td><b>Expert-load entropy / max-min load ratio per MoE layer</b></td><td>(2)</td><td>Router-collapse early warning; track dropped-token fraction</td></tr>
+    <tr><td><b>log-Z / z-loss value</b></td><td>(4a)</td><td>bf16 drift; should stay near 0</td></tr>
+    <tr><td><b>Residual-stream RMS by depth</b></td><td>residual</td><td>mHC / residual-explosion check; should be flat across depth</td></tr>
+    <tr><td><b>Fraction of skipped steps</b></td><td>(3)/SDC</td><td>If rising, data or hardware is degrading — investigate, do not absorb</td></tr>
+  </tbody>
+  <caption>Six primary scalars, each mapped to a failure family. The max attention logit is the canary; the skip-step fraction is the systemic-degradation alarm.</caption>
+</table></div>
+
+<p>Two operating principles. First, <strong>the max attention logit is your canary</strong> — it is the earliest-firing, highest-signal scalar, and on a Muon run it is the one most likely to move. Wire it to a hard alert. Second, <strong>a rising skip-step fraction is never benign.</strong> skip-step is designed to absorb the occasional bad batch silently; if it is firing more than transiently, you have a systematic problem — a corrupt shard, a degrading node, or a router that is starting to collapse — and the guard is masking it. Page on the skip rate, not just on outright divergence.</p>
+
+<h2 id="stack"><span class="sec-num">10</span>Recommended stability stack for 10T / 200B / 100k GB200</h2>
+
+<p>Composing the chapter into a single configuration:</p>
+
+<figure class="fig" data-fig="timeline">
+  <figcaption class="figcap"><b>Figure 6 — Where each defense fires across the run.</b> Structural fixes (z-loss, QK-Clip, mHC, sandwich norm) are on from step zero; the bias balancer and skip-step run throughout; the WSD constant phase carries scaling-law probing before the sharp final cosine decay — the LR regime K2 used to avoid late transients.
+    <span class="meta"><span>Regime · <b>10T/200B on 100k GB200</b></span><span>Evidence · <b>K2 WSD + this chapter</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "segments":[
+      {"label":"warmup + structural fixes on","frac":4,"fam":"attn","sub":"QK-Clip, z-loss, mHC, skip-step warmup"},
+      {"label":"WSD constant phase","frac":66,"fam":"optim","sub":"const LR ~2e-4, bias balancer active"},
+      {"label":"sharp cosine decay","frac":30,"fam":"data","sub":"LR → ~2e-5, γ → 0"}
+    ] }</script>
+</figure>
+
+<div class="tcards">
+  <div class="tcard" data-fam="optim"><div class="tn">optimizer</div><div class="ts">Muon (2D) + AdamW</div><div class="tm">Muon for all 2D hidden matrices; AdamW for embeddings, head, RMSNorm gains. λ=0.1, RMS≈0.18–0.2, mu_dtype=float32.</div></div>
+  <div class="tcard" data-fam="attn"><div class="tn">family (1)</div><div class="ts">QK-Clip τ=100 (MLA)</div><div class="tm">or QK-norm on the V4 route. Never stack with attn_logits_soft_cap — MaxText forbids it.</div></div>
+  <div class="tcard" data-fam="prec"><div class="tn">family (4)/(5)</div><div class="ts">z_loss=1e-4</div><div class="tm">optional final_logits_soft_cap=30.0 as belt-and-suspenders.</div></div>
+  <div class="tcard" data-fam="moe"><div class="tn">family (2)</div><div class="ts">aux-loss-free global bias</div><div class="tm">calculate_load_balance_updates + negligible-weight sequence aux loss as guardrail.</div></div>
+</div>
+
+<ul>
+  <li><strong>Optimizer:</strong> <span class="f-optim">Muon</span> for all 2D hidden matrices (MoE experts, attention projections), AdamW for embeddings, unembed/head, and RMSNorm gains; λ=0.1 both; consistent-RMS≈0.18–0.2; <code>mu_dtype=float32</code>.</li>
+  <li><strong>Family (1):</strong> QK-Clip with τ=100 on MLA (<code>use_qk_clip</code>, MLA-only), or QK-norm if you adopt the V4 route. Never stack with <code>attn_logits_soft_cap</code> — MaxText forbids it.</li>
+  <li><strong>Family (4)/(5):</strong> <code>z_loss_multiplier=1e-4</code>; optional <code>final_logits_soft_cap=30.0</code>.</li>
+  <li><strong>Residual:</strong> sandwich norm + 1/√(2L) init as baseline; mHC n=4 if validated on a depth-matched proxy.</li>
+  <li><strong>Family (2):</strong> aux-loss-free global bias balancing (<code>calculate_load_balance_updates</code>) with a negligible-weight sequence-level aux loss as guardrail.</li>
+  <li><strong>Runtime backstop:</strong> <code>skip_step_on_spikes</code>, <code>interval=128</code>, <code>scaling_factor=6.0</code>.</li>
+  <li><strong>Schedule:</strong> WSD — long constant phase for scaling-law probing, sharp final cosine decay.</li>
+  <li><strong>SDC:</strong> cross-DP gradient comparison + golden-value stress tests + hot-standby replay; quarantine on mismatch.</li>
+</ul>
+
+<div class="callout key"><div class="ct">The unifying claim</div>
+  <p>Trillion-scale stability is a <em>composition</em> property, not a single trick — validated by Kimi K2's 15.5T-token zero-spike run: each mitigation closes exactly one failure family, and the run is stable only when all five are closed simultaneously. Diagnose by family, instrument the canaries, and never let a runtime guard quietly absorb a root cause.</p></div>
+
+<div class="sources"><h3>Sources</h3><ul>
+  <li>Kimi K2 / MuonClip / QK-Clip: <a href="https://arxiv.org/abs/2507.20534">arxiv.org/abs/2507.20534</a>, <a href="https://arxiv.org/html/2507.20534v1">arxiv.org/html/2507.20534v1</a></li>
+  <li>OLMo-2 (z-loss, QK-norm, n-gram spikes): <a href="https://arxiv.org/abs/2501.00656">arxiv.org/abs/2501.00656</a></li>
+  <li>Wortsman et al., small-scale proxies (attention/output logit instability): <a href="https://arxiv.org/abs/2309.14322">arxiv.org/abs/2309.14322</a></li>
+  <li>Gemma-2 soft-caps: <a href="https://arxiv.org/abs/2408.00118">arxiv.org/abs/2408.00118</a></li>
+  <li>mHC (Manifold-Constrained Hyper-Connections, DeepSeek-V4): <a href="https://arxiv.org/abs/2512.24880">arxiv.org/abs/2512.24880</a></li>
+  <li>Aux-loss-free load balancing: <a href="https://arxiv.org/abs/2408.15664">arxiv.org/abs/2408.15664</a>; DeepSeek-V3: <a href="https://arxiv.org/abs/2412.19437">arxiv.org/abs/2412.19437</a></li>
+  <li>Practical Efficiency of Muon (large-batch persistence): <a href="https://arxiv.org/abs/2505.02222">arxiv.org/abs/2505.02222</a></li>
+  <li>Spectral Scaling Laws of Muon (final-layer M⁻⁰·⁹⁶): <a href="https://arxiv.org/html/2606.04058">arxiv.org/html/2606.04058</a></li>
+  <li>Silent Data Corruption in LLM training: <a href="https://arxiv.org/html/2502.12340v1">arxiv.org/html/2502.12340v1</a></li>
+  <li>MaxText QK-Clip: <a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/utils/qk_clip_utils.py">maxtext/src/maxtext/utils/qk_clip_utils.py</a></li>
+  <li>MaxText z-loss (cross_entropy_with_logits): <a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/utils/max_utils.py">maxtext/src/maxtext/utils/max_utils.py</a></li>
+  <li>MaxText skip_step_on_spikes: <a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/optimizers/optimizers.py">maxtext/src/maxtext/optimizers/optimizers.py</a></li>
+  <li>OLMo-core skip_step_optimizer (reference impl): <a href="https://github.com/allenai/OLMo-core/blob/main/src/olmo_core/optim/skip_step_optimizer.py">OLMo-core/skip_step_optimizer.py</a></li>
+</ul></div>

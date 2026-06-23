@@ -1,0 +1,666 @@
+<h1
+id="13-data-curation-in-2026-from-common-crawl-to-taxonomied-corpora-custom-crawlers-and-active-selection">13.
+Data curation in 2026: from Common Crawl to taxonomied corpora, custom
+crawlers, and active selection</h1>
+<p>For a 10T-total / 200B-active MoE on 100k GB200, data is not a
+preprocessing step you finish before the run — it is the binding
+constraint and the single highest-leverage variable in the whole
+campaign. The architecture and the systems plan are, by mid-2026,
+largely solved problems (G=8–12, S≈0.98, FP4 bulk GEMMs, WSD schedule);
+what separates a frontier model from a mediocre one trained on the same
+FLOP budget is the corpus. This chapter is the data-engineering
+counterpart to the scaling-law campaign in §7 and §8: it argues that the
+field has undergone a structural phase change — from <em>monolithic
+filtering</em>, where one classifier makes one keep/discard decision per
+document and 90% of the web is thrown away forever, to <em>queryable
+taxonomied corpora</em> plus <em>model-aware active selection</em>,
+where annotation is decoupled from selection and the discarded tail is
+recycled rather than deleted. We walk the open-corpus lineage (FineWeb,
+DCLM, Nemotron-CC, RefinedWeb, RedPajama-v2, TxT360), the Essential-Web
+taxonomy template, the classifier/dedup/decontam stack, data mixing
+(DoReMi → RegMix → CLIMB → online bandits), synthetic data (WRAP →
+BeyondWeb → REWIRE → Nemotron-CC-Math), and the genuine frontier —
+datamodels, influence functions, learnability, and per-token selection —
+before specifying a concrete 10T-token stack.</p>
+<h2
+id="131-the-structural-shift-decouple-annotation-from-selection">13.1
+The structural shift: decouple annotation from selection</h2>
+<p>The defining move of 2025–2026 is to stop baking a single quality
+decision into the artifact. Pre-2025 web corpora — FineWeb-Edu,
+DCLM-baseline, Nemotron-CC — score every document with a classifier,
+keep the top X%, and the discarded 90% survives only as a URL and a
+scalar score. That is lossy in a way that compounds: every time you want
+to change the mix (upsample medical, downsample boilerplate, concentrate
+math late in training), you must retrain a bespoke high-recall
+classifier and re-filter trillions of tokens, a weeks-to-months loop.
+<strong>Essential-Web v1.0</strong> (Essential AI, <a
+href="https://arxiv.org/abs/2506.14111">arXiv 2506.14111</a>, 24T
+tokens, 23.6B documents) inverts this. Every document carries the
+<strong>EAI-Taxonomy</strong>: 12 categories in 5 groupings — (1)
+<strong>FDC</strong>, Free Decimal Correspondence, a public-domain Dewey
+analogue with 3 hierarchical levels (e.g. 5→Science, 51→Mathematics,
+512→Algebra); (2) <strong>Bloom</strong> (Cognitive Process × Knowledge
+Domain); (3) <strong>Document Type</strong> (V1 broad / V2 fine); (4)
+<strong>Content Quality</strong> = Reasoning Depth + Educational Level
+(the FineWeb-Edu axis) + Technical Correctness; (5)
+<strong>Extraction</strong> (HTML artifacts + Missing Content). The
+corpus contains <strong>14.1M unique primary-label combinations and 1.2B
+primary/secondary combos</strong>, which is the whole point: selection
+becomes a <code>WHERE</code> clause over columns, written in under
+fifteen minutes, instead of a classifier you train and validate.</p>
+<p>The empirical payoff is that pure SQL-style filters over the taxonomy
+produce datasets competitive with or beating task-specialized SOTA
+pipelines: math −8.0% vs SOTA, <strong>web code +14.3%, STEM +24.5%,
+medical +8.6%</strong> (the medical figure is +3.2pp / 8.6% over
+DCLM-baseline, +4.9pp over TheBlueScrubs), all reached without training
+a single domain classifier (<a
+href="https://arxiv.org/abs/2506.14111">arXiv 2506.14111</a>). For a
+100k-GB200 run this is the correct <em>template</em> — but it is a
+template, not a ceiling. The recommendation is unambiguous:
+<strong>pre-annotate your entire crawl once with a rich, orthogonal
+taxonomy, then drive every per-stage mix, curriculum decision, and
+domain upsampling via cheap queries.</strong> Do not re-filter 10T
+tokens each time the mix changes. And do not treat the EAI category set
+as the final word — extend it with axes your evals care about (license
+class, language, toxicity tier, code-vs-prose, instruction-density,
+paywall/provenance flag, recency bucket). The taxonomy is metadata you
+own; over-annotate it.</p>
+<p>The load-bearing insight is the annotator economics. Essential AI
+chose the teacher by <em>orthogonality, correctness, and
+expressivity</em>, measured via inter-category normalized mutual
+information (NMI) on held-out sets, and <strong>Qwen2.5-32B-Instruct won
+over Qwen2.5-72B and DeepSeek-V3</strong> — a larger teacher was not
+better for labeling. They then distilled it into
+<strong>EAI-Distill-0.5b</strong>, a fine-tuned Qwen2.5-0.5B-Instruct
+trained on ~104.6M Common Crawl documents labeled by the teacher (two
+annotation passes to add categories), reaching <strong>within 3%
+annotator agreement, 14% NMI, and 1% domain-recall</strong> of the 32B
+teacher. Full-corpus inference over 23.6B documents cost **~90k AMD
+MI300x GPU-hours** (512 MI300x, roughly one week), vLLM for the Qwen
+models, SGLang for DeepSeek-V3 (<a
+href="https://arxiv.org/abs/2506.14111">arXiv 2506.14111</a>). The
+lesson for 10T-scale: a 0.5–1B distilled annotator makes whole-corpus
+rich labeling a one-off ~10⁵ GPU-hour cost — negligible against a
+100k-GB200 pretrain that will burn 10⁷–10⁸ GPU-hours. There is no excuse
+not to over-annotate. The Essential-Web appendix even exposes the exact
+pre-classifier heuristic gates (<code>frac_chars_dupe_Ngrams</code>
+thresholds, top-2/3-gram fractions, <code>word_count &lt; 50</code>) and
+the two-pass + NMI teacher-selection methodology (<a
+href="https://arxiv.org/pdf/2506.14111">PDF</a>) — a copyable spec for
+building your own distilled annotator rather than re-deriving it.</p>
+<h2 id="132-the-open-corpus-lineage-and-what-each-contributes">13.2 The
+open-corpus lineage and what each contributes</h2>
+<p>Before designing a stack, fix the reference points. The open
+web-corpus lineage is the empirical record of what filtering does and
+does not buy, and a frontier lab should treat each as a tested recipe
+rather than a finished dataset to consume.</p>
+<div class="tablewrap"><table class="data">
+<thead>
+<tr>
+<th>Corpus</th>
+<th>Scale</th>
+<th>Core method</th>
+<th>Key result / lesson</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>RefinedWeb</strong> (2023)</td>
+<td>~5T (600B released)</td>
+<td>Heuristic + MinHash, CC-only, no LLM classifier</td>
+<td>Web-only can match curated mixes; heuristics + strong dedup go
+far</td>
+</tr>
+<tr>
+<td><strong>RedPajama-v2</strong> (2023)</td>
+<td>30T tokens, 100B docs</td>
+<td>Raw CC + 40+ precomputed quality signals, <em>no</em> filtering
+applied</td>
+<td>The original "ship signals, let users filter" idea —
+proto-taxonomy</td>
+</tr>
+<tr>
+<td><strong>FineWeb / FineWeb-Edu</strong> (<a
+href="https://arxiv.org/html/2406.17557v1">2406.17557</a>)</td>
+<td>15T / ~1.3T</td>
+<td>Linear regressor on Snowflake-arctic-embed-m, 460k Llama-3-70B edu
+scores, threshold ≥3</td>
+<td>Edu-classifier filtering is the workhorse; F1≈82%; per-snapshot (not
+global) dedup</td>
+</tr>
+<tr>
+<td><strong>DCLM-baseline</strong> (<a
+href="https://arxiv.org/abs/2406.11794">2406.11794</a>)</td>
+<td>3.6T (from 240T pool)</td>
+<td>fastText on OH-2.5 + ELI5 positives, top-~10%</td>
+<td><a href="mailto:7B@2.6T">7B@2.6T</a> → 64% MMLU; established the
+fastText-classifier baseline</td>
+</tr>
+<tr>
+<td><strong>Nemotron-CC</strong> (<a
+href="https://arxiv.org/abs/2412.02595">2412.02595</a>)</td>
+<td>6.3T (4.4T real + 1.9T synth)</td>
+<td>Classifier <em>ensemble</em> + rephrasing</td>
+<td>Recall fix: HQ subset beats DCLM by +5.6 MMLU @8B/1T with 4× more
+unique tokens</td>
+</tr>
+<tr>
+<td><strong>TxT360</strong> (<a
+href="https://www.llm360.ai/news/txt360-blogpost.html">LLM360</a>)</td>
+<td>40.21B docs → 15T+</td>
+<td>Global near-dedup of 99 CC snapshots + 14 curated sources, rich
+metadata</td>
+<td>Controlled upsampling beats FineWeb-15T; ~17% exact dupes
+removed</td>
+</tr>
+<tr>
+<td><strong>Dolma 3 / Olmo 3</strong> (<a
+href="https://arxiv.org/pdf/2512.13961">2512.13961</a>)</td>
+<td>~9.3T pool → ~5.9T mix</td>
+<td>Global dedup (Duplodocus) + quality-aware upsampling ≤7×</td>
+<td>Most fully-disclosed end-to-end SOTA stack; rebukes "discard
+90%"</td>
+</tr>
+</tbody>
+</table></div>
+<p>Two structural reads. First, the lineage bifurcates into a
+<em>filtering school</em> (RefinedWeb → DCLM → FineWeb-Edu: train a
+classifier, keep the top slice) and a <em>metadata school</em>
+(RedPajama-v2 → TxT360 → Essential-Web → Dolma 3: ship signals/labels,
+defer selection). The metadata school has won at the frontier because,
+as §13.6 makes precise, the selection decision is scale- and
+target-dependent and you cannot bake it once. Second, the absolute
+scales matter for a 10T MoE: DCLM-Pool is 240T raw CC tokens, FineWeb is
+15T, RedPajama-v2 is 30T raw, Essential-Web is 24T labeled — but the
+<em>unique high-quality</em> yield after aggressive filtering and dedup
+is realistically only ~15–20T tokens across the whole open web. That
+ceiling, not the raw pool, is what your epoch budget must respect
+(§13.5).</p>
+<p>A third read, easy to miss, is that these corpora are <em>recipes
+plus ablations</em>, and the ablations are the asset. DCLM's
+contribution was less the 3.6T-token artifact than DCLM-Bench — a
+controlled 1B/7B testbed that let the field A/B filtering choices on a
+fixed compute budget; FineWeb's was the methodical demonstration that
+per-snapshot dedup, a simple edu classifier, and good extraction beat
+elaborate hand-tuned heuristic cascades. A frontier lab should mine each
+release for its <em>decision</em> (what was kept, what was thrown away,
+and the measured downstream delta) and reproduce the decision on its own
+corpus, not ingest the tokens. The tokens are downstream-stale the
+moment your crawler and taxonomy diverge from theirs; the methodology is
+durable. This is also why the right internal artifact is not "our
+FineWeb" but a versioned, queryable, fully-annotated pool from which any
+of these recipes can be re-derived in an afternoon by writing a
+different query.</p>
+<h2
+id="133-quality-classifiers-the-recall-problem-and-the-fasttext-renaissance">13.3
+Quality classifiers: the recall problem and the fastText
+renaissance</h2>
+<p>The 2024 canon converged on two designs. <strong>FineWeb-Edu</strong>
+uses a linear regressor on Snowflake-arctic-embed-m embeddings, trained
+on ~410k of 460k Llama-3-70B-Instruct educational 0–5 annotations (an
+<em>additive</em> rubric — score points for distinct desiderata — which
+beats single-rating prompts), threshold ≥3, F1≈82%, yielding ~1.3T
+tokens from FineWeb's 15T (<a
+href="https://arxiv.org/html/2406.17557v1">arXiv 2406.17557</a>).
+<strong>DCLM-baseline</strong> uses a fastText classifier with
+OpenHermes-2.5 + r/ExplainLikeImFive (ELI5) instruction-formatted
+positives, top-~10% cut → 3.6T tokens, with a <a
+href="mailto:7B@2.6T">7B@2.6T</a> reaching 64% 5-shot MMLU (<a
+href="https://arxiv.org/abs/2406.11794">arXiv 2406.11794</a>).</p>
+<p>The recognized failure mode — stated explicitly in Essential-Web's
+related work — is that aggressive monolithic classifiers <strong>remove
+~90% of the data</strong>, which is fatal for long-horizon training
+(Llama-3.1's 15T, your 10T-active run) because it destroys unique-token
+yield, and these classifiers <strong>lag badly on math and code</strong>
+where "educational prose" signal is a poor proxy.
+<strong>Nemotron-CC</strong> (<a
+href="https://arxiv.org/abs/2412.02595">arXiv 2412.02595</a>, 6.3T
+tokens) is the canonical recall fix: <strong>ensemble</strong> the
+FineWeb-Edu and DCLM classifiers plus custom model-labeled classifiers,
+reducing reliance on any single heuristic → 4.4T unique real tokens +
+1.9T synthetic; the high-quality subset beats DCLM by <strong>+5.6 MMLU
+at 8B/1T while keeping 4× more unique tokens</strong>.
+<strong>Ultra-FineWeb</strong> (<a
+href="https://arxiv.org/abs/2505.05427">arXiv 2505.05427</a>, OpenBMB,
+1T en + 120B zh) pushes efficient verification: bootstrap a fastText
+classifier with a <em>verification step</em> — does adding a candidate
+set actually lower validation loss in a short MiniCPM run? — making
+filtering cheap enough to iterate.</p>
+<p>The net guidance for the frontier run is a division of labor:
+<strong>fastText is back as the inference-time workhorse</strong>
+(millions of docs/sec/CPU core, near-free over 10T tokens) while
+LLM-as-judge and large embedders supply the <em>labels</em>. Ensemble
+multiple classifiers for recall rather than trusting one aggressive cut,
+and <strong>verify a classifier by its downstream-loss effect, not its
+F1</strong> — the Ultra-FineWeb verification loop and Essential-Web's
+NMI-based teacher selection are the same instinct: optimize the metric
+you actually care about (loss/eval), not a proxy. For a 200B-active MoE
+specifically, filter <em>less</em> aggressively than the 7B-proxy
+literature implies (§13.6) and lean on the recall-preserving ensemble +
+taxonomy rather than a top-10% guillotine.</p>
+<h2 id="134-deduplication-and-decontamination">13.4 Deduplication and
+decontamination</h2>
+<p>The standard dedup stack has four tiers, and a frontier corpus uses
+all of them:</p>
+<ul>
+<li><strong>Exact substring / suffix-array dedup</strong> — remove
+verbatim repeats; cheap, high-precision, the floor.</li>
+<li><strong>MinHash-LSH fuzzy dedup</strong> — the dominant
+near-duplicate method. FineWeb deliberately deduped <em>per-snapshot,
+not globally</em>, after finding that global dedup over-removes and the
+survivors skew toward low-quality boilerplate that happens to be unique
+(<a href="https://arxiv.org/html/2406.17557v1">arXiv 2406.17557</a>).
+This is a genuine design tension, see below.</li>
+<li><strong>Bloom-filter dedup (BFF)</strong> — DCLM's approach;
+memory-efficient global dedup at pool scale.</li>
+<li><strong>Semantic dedup</strong> — <strong>SemDeDup</strong> (embed,
+cluster, drop near-duplicate embeddings), <strong>D4</strong> (dedup +
+diversify via SSL-prototype pruning), and <strong>SoftDeDup</strong>
+(reweight by n-gram "data commonness" instead of hard removal). This
+tier catches paraphrase-level redundancy that MinHash misses.</li>
+</ul>
+<p><strong>TxT360</strong> globally near-deduplicated 99 CC snapshots +
+14 curated sources to 40.21B docs (~17% exact dupes removed), with rich
+per-document metadata enabling <em>controlled upsampling</em> into a
+15T+ corpus that beats FineWeb-15T (<a
+href="https://www.llm360.ai/news/txt360-blogpost.html">LLM360</a>). The
+2026 frontier reference is <strong>Olmo 3 / Dolma 3</strong> (<a
+href="https://arxiv.org/pdf/2512.13961">arXiv 2512.13961</a>):
+aggressive <strong>global dedup at trillion-token scale via their new
+"Duplodocus" tool</strong>, plus <strong>quality-aware upsampling that
+repeats high-quality docs up to 7×</strong> rather than flat top-k
+filtering — a direct rebuke of the "throw away 90%" school. The
+FineWeb-vs-Dolma tension on global dedup resolves as follows: global
+dedup is correct <em>when paired with quality-aware upsampling and rich
+metadata</em> (so you re-add the high-quality survivors deliberately),
+and harmful when it is the only knob (you over-remove and keep the
+unique junk). For a 10T MoE, run global dedup to establish the
+unique-token inventory, then upsample by taxonomy class — do not let
+global dedup silently set your mix.</p>
+<p><strong>Decontamination</strong> remains GPT-3-era <strong>13-gram
+overlap</strong> as the floor, but it is known-leaky to paraphrase.
+Modern pipelines (Olmo 3 emphasizes "stronger decontamination") add
+embedding-similarity and LLM-semantic checks against the <em>full</em>
+eval suite — not just public benchmarks but your private evals, since a
+leaked private eval is undetectable from the outside and corrupts your
+own go/no-go decisions. The decontamination ordering matters
+operationally: it must run <em>after</em> synthesis, not before, because
+a rephraser pointed at a document that happens to paraphrase a benchmark
+question will manufacture fresh contamination that no 13-gram filter on
+the source corpus would have caught. Re-run the full decontam sweep
+after every synthetic-generation and translation pass, and decontaminate
+the <em>synthetic</em> tokens against the eval suite, not just the raw
+web.</p>
+<p>For a 200B-active MoE, dedup matters <em>more</em> than for a dense
+model: Muennighoff data-constrained scaling shows repeats decay in value
+(≈4 epochs is the practical degradation point for dense; MoE folklore
+puts it lower, ~2 epochs, because sparse experts overfit their routed
+subset faster), so <strong>unique-token yield is the binding
+constraint</strong> and every duplicate you fail to remove is an epoch
+you cannot afford (<a href="https://arxiv.org/pdf/2305.16264">arXiv
+2305.16264</a>). Concretely, Muennighoff's effective-data law is
+<code>D' = U_D + U_D·R_D*·(1 − e^(−R_D/R_D*))</code> with
+<code>R_D* ≈ 15.4</code> for the dense regime: returns on repetition are
+nearly free up to ~4 epochs, decay sharply past <code>R_D*</code>, and
+are essentially nil by ~40 epochs. The corollary for the data pipeline
+is that a duplicate you fail to catch does not merely waste a slot — it
+inflates your <em>measured</em> unique-token count, so you under-acquire
+and discover the shortfall only when the loss curve flattens early.
+Budget dedup recall as conservatively as you budget GPU-hours.</p>
+<h2 id="135-why-frontier-labs-run-private-crawlers">13.5 Why frontier
+labs run private crawlers</h2>
+<p>Three converging pressures make a proprietary crawler mandatory by
+mid-2026, not optional.</p>
+<p><strong>(1) Coverage and freshness.</strong> Common Crawl is a
+sparse, lagging sample of any given domain — it captures a thin slice of
+each site at irregular intervals. Labs want full-site, near-real-time
+crawls. Anthropic's ClaudeBot at its June-2025 peak was crawling on the
+order of <strong>70,900 pages per referred visitor</strong>, an
+extraction footprint far beyond CC's, precisely because CC's per-site
+depth is shallow.</p>
+<p><strong>(2) Access collapse.</strong> More than <strong>35% of the
+top-1000 sites now block GPTBot — a 7× rise since August 2023 — and
+CCBot is the single most-blocked crawler</strong>, so Common Crawl's
+<em>effective</em> coverage is actively declining (<a
+href="https://www.cloudflare.com/press/press-releases/2025/cloudflare-just-changed-how-ai-crawlers-scrape-the-internet-at-large/">Cloudflare</a>).
+Cloudflare's mid-2025 flip to permission-default (block AI crawlers
+unless allowed) and the emerging <strong>RSL (Really Simple
+Licensing)</strong> standard adopted by Reddit, Yahoo, Medium, and
+People Inc. push the whole web toward pay-per-crawl. A corpus built on
+CC is built on a shrinking, increasingly stale base.</p>
+<p><strong>(3) Legal and quality provenance.</strong> A November 2025
+investigation showed Common Crawl ships paywalled news despite claims to
+the contrary — a liability a frontier lab prefers to own via direct
+licenses rather than inherit. The economics are now explicit:
+Reddit↔︎OpenAI is reportedly ~$70M/yr for licensed access.</p>
+<p>The conclusion for a 100k-GB200 program: <strong>run a proprietary
+full-coverage crawler for freshness, depth, and clean provenance;
+license the high-value walled gardens directly</strong> (Reddit and
+forums, news, Stack/code, scientific publishers); and use Common Crawl
+only as a baseline and supplement, never as the spine. The crawler is
+also where you enforce provenance metadata — license class, robots/RSL
+status, paywall flag — that becomes a taxonomy axis and a legal audit
+trail. Pair direct PDF acquisition with <strong>olmOCR</strong>-class
+extraction for scientific literature, which Dolma 3 weights at 13.6% of
+its mix (§13.8) — a signal of how much premium clean text now comes from
+PDFs rather than HTML.</p>
+<h2
+id="136-synthetic-data-rephrasing-has-won-over-de-novo-textbooks">13.6
+Synthetic data: rephrasing has won over de-novo textbooks</h2>
+<p>The decisive empirical result of 2025–2026 is that <strong>rephrasing
+existing web text beats generating textbooks from scratch at
+scale.</strong> This reverses the early Phi/Cosmopedia intuition and is
+now the consensus.</p>
+<p>The lineage: <strong>WRAP</strong> established source-rephrasing with
+a ~3× training speedup. <strong>Cosmopedia</strong> (Mixtral-8x7B, 25B
+tokens, 30M files) is the open textbook-style baseline.
+<strong>BeyondWeb</strong> (DatologyAI, <a
+href="https://www.datologyai.com/blog/beyondweb">arXiv 2508.10975</a>)
+is the trillion-scale lesson: <em>targeted, diverse-strategy</em>
+rephrasing — format transformation, QA-pair extraction, pedagogical-tone
+rewrite, content restructuring — beats RedPajama by
+<strong>+7.1pp</strong> and Nemotron-Synth by <strong>+2.6pp</strong> at
+8B/180B tokens, <strong>7.7× faster than RedPajama</strong>; a
+3B-on-BeyondWeb beats an 8B-on-Cosmopedia. Three findings reframe the
+whole synthetic-data cost model:</p>
+<ol type="1">
+<li><strong>Rephraser quality saturates by ~3B params.</strong>
+Generator quality does <em>not</em> predict synthetic quality; weak ~3B
+models rephrase fine. You do not need your flagship to generate
+data.</li>
+<li><strong>Strategy diversity is what sustains gains across
+trillion-token budgets.</strong> Single-strategy synthetic
+<em>plateaus</em>; diverse-strategy does not. The cost lever is
+prompt/strategy engineering, not generator size.</li>
+<li>The "Demystifying Synthetic Data" scaling study (<a
+href="https://arxiv.org/abs/2510.01631">arXiv 2510.01631</a>) confirms
+<strong>rephrased web shows no degradation at high synthetic fraction,
+whereas textbook-style synthetic degrades</strong> — so you can push the
+synthetic fraction high if and only if it is rephrasing-based and
+strategy-diverse.</li>
+</ol>
+<p><strong>Nemotron-CC-v2</strong> operationalizes this: Qwen3-30B-A3B
+rephrasing + Diverse-QA (5 prompt templates), <strong>translated into 15
+languages</strong> for +10.0 Global-MMLU over multilingual-CC-only.
+<strong>Nemotron-CC-Math</strong> (<a
+href="https://arxiv.org/html/2508.15096v1">arXiv 2508.15096</a>, 133.26B
+tokens @3+, 52.32B @4+) is the must-copy math pipeline, and its key
+lesson is <em>non-obvious</em>: the bottleneck for web math is not the
+quality classifier but <strong>HTML extraction</strong>. Trafilatura and
+Resiliparse silently corrupt inline LaTeX and flatten code blocks.
+Nemotron-CC-Math renders HTML through <strong>Lynx — a 1992 text browser
+— to preserve equations</strong>, then uses <strong>Phi-4 to standardize
+to canonical LaTeX</strong>, delivering <strong>+4.8 MATH, +16.2 MBPP+
+over FineMath-4+ with 5.5× more tokens</strong>. Most teams have not
+internalized this; for a math/code-heavy frontier MoE it is free
+quality.</p>
+<p><strong>REWIRE</strong> (Meta, <a
+href="https://arxiv.org/pdf/2506.04689v1">arXiv 2506.04689</a>) is the
+clearest "beat the data wall" lever: it <strong>recycles the
+filtered-out low-quality tail</strong> by rewriting those discarded
+documents, outperforming both raw-web and synthetic-only baselines
+across 10B/70B/300B budgets, with an optimal mix of recycled + raw
+beating either alone. For a unique-token-constrained 10T budget this is
+orthogonal to and stackable with rephrasing the kept data — instead of
+discarding 90%, rewrite the discarded tail into usable tokens. The
+synthetic strategy for the frontier run is therefore: <strong>keep the
+synthetic fraction high but diversity-driven, never a textbook
+monoculture; rephrase the kept web with ≥4 distinct strategies;
+REWIRE-recycle the filtered tail; render math/code through
+structure-preserving extraction; translate the best synthetic into the
+target language set.</strong></p>
+<h2
+id="137-the-frontier-beyond-annotation-model-aware-and-per-token-selection">13.7
+The frontier beyond annotation: model-aware and per-token selection</h2>
+<p>Even a perfect taxonomy plus SQL is heuristic selection — it matches
+documents to a human notion of "high quality." The genuine research
+frontier is <em>model-aware</em> selection: choose data by how the
+<em>learner</em> uses it to perform on <em>target</em> tasks.</p>
+<p><strong>Heuristic similarity is provably suboptimal.</strong>
+<strong>DsDm</strong> (Engstrom et al., ICML 2024, <a
+href="https://proceedings.mlr.press/v235/engstrom24a.html">PMLR
+v235</a>) shows that selecting by similarity to "high-quality" sources
+can <em>hurt</em> downstream performance; <strong>datamodels / influence
+functions</strong> that predict how training on a document changes
+target-task loss win instead. <strong>MATES</strong> (Yu et al., NeurIPS
+2024) trains a small <strong>data-influence model</strong>, periodically
+refreshed to track the evolving pretraining state (oracle = one-step
+reference-loss reduction), beating static selection on scaling curves —
+the key being that influence is <em>non-stationary</em>, so a single
+up-front score is wrong by mid-training.</p>
+<p><strong>Apple's BETR</strong> ("Language Models Improve When
+Pretraining Data Matches Target Tasks," <a
+href="https://arxiv.org/abs/2507.12466">arXiv 2507.12466</a>) is the
+cleanest 2025 result and the most directly actionable: embed benchmark
+examples, score corpus documents by similarity to them, distill into a
+classifier — yielding a <strong>2.1× compute multiplier over
+DCLM-baseline and 4.7× over unfiltered</strong>, validated across 500+
+models from 10¹⁹ to 10²² FLOP. Its scaling-law finding is the one to
+burn in for a 200B-active build: <strong>larger models need
+<em>less</em> aggressive filtering.</strong> Selection strategy must be
+scale-adapted. Tuning your 10T/200B mix on a 7B proxy's optimal filter
+threshold will silently over-filter and waste frontier compute — the
+proxy will tell you to cut harder than the real model wants.</p>
+<p>On the <em>learnability / online</em> axis: <strong>RHO-Loss</strong>
+(select tokens that are learnable-but-not-yet-learned, via a reference
+model's holdout loss) is the seed; <strong>ESLM</strong> (<a
+href="https://arxiv.org/abs/2505.19893">arXiv 2505.19893</a>) does
+risk-averse per-token selective language modeling, pushing selection
+below the document granularity to the token level. The RHO-Loss
+criterion is worth stating precisely because it captures what
+document-level quality scoring misses: a token is worth training on when
+the <em>training</em> model's loss on it is high (it has not been
+learned) but a <em>reference</em> model's holdout loss on it is low (it
+is learnable and not noise) — high training loss alone selects
+mislabeled and inherently-random tokens, which is why naive hard-example
+mining fails. Per-token selection is the logical endpoint of the recall
+argument: instead of discarding a document wholesale, keep its
+high-signal spans and skip its boilerplate, navigation chrome, and
+license footers. This is still research-grade at trillion-token scale —
+the reference-model forward pass over 10T tokens is a real cost, and the
+gains shrink as the base corpus quality rises — but it is where the
+field is heading, and a cheap approximation (mask obvious boilerplate
+spans flagged by the Extraction taxonomy axis) is already deployable
+today.</p>
+<p><strong>Per-domain mixing</strong> has matured well past
+<strong>DoReMi</strong> (Group-DRO to derive domain weights from a
+proxy). <strong>RegMix</strong> (<a
+href="https://arxiv.org/abs/2502.10341">arXiv 2502.10341</a> lineage)
+fits a regression over many small proxy models trained on random
+mixtures, matching or exceeding DoReMi at ~10% of the compute.
+<strong>WebOrganizer</strong> (<a
+href="https://weborganizer.allen.ai/">weborganizer.allen.ai</a>, Wettig
+et al.) organizes the web into <strong>24 topic × 24 format
+domains</strong> and, combined with RegMix, shows that
+<strong>topic-defined domains beat source-defined domains for
+mixing</strong> — the "Topic Over Source" result (<a
+href="https://arxiv.org/abs/2502.16802">arXiv 2502.16802</a>) — which is
+directly relevant because your taxonomy already gives you topic columns;
+mix over those, not over URLs. <strong>CLIMB / Nemotron-CLIMB</strong>
+(NVIDIA, <a href="https://arxiv.org/abs/2504.13161">arXiv
+2504.13161</a>) does k-means-cluster → proxy-eval → regression-predictor
+→ iterative bootstrap of the mixture, with a 1B model <strong>+2.0% over
+Llama-3.2-1B at 400B tokens</strong>. <strong>Online Data
+Mixing</strong> (a multi-armed bandit over domains <em>during</em>
+training) closes the loop for a run far too expensive to re-sweep — you
+adjust the mixture from live loss signals rather than committing it up
+front. For a single 10T run you cannot afford a full mixture sweep at
+scale, so the practical recipe is: RegMix/CLIMB to set the
+<em>initial</em> topic-format mixture from proxies, then an online
+bandit to adapt it during the run.</p>
+<h2 id="138-a-sota-10t-token-data-stack-june-2026">13.8 A SOTA 10T-token
+data stack (June 2026)</h2>
+<p>Putting it together, here is the concrete stack for the 10T-total /
+200B-active target. The numbers throughout are governed by the binding
+constraint from §13.4: realistically ~15–20T unique high-quality tokens
+exist, MoEs tolerate fewer epochs than dense models, so the unique-token
+budget — not the raw pool — is what you optimize, and
+acquisition/synthesis/recycling are compute-equivalent levers for
+beating the wall.</p>
+<div class="tablewrap"><table class="data">
+<thead>
+<tr>
+<th>Stage</th>
+<th>Action</th>
+<th>Tooling / reference</th>
+<th>Frontier choice for 10T/200B</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>1. Acquire</strong></td>
+<td>Proprietary full-coverage crawler + licensed walled gardens + CC
+baseline</td>
+<td>ClaudeBot-class crawler; RSL-licensed Reddit/news/code/science</td>
+<td>CC is a <em>supplement</em>, not the spine; provenance metadata
+captured at crawl</td>
+</tr>
+<tr>
+<td><strong>2. Extract</strong></td>
+<td>Structure-preserving extraction</td>
+<td>Lynx for math/code, olmOCR for PDFs</td>
+<td>Never let Trafilatura mangle LaTeX; PDFs are a premium source</td>
+</tr>
+<tr>
+<td><strong>3. Dedup</strong></td>
+<td>Global trillion-token dedup, all four tiers</td>
+<td>MinHash-LSH + suffix-array + BFF + SemDeDup; Duplodocus-class</td>
+<td>Global dedup to set unique inventory, then upsample by class</td>
+</tr>
+<tr>
+<td><strong>4. Annotate</strong></td>
+<td>Once, into a rich orthogonal taxonomy</td>
+<td>EAI-Taxonomy template + distilled 0.5–1B annotator (~10⁵
+GPU-hr)</td>
+<td>Queryable metadata, not a single score; extend EAI axes</td>
+</tr>
+<tr>
+<td><strong>5. Select</strong></td>
+<td>SQL filters + model-aware overlays</td>
+<td>EAI <code>WHERE</code> clauses + BETR/datamodel influence,
+scale-adapted</td>
+<td>Filter <em>less</em> hard than 7B-proxy implies; influence for
+target alignment</td>
+</tr>
+<tr>
+<td><strong>6. Synthesize</strong></td>
+<td>Diverse-strategy rephrasing + tail recycling + Diverse-QA</td>
+<td>BeyondWeb principles, REWIRE, Nemotron-CC-Math, multilingual</td>
+<td>High synthetic fraction, diversity-driven, ~3B rephraser
+suffices</td>
+</tr>
+<tr>
+<td><strong>7. Mix</strong></td>
+<td>Topic-format mixing + quality-aware upsampling + curriculum</td>
+<td>RegMix/CLIMB → online bandit; Dolma-3 upsampling ≤7×</td>
+<td>Math/code/reasoning concentrated late, after LR decay</td>
+</tr>
+<tr>
+<td><strong>8. Decontaminate</strong></td>
+<td>13-gram floor + embedding/LLM-semantic</td>
+<td>Against the <em>full</em> eval suite incl. private evals</td>
+<td>Re-run after every synthetic-generation pass</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>Reference proportions.</strong> Dolma 3's ~5.9T mix is the
+most fully-disclosed SOTA baseline: <strong>CC 76.1%, olmOCR science
+PDFs 13.6%, Stack-Edu code 6.89%, FineMath-3+ 2.56%, arXiv
+0.86%</strong> (<a href="https://arxiv.org/pdf/2512.13961">arXiv
+2512.13961</a>). A frontier 200B-active MoE should shift materially away
+from that distribution — Dolma is deliberately CC-heavy for
+reproducibility and license-cleanliness, not because 76% web is optimal.
+The frontier shift is toward (a) <strong>a much larger code and math
+fraction</strong> (these carry the reasoning signal that MoE experts
+specialize on, and the granularity/sparsity scaling laws reward
+specialization), (b) <strong>a high synthetic fraction</strong> of
+strategy-diverse rephrased + recycled tokens, and (c)
+<strong>license-clean premium sources</strong> (licensed forums, news,
+publishers) replacing the riskiest CC tail. A plausible target mix: ~40%
+filtered+recycled web, ~20% code, ~12% math, ~20% strategy-diverse
+synthetic (rephrased web + Diverse-QA + REWIRE tail), ~8% premium
+licensed + science PDFs — tuned by RegMix proxies and adapted
+online.</p>
+<p><strong>Curriculum and the late-stage decay.</strong> The mixture is
+not static across training. The strong, repeatable finding is that
+<strong>the LR decay phase wastes your best data if you place it
+early</strong> — high-quality math/code/reasoning and the cleanest
+synthetic should be <em>concentrated late</em>, after the learning rate
+has decayed, where the model can actually absorb it (this couples
+directly to the WSD scheduler from §8: fork the annealing phase and feed
+it your premium mix). With ~5T unique high-quality tokens repeated at ≤4
+epochs you reach ~20T effective tokens before repetition decay bites —
+and quality-aware upsampling (Dolma-3 style, repeating the best
+documents up to 7×) is the mechanism for getting there without flat
+top-k throwing away recall.</p>
+<p><strong>Pipeline cost and where it runs.</strong> The whole stack is
+cheap relative to the pretrain, which is the reason there is no excuse
+to skimp on it. Annotation is the largest single line item and it is
+~10⁵ GPU-hours for a distilled 0.5–1B model over tens of billions of
+documents — at most a few tenths of a percent of a 10⁷–10⁸ GPU-hour
+pretrain. Dedup, extraction, and fastText classification are
+overwhelmingly <em>CPU</em> work and run on a commodity cluster off the
+critical accelerator path; the GPU-resident costs are the annotator, the
+synthetic rephraser (a ~3B model, embarrassingly parallel, run with
+vLLM/SGLang at high batch), and the optional reference-model forward
+pass for influence/learnability scoring. The right operational posture
+is to treat the data pipeline as a <em>standing service</em> that runs
+continuously and feeds a versioned pool, not a one-shot job before the
+run: the crawler is always crawling, the annotator re-labels new
+documents as they land, and the mixture is re-queried per training
+stage. The 100k-GB200 fleet should never idle waiting on data, and with
+the pipeline decoupled and CPU-bound it never will — the binding
+constraint is unique-token <em>supply</em>, not pipeline throughput.</p>
+<p><strong>The through-line.</strong> Every recommendation here points
+the same direction: stop deleting data. Annotate once and select by
+query; recall-preserve with ensembles and taxonomy; recycle the filtered
+tail with REWIRE; upsample quality rather than discarding the rest;
+adapt selection to your model's scale (filter <em>less</em> at 200B);
+and treat synthetic as a strategy-diversity problem, not a
+generator-size problem. The "discard 90%" orthodoxy was a small-model
+artifact. For a 10T/200B MoE on 100k GB200, where unique tokens are the
+binding constraint and acquisition/synthesis/recycling are the only ways
+past the data wall, the corpus is engineered, not filtered — and the lab
+that owns its crawler, its taxonomy, and its model-aware selection loop
+owns the variable that the FLOP budget cannot buy.</p>
+<h2 id="sources">Sources</h2>
+<ul>
+<li>Essential-Web v1.0 / EAI-Taxonomy: <a
+href="https://arxiv.org/abs/2506.14111">https://arxiv.org/abs/2506.14111</a>,
+<a
+href="https://arxiv.org/pdf/2506.14111">https://arxiv.org/pdf/2506.14111</a></li>
+<li>FineWeb / FineWeb-Edu: <a
+href="https://arxiv.org/html/2406.17557v1">https://arxiv.org/html/2406.17557v1</a></li>
+<li>DCLM: <a
+href="https://arxiv.org/abs/2406.11794">https://arxiv.org/abs/2406.11794</a></li>
+<li>Nemotron-CC: <a
+href="https://arxiv.org/abs/2412.02595">https://arxiv.org/abs/2412.02595</a></li>
+<li>Nemotron-CC-Math (Lynx + Phi-4 extraction): <a
+href="https://arxiv.org/html/2508.15096v1">https://arxiv.org/html/2508.15096v1</a></li>
+<li>TxT360 (LLM360): <a
+href="https://www.llm360.ai/news/txt360-blogpost.html">https://www.llm360.ai/news/txt360-blogpost.html</a></li>
+<li>Olmo 3 / Dolma 3 / Duplodocus: <a
+href="https://arxiv.org/pdf/2512.13961">https://arxiv.org/pdf/2512.13961</a></li>
+<li>BeyondWeb (DatologyAI): <a
+href="https://www.datologyai.com/blog/beyondweb">https://www.datologyai.com/blog/beyondweb</a></li>
+<li>Demystifying Synthetic Data: <a
+href="https://arxiv.org/abs/2510.01631">https://arxiv.org/abs/2510.01631</a></li>
+<li>REWIRE (Recycling the Web): <a
+href="https://arxiv.org/pdf/2506.04689v1">https://arxiv.org/pdf/2506.04689v1</a></li>
+<li>Apple BETR: <a
+href="https://arxiv.org/abs/2507.12466">https://arxiv.org/abs/2507.12466</a></li>
+<li>DsDm (Engstrom et al.): <a
+href="https://proceedings.mlr.press/v235/engstrom24a.html">https://proceedings.mlr.press/v235/engstrom24a.html</a></li>
+<li>WebOrganizer / Topic Over Source: <a
+href="https://weborganizer.allen.ai/">https://weborganizer.allen.ai/</a>,
+<a
+href="https://arxiv.org/abs/2502.10341">https://arxiv.org/abs/2502.10341</a></li>
+<li>CLIMB / Nemotron-CLIMB: <a
+href="https://arxiv.org/abs/2504.13161">https://arxiv.org/abs/2504.13161</a></li>
+<li>ESLM (per-token selective LM): <a
+href="https://arxiv.org/abs/2505.19893">https://arxiv.org/abs/2505.19893</a></li>
+<li>Data-constrained scaling (Muennighoff et al.): <a
+href="https://arxiv.org/pdf/2305.16264">https://arxiv.org/pdf/2305.16264</a></li>
+<li>Cloudflare / crawler-blocking and pay-per-crawl: <a
+href="https://www.cloudflare.com/press/press-releases/2025/cloudflare-just-changed-how-ai-crawlers-scrape-the-internet-at-large/">https://www.cloudflare.com/press/press-releases/2025/cloudflare-just-changed-how-ai-crawlers-scrape-the-internet-at-large/</a></li>
+</ul>

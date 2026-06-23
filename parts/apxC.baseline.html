@@ -1,0 +1,749 @@
+<h1
+id="appendix-c-the-operational-playbook--stas-bekmans-ml-engineering-distilled-for-a-100k-gpu-run">Appendix
+C. The operational playbook — Stas Bekman's ML-Engineering, distilled
+for a 100k-GPU run</h1>
+<p>This appendix compresses Stas Bekman's <a
+href="https://github.com/stas00/ml-engineering">ML-Engineering
+handbook</a> into an executable checklist for a 10T-parameter /
+200B-active MoE on ~100k GB200. It is organized by operational domain.
+Every threshold, command, and formula below is sourced from the
+handbook; treat the numbers as starting points to re-measure on your
+stack, not as gospel — the handbook's own core thesis is that vendor
+specs lie and you must benchmark everything yourself. The single
+overarching law: at this scale <strong>the bottleneck is moving bits,
+not FLOPS</strong> (<a
+href="https://github.com/stas00/ml-engineering/blob/master/insights/ai-battlefield.md">insights/ai-battlefield</a>).
+GB200's FP16 compute scaled ~18x over V100 while NVLink intra-node only
+scaled ~6x; the first four NVLink generations reused the <em>same</em>
+25 GBps-per-NIC links and just added more of them. Your fabric is
+structurally behind your FLOPS, so plan for comms-bound regimes —
+especially MoE all-to-all and gradient reduction — and engineer to hide
+them.</p>
+<h2 id="c1-network-topology-benchmarking-and-the-bandwidth-reality">C.1
+Network: topology, benchmarking, and the bandwidth reality</h2>
+<p><strong>Lock down units before trusting any number.</strong> The #1
+source of confusion (<a
+href="https://github.com/stas00/ml-engineering/blob/master/network/README.md">network/README</a>):
+1 GBps = 8 Gbps, and vendors routinely quote <em>bidirectional
+(duplex)</em> figures that are ~2x the unidirectional number. Diagnostic
+rule: real measured bandwidth should land at ~80% of the
+<em>unidirectional</em> theoretical. If a measurement comes in at ~40%
+of spec, the spec was almost certainly duplex — halve it, and you're
+back to ~80%. Before any capacity math, pin down GBps-vs-Gbps and
+uni-vs-duplex for every link.</p>
+<p><strong>Know your two domains and the order-of-magnitude gap between
+them.</strong></p>
+<ul>
+<li>Intra-node (scale-up): GB200 NVL72 fuses <strong>72 Blackwell GPUs
+into ONE NVLink-5 domain at 900 GBps unidirectional</strong> per GPU via
+NVSwitch. This is the key architectural lever of the whole machine.
+NVLink generations, unidirectional all-to-all per GPU: v3 (A100)=300, v4
+(H100/H200)=450, v5 (B200/GB200)=900, v6 (Rubin)=1800 GBps. PCIe5=63,
+PCIe4=31 GBps.</li>
+<li>Inter-node (scale-out): per-node unidirectional totals — Quantum-2
+IB (8x400G)=400, <strong>InfiniBand XDR800 (8x800G)=800</strong>, AWS
+EFA v3=400, EFA v4=800, Gaudi3=600 GBps. IB per-link signaling: EDR=25,
+HDR=50, NDR=100, XDR=200 Gbps; latency ~0.5–0.6 µs.</li>
+<li>The gap: ~5600 Gbps intra-node vs ~3200 Gbps/node scale-out.
+<strong>This gap, not raw FLOPS, governs your parallelism
+mapping.</strong></li>
+</ul>
+<p><strong>Map parallelism to the fabric.</strong> Keep the
+heaviest-traffic collectives inside the 72-GPU NVLink domain: tensor
+parallelism (TP) and MoE expert-parallel all-to-all. TP "requires very
+fast network; not advisable across nodes" (<a
+href="https://github.com/stas00/ml-engineering/blob/master/training/model-parallelism/README.md">model-parallelism</a>);
+on NVL72 you can push TP beyond 8 if it helps, but mind comms-overlap
+difficulty. Reserve scale-out IB/EFA for DP and PP, where comms either
+overlap compute (PP send/recv) or can be made intra-node via
+hpZ/HYBRID_SHARD. Sequence/context parallelism (Ulysses all-to-all) and
+the MoE expert all-to-all are the new heavy hitters a 200B-active MoE
+adds — neither is characterized by the all-reduce proxy, so benchmark
+them separately.</p>
+<p><strong>Run the bottleneck calc per parallelism config.</strong>
+Compare <code>comm_time = payload_bytes / bandwidth</code> against
+<code>compute_time</code>; the network is the bottleneck whenever
+<code>comm_time &gt; compute_time</code>. DDP all-reduce payload =
+<code>params * 4 bytes * 2</code> (all-reduce moves data ~2x). Worked:
+2B params → 16 GB payload; intra-node 300 GBps → 0.053 s vs ~0.42 s
+compute (compute-bound, fine); 4 nodes @200 Gbps inter-node → ~0.64–0.8
+s (≈23x slower than NVLink, network-bound); @400 Gbps → 0.32 s &lt; 0.42
+s (hidden again). Every model-parallel scheme incurs <em>far more</em>
+comms than plain DDP — comms volume per strategy: DDP=2x params,
+ZeRO-1/2=2x, <strong>ZeRO-3/FSDP=3x</strong> (1.5x more than DDP, two
+all-gathers + one reduce-scatter), TP=2x all-gather + 2x reduce-scatter,
+PP=2x send + 2x recv (overlaps compute). The actionable sizing formulas
+(<a
+href="https://github.com/stas00/ml-engineering/blob/master/training/model-parallelism/README.md">model-parallelism</a>):</p>
+<pre><code>comms_time   = n_transmissions * n_bytes * model_size_B / inter_node_GBps
+compute_time = n_passes * n_bytes * model_size_B * seqlen * GBS / (total_gpus * 1e3 * tflops_wo_comms)</code></pre>
+<p>with <code>n_transmissions</code> = 3 (ZeRO-3/FSDP) or 2 (ZeRO-1);
+<code>n_passes</code> = 3 without activation recompute, 4 with;
+<code>tflops_wo_comms</code> ≈ 75% of peak. <strong>Goal:
+<code>comms_time ≤ compute_time</code></strong> — overlap is imperfect,
+so never let comms dominate. For GAS&gt;1 under ZeRO-2/3 the all-gather
+repeats per accumulation step, so comms blows up to
+<code>GAS*3*2*M/GBps</code>; ZeRO-1 needs no extra comms for GAS&gt;1 —
+a strong reason to use ZeRO-1 when combining with PP/TP.</p>
+<p><strong>Payload size is everything — small messages are
+catastrophic.</strong> A100 all-reduce busbw by payload: 32KB→~1.3,
+1MB→18, 8MB→110, 128MB→177, 1GB→229, 8GB→235 GBps; throughput only
+saturates around ~536 MB and is poor below 8 MB. Fragmentation penalty:
+1x4GB = 1257 Gbps vs 1000x4MB = 374 Gbps busbw (~3x). <strong>Bucket and
+fuse gradients/collectives so payloads land in the saturated regime
+(≥128–536 MB).</strong> Never use object-based collectives
+(<code>all_gather_object</code> pickles Python objects) on a hot path —
+~23x slower than tensor <code>all_reduce</code> (<a
+href="https://github.com/stas00/ml-engineering/blob/master/network/benchmarks/README.md">network/benchmarks</a>).</p>
+<p><strong>Benchmark — the actual commands and what to
+read.</strong></p>
+<ul>
+<li>nccl-tests:
+<code>./build/all_reduce_perf -b 32k -e 16G -f 2 -g 8 -n 50</code>
+(<code>-b</code> begin, <code>-e</code> end, <code>-f</code> step mult,
+<code>-g</code> #GPUs, <code>-n</code> iters). <strong>Read ONLY the
+<code>busbw</code> column</strong> — <code>algbw</code> is raw size/time
+and isn't comparable across collectives. busbw already bakes in the
+all-reduce volume factor <code>2*(n-1)/n</code> (~1.75 at n=8 → 2 as n
+grows), so compare busbw directly to the theoretical peak. Read it at
+the largest/saturated payload.</li>
+<li>Pure-PyTorch alternative (no build):
+<code>all_reduce_bench.py</code>. It reports both <code>algbw</code> (=
+payload/time, compare to <em>application</em> needs) and
+<code>busbw = algbw * 2*(ranks-1)/ranks</code> (compare to <em>link</em>
+peak). Time with CUDA events + <code>torch.cuda.synchronize()</code>,
+<strong>not</strong> wall-clock around the kernel; 5 warmup + 20 timed
+iters; sweep 2^15 (32KB) → 2^34 (16GB). Stability/flapping probe:
+<code>--profile_stability --payload_size_in_gib 0.5</code> (a stress
+test, not representative load).</li>
+<li>Raw p2p: NVIDIA <code>nvbandwidth</code> (newer/correct) or
+<code>p2pBandwidthLatencyTest</code> (diagonal ≈ same-GPU ~1581 GBps;
+off-diagonal = real p2p, e.g. A100 ~274 GBps).</li>
+</ul>
+<p><strong>Network benchmarking checklist.</strong></p>
+<ul class="task-list">
+<li><label><input type="checkbox" />Benchmark on <strong>≥4
+nodes</strong> (ideally full production count) — sub-4-node results do
+<strong>not</strong> extrapolate to 100k GPUs; cross-rail/spine
+contention only appears at scale.</label></li>
+<li><label><input type="checkbox" />Reserve an
+<strong>isolated/dedicated partition</strong> for the benchmark; noisy
+neighbors make numbers non-reproducible (BLOOM-176B used an isolated
+SLURM partition).</label></li>
+<li><label><input type="checkbox" />On GB200 NVL72, benchmark the
+intra-rack NVLink all-reduce and the cross-rack IB all-reduce
+<strong>separately</strong>, then the hierarchical combined
+collective.</label></li>
+<li><label><input type="checkbox" />Confirm busbw saturates to
+<strong>≥80–85% of NVLink-5 900 GBps</strong> inside each NVL72 domain;
+flag any node/link materially below the cluster median (slow-link
+detection — pace the cluster to the slowest
+accelerator/link).</label></li>
+<li><label><input type="checkbox" />Enable <strong>SHARP/NVLS</strong>
+(<code>NCCL_NVLS_ENABLE=1</code>, <code>NCCL_ALGO=NVLS</code>):
+in-network reduction turns all-reduce from 2N sends into N+1 (~25–30%
+gain; NVLink4 ~370→480 GBps). Requires <em>all</em> GPUs in the
+collective to activate — verify the uplift actually
+appears.</label></li>
+<li><label><input type="checkbox" />For &gt;64-GPU scale set
+<code>NCCL_IB_QPS_PER_CONNECTION=4</code> (default 1) to spread traffic
+across queue pairs; verify adaptive routing is enabled for IB/RoCEv2
+with the provider.</label></li>
+<li><label><input type="checkbox" />Disable PCI ACS for GPU-Direct (or
+enable ATS on VMs where ACS can't be disabled).</label></li>
+<li><label><input type="checkbox" />On shared/cloud fabric,
+<strong>repeat benchmarks at different times of day</strong> —
+single-run numbers are unreliable.</label></li>
+<li><label><input type="checkbox" />Bandwidth thresholds (from ZeRO-3,
+64+ GPU experience): 100 Gbps inter-node is <em>not enough</em>; 200–400
+Gbps <em>ok</em>; 800–1000 Gbps <em>ideal</em>. General target ≥400 Gbps
+inter-node (BLOOM-176B survived on 50 Gbps — slow but workable). On
+GB200 these floors scale up with the FLOPS jump.</label></li>
+</ul>
+<h2 id="c2-network-debug-nccl-connectivity-diagnostics">C.2 Network
+debug: NCCL connectivity diagnostics</h2>
+<p>Don't debug with your full training stack (slow to launch, masks the
+problem). Use the dedicated probe
+<code>torch-distributed-gpu-test.py</code> with
+<code>NCCL_DEBUG=INFO</code> (<a
+href="https://github.com/stas00/ml-engineering/blob/master/network/debug/README.md">network/debug</a>):</p>
+<pre><code>NCCL_DEBUG=INFO python -m torch.distributed.run --nproc_per_node 8 --nnodes 1 torch-distributed-gpu-test.py</code></pre>
+<p><strong>The single most important grep at 100k scale:</strong> search
+every node's startup log for <code>NCCL INFO NET/</code>. This one line
+is where most multi-node perf disasters are diagnosed:</p>
+<ul>
+<li>GOOD:
+<code>NCCL INFO NET/IB : Using [0]mlx5_0:1/IB ... [RO]; OOB eno1:...</code>
+— IB RDMA does the collectives, an OOB Ethernet NIC does bootstrap.
+Correct.</li>
+<li>BAD (wrong plugin):
+<code>NCCL INFO NET/FastSocket : Using [0]ibs108:...</code> — the wrong
+transport grabbed the IB devices; you're running TCP over IB-named
+interfaces, massively degraded.</li>
+<li><code>NCCL INFO NET/Socket : Using [0]eth0:...</code> — plain
+Ethernet, acceptable only if no faster fabric exists. If it picked
+<code>docker0</code> or <code>lo</code>, the job hangs or crawls.</li>
+</ul>
+<p><strong>Interface selection is the main lever.</strong>
+<code>NCCL_SOCKET_IFNAME</code> (TCP) and <code>NCCL_IB_HCA</code>
+(IB/RDMA) share a prefix grammar: bare = "starts with"
+(<code>eth</code>→eth0,eth1…), <code>=</code> exact
+(<code>=eth0,eth1</code>), <code>^</code> exclude prefix
+(<code>^docker</code>), <code>^=</code> exclude exact. Classic gotcha: a
+bonded RoCE interface <code>[8]mlx5_bond_0:1/RoCE</code> sneaks into the
+comm set and tanks throughput — fix by excluding it
+(<code>NCCL_IB_HCA=^mlx5_bond_0:1</code>) or explicitly whitelisting the
+8 real HCAs (<code>=mlx5_0,...,mlx5_7</code>). Discover with
+<code>ifconfig</code> (TCP) and
+<code>ibstat</code>/<code>ibstat | grep mlx5</code> (IB).</p>
+<p><strong>Verbosity knobs.</strong>
+<code>NCCL_DEBUG ∈ {VERSION, WARN, INFO, TRACE}</code>;
+<code>NCCL_DEBUG_FILE=/path/nccl-log.%h.%p.txt</code> splits the
+firehose per host/PID so you can <strong>diff a slow rank against
+healthy ones across 100k GPUs</strong>;
+<code>NCCL_DEBUG_SUBSYS=COLL</code> (or
+<code>INIT,GRAPH,ENV,TUNING</code>) narrows it. Gate verbose collective
+counting to rank 0 (<code>if [[ $SLURM_PROCID == "0" ]]</code>) then
+<code>grep -a "NCCL INFO AllReduce" main_log.txt | wc -l</code>.</p>
+<p><strong>Intra-node P2P/NVLink path.</strong>
+<code>nvidia-smi topo -p2p r</code> shows a matrix (legend X=self, OK,
+CNS/GNS/TNS/NS = various "not supported", U=unknown). Per-pair:
+<code>python -c "import torch; print(torch.cuda.can_device_access_peer(torch.device('cuda:0'), torch.device('cuda:1')))"</code>
+— False means no P2P → silently halved intra-node bandwidth. Remedies:
+disable PCI ACS and/or disable IOMMU in BIOS.
+<code>NCCL_P2P_DISABLE=1</code> is <strong>diagnostic only</strong> (big
+slowdown).</p>
+<p><strong>Containers:</strong>
+<code>docker run --shm-size=1g --ulimit memlock=-1</code> (NCCL needs
+large shm and unlimited locked memory for RDMA pinning); install
+<code>libibverbs1</code> + <code>librdmacm1</code>; add
+<code>--privileged</code> if RDMA init fails. <strong>Cross-cloud
+gotcha:</strong> NCCL env vars that worked on cloud A frequently break
+on cloud B — strip ALL inherited <code>NCCL_*</code> and reconfigure
+from scratch per platform. <strong>Exit criterion:</strong> after NCCL
+looks right, benchmark and require <strong>~80% of advertised line
+rate</strong> before declaring a node-type healthy.</p>
+<h2 id="c3-fault-tolerance--checkpointing">C.3 Fault tolerance &amp;
+checkpointing</h2>
+<p>At 100k-GPU MTBF you will see failures every few hours — spare
+capacity + auto-restart is mandatory, not optional (<a
+href="https://github.com/stas00/ml-engineering/blob/master/training/fault-tolerance/README.md">fault-tolerance</a>).</p>
+<p><strong>Auto-restart via self-healing SLURM job arrays.</strong>
+<code>sbatch --array=1-N%1 train.slurm</code> — <code>%1</code> forces
+one element at a time, so any crash/exit auto-schedules the next. The
+training script must <strong>always resume from the latest
+checkpoint</strong> so restart is a no-op transition. Append a recovery
+queue behind a live job without killing it:
+<code>--dependency=&lt;jobid&gt;</code>. Wrap with a thin
+<code>source actual-training-script.slurm</code> so you can hotfix the
+inner script between auto-restarts. Note <code>--max_restarts 0</code>
+in torchrun is deliberate: you rely on the array for restart, not
+torchrun in-process.</p>
+<p><strong>Provision 5–10% spare nodes</strong> (need 64 → allocate
+67–70) so SLURM auto-draining can remove bad hardware without dropping
+below world size. Prefer <strong>fixed allocation</strong> over dynamic
+— dynamic keeps handing you other users' marginal rejected nodes that
+pass cursory checks but fail under load. <code>sinfo</code> shows node
+states (idle/alloc/drain/drained). <strong>Track GPU UUIDs</strong>
+(<code>nvidia-smi -L</code>) to catch the same broken GPU cycled back
+after "cooling."</p>
+<p><strong>Checkpoint overhead budget.</strong>
+<code>overhead% = (n_checkpoints * t_save) / total_training_seconds * 100</code>.
+BLOOM-176B reference: 2.3 TB checkpoint, ~40 s save (384 concurrent
+processes to GPFS-NVME ≈ 57.5 GB/s aggregate), every 3 h → ~720 saves /
+90 days = 8 h = <strong>0.37% overhead</strong>; at 5x slower IO → ~2%
+(treat 2%+ as a bottleneck to fix via async/sharded checkpointing). At
+10T/200B your checkpoint is far larger than BLOOM's — re-architect to
+async/sharded writes if <code>t_save</code> is large.</p>
+<p><strong>Keep the 2 most recent checkpoints LOCAL</strong> (not just
+cloud), and make resume fall back to N-1 if N is corrupt: <em>"it's
+possible that the very last checkpoint got corrupted or didn't finish
+saving if a crash occurred during its saving."</em> The handbook does
+<strong>not</strong> prescribe atomic writes or checksums — <strong>add
+tmp-then-rename atomic writes + checksum-on-write yourself</strong> for
+10T-scale safety. Keep recent checkpoints on local NVMe for fast
+crash-resume; async-offload older ones to cloud via cron/SLURM (fetching
+from cloud to resume is prohibitively slow).</p>
+<p><strong>Three hourly watchdogs</strong> (cron or self-perpetuating
+SLURM jobs): (a) <em>is-job-running</em> —
+<code>tools/slurm-status.py --job-name my-training</code> alerts if
+neither running nor queued; (b) <em>is-job-hanging</em> — check
+training-log mtime updated within an interval (e.g. 5 min) to catch
+hangs on timeout-less syscalls; (c) <em>fs-watchdog</em> — monitor BOTH
+bytes and <strong>inodes</strong> via <code>df -ih</code> (Python venvs
+exhaust inodes before bytes). Alert on <strong>absolute
+headroom</strong> (free &lt; 3–5 days of measured daily consumption —
+BLOOM wrote 18.4 TB/day), NOT a flat 50%. Distributed FS gotchas: only
+~80% of nominal capacity is reliably usable; <code>df</code> stats can
+lag ~30 min — use quota tools for real-time numbers.</p>
+<p><strong>Kill/save switch.</strong> Poll a sentinel file at the top of
+each iteration (and at <code>main()</code> entry, to burn through a
+queued array fast): if a kill-switch file exists →
+<code>save_checkpoint(); sys.exit()</code>. Lets non-sudo operators stop
+training by <code>touch</code>. Save-switch variant saves-and-continues
+and auto-removes the trigger (good for snapshotting a loss spike).</p>
+<p><strong>Graceful preemption</strong> (three patterns): (A) pass a
+timer at launch — 100 h job (<code>--time=100:00:00</code>) →
+<code>--exit-duration-in-mins 5990</code>; loop checks elapsed and
+all-reduces the exit flag (<code>ReduceOp.MAX</code> over a
+<code>torch.cuda.IntTensor</code>) so <strong>all ranks exit
+together</strong>. (B.1) <code>#SBATCH --signal=USR1@600</code> delivers
+SIGUSR1 600 s before end; register
+<code>signal.signal(signal.SIGUSR1, handler)</code> to checkpoint+exit
+(default SIGTERM gives only ~30–60 s — too little). (B.2) For launchers
+that don't forward signals, <code>#SBATCH --signal=B:USR1@600</code> + a
+bash <code>trap</code> that <code>pgrep</code>/<code>kill -USR1</code>
+its children; requires <code>srun ... &amp;</code> plus explicit
+<code>wait</code>. Check QoS grace time:
+<code>sacctmgr show qos format=name,priority,preempt,GraceTime</code>;
+request an increase if it's &lt; your save time + margin.</p>
+<p><strong>Memory-leak self-exit guards</strong> (stopgaps, not fixes):
+CPU — if <code>psutil.virtual_memory().percent &gt; 95</code> →
+save+exit; GPU — <code>gc.collect(); torch.cuda.empty_cache()</code>
+then <code>free,_=torch.cuda.mem_get_info()</code>, if
+<code>free &lt; 2 GB</code> → save+exit (next array job starts clean).
+Fix root-cause fragmentation via <code>PYTORCH_ALLOC_CONF</code> /
+<code>max_split_size_mb</code>. MMAP growth is <em>not</em> a leak.</p>
+<p><strong>SOURCE SEPARATELY:</strong> this section omits
+nvidia-resiliency-ext / torch-elastic in-process restart, straggler
+detection, and pre-job GPU health checks (NCCL all-reduce test / DCGM /
+gpu-burn) — all essential at 100k GPUs; pull from other chapters. The
+"RDMA-copy weights from an intact DP replica to a standby node"
+technique (limiting loss to one iteration vs hundreds) has no
+widely-available OSS implementation but is worth evaluating given large
+checkpoint-restore wall-time.</p>
+<h2
+id="c4-training-instabilities-what-actually-causes-them-and-the-fixes">C.4
+Training instabilities: what actually causes them, and the fixes</h2>
+<p>Most spikes trace to a "bad data pocket" (poor shuffling / uncleaned
+web garbage), <strong>not</strong> the model — and the batch immediately
+before a spike usually looks unremarkable because divergence often
+starts developing many steps earlier (<a
+href="https://github.com/stas00/ml-engineering/blob/master/training/instabilities/README.md">instabilities</a>).</p>
+<p><strong>Init std — the single most actionable lever.</strong>
+Megatron-LM's default <code>--init-method-std=0.02</code> is far too
+large for big-hidden models and was the root cause that blocked the 104B
+experiments past the first few thousand iterations. Init std must scale
+with hidden size. Prefer the smaller <strong>530B-paper formula</strong>
+<code>sqrt(1/(NHIDDEN*3)) = sqrt(0.3333/NHIDDEN)</code> over
+"Transformers without Tears" <code>sqrt(0.4/NHIDDEN)</code>. Worked:
+NHIDDEN=14336 → <code>sqrt(1/(14336*3)) = 0.00482</code> — the value
+BLOOM-176B used, credited as a crucial reason it had no stability
+issues. <strong>Never ship <code>--init-method-std=0.02</code> at large
+NHIDDEN.</strong></p>
+<p><strong>Precision.</strong> The 104B failures are attributed to fp16
++ dirty data. The three-part fix that made BLOOM-176B stable:
+<strong>bf16 (not fp16) + much cleaner data + an embedding
+LayerNorm</strong>. You'll be in bf16/fp8 already; the
+embedding-LayerNorm and data-cleanliness lessons carry over.</p>
+<p><strong>Adam epsilon → 0.</strong> "A Theory on Adam Instability in
+Large-Scale ML" (arXiv 2304.09871, studied to 546B) shows time-domain
+correlation drives divergence spikes when epsilon isn't small enough
+relative to the gradient-estimate components. Practical fix (§7.1): set
+Adam epsilon to 0 and handle the resulting division-by-zero
+explicitly.</p>
+<p><strong>Attention numerical scaling.</strong> Fold the
+<code>1/sqrt(norm_factor)</code> scale <em>into</em> Q and K before the
+matmul rather than applying it after (identity
+<code>n*(A·B) === (sqrt(n)*A)·(sqrt(n)*B)</code>) — applies to custom
+kernels too, since CuBlas <code>GemmStridedBatchedEx</code> applies
+<code>alpha</code> post-matmul.</p>
+<p><strong>Bad-data × model-state interaction — the canonical
+recovery.</strong> PaLM saw "dozens of loss spikes at irregular
+intervals" and never found root cause; the mitigation that worked was
+<strong>roll back to an earlier checkpoint and skip the problematic data
+batches</strong> (arXiv 2204.02311 §5.1). This is why your
+<strong>checkpoint cadence and data-skip-and-rollback tooling must be
+solid</strong>. Inspecting the offending batch is impractical: at large
+GBS × long seqlen it can be "the size of a book."</p>
+<p><strong>Classify every spike.</strong> (1) <em>fast-recovering</em> —
+bounces back in a handful of steps (BLOOM's single spike recovered in
+~200 steps), generally let it ride; (2) <em>slow-recovering</em>; (3)
+<em>not-fully-recovering</em> — spikes, partially recovers, then
+diverges → rollback+skip. Also "non-spike diverging" (each restart makes
+a little progress then diverges). For mixed datasets (a 200B MoE will
+mix many), <strong>track per-dataset loss</strong> — spikes can hit one
+distribution and not another.</p>
+<p><strong>Resume-related spikes (you WILL resume often).</strong> A
+perfect resume must restore all RNG states, advance the DataLoader to
+the exact prior index, and reproduce complex DataLoader behavior.
+Imperfect resume → a spike on every resume (IDEFICS-80B got a
+recoverable spike on each of ~a dozen resumes from image-to-text ratio
+fluctuation). <strong>The most non-obvious failure — repeat-data
+false-low loss:</strong> if your framework doesn't restore the
+DataSampler (pytorch-lightning does <em>not</em>), every resume restarts
+the data stream from scratch; the model re-sees and overfits
+already-seen data and <strong>reports a falsely low loss</strong>, then
+"spikes" UP to the true level when it finally hits unseen data — the
+loss becoming honest, not getting worse. Worst case cited: training "6x
+times the same 50B tokens" of a planned 300B budget without noticing.
+<strong>Detection:</strong> do 2 early resumes with a FIXED seed before
+the real run (reshuffling hides the bug). Wandb compounds confusion — it
+drops new data after a rollback until old step numbers are surpassed, so
+<strong>start a fresh wandb run per rollback-resume</strong> and stitch
+manually.</p>
+<p><strong>Don't panic at grokking.</strong> A sharp loss drop (4→2.5 in
+~480 samples) at tiny global batch (8) is benign generalization, not
+instability — and not seen at large batch. <strong>Meta-advice:</strong>
+read public training logbooks (BLOOM, IDEFICS m4-logs, the 104B
+chronicles) before the run to pattern-match failures.</p>
+<h2 id="c5-precision-discipline-the-fp32-accumulator-rules">C.5
+Precision discipline (the fp32-accumulator rules)</h2>
+<p>Each dtype step down ~doubles throughput (A100 bf16=312, fp8=624
+TFLOPS) — which is why fp8, and on Blackwell MXFP4, matter at 100k scale
+— but each step down increases the precision-preservation burden (<a
+href="https://github.com/stas00/ml-engineering/blob/master/training/dtype.md">dtype.md</a>).</p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Enable TF32 at program
+start</strong> (off by default):
+<code>torch.backends.cuda.matmul.allow_tf32 = True; torch.backends.cudnn.allow_tf32 = True</code>
+— free ~8x speedup on any residual fp32 matmuls.</label></li>
+<li><label><input type="checkbox" /><strong>bf16, never fp16</strong> as
+the mixed-precision baseline — fp16 LLM training is documented as
+unstable and needs loss scaling; bf16 needs none (fp32-matching exponent
+range, no overflow).</label></li>
+<li><label><input type="checkbox" /><strong>fp32 master weights + fp32
+optimizer states</strong> to avoid tiny-gradient-into-large-weight
+swamping at the optimizer step. If you must shrink the 200B-param
+optimizer footprint, use bf16 master weights <em>only</em> with
+<strong>Kahan summation / stochastic rounding</strong> (AnyPrecision
+optimizer, arXiv 2010.06192) — never plain bf16.</label></li>
+<li><label><input type="checkbox" /><strong>Force fp32
+accumulation</strong> for: LayerNorm/RMSNorm internals, <strong>bf16
+reduction collectives (all-reduce)</strong> — critical at 100k-GPU
+all-reduce fan-in — and gradient accumulation (mandatory for bf16).
+Audit custom kernels: half-precision accumulation silently
+corrupts.</label></li>
+<li><label><input type="checkbox" /><strong>fp8 (E4M3 fwd / E5M2 bwd)
+via Transformer Engine for matmul-heavy paths only</strong>; keep norms,
+reductions, master weights, and optim states higher-precision. On
+Blackwell, evaluate MX block formats (<code>float8_e8m0fnu</code> scale
++ MXFP8/MXFP4) for the next ~2x step, with the same
+accumulate-in-higher-precision discipline and explicit fp4 numerics
+validation.</label></li>
+<li><label><input type="checkbox" /><strong>Never serve/finetune a
+bf16-trained model in an fp16 runtime</strong> without overflow handling
+— fp16 max is 65504 and bf16 weights routinely exceed it (HF PR #10956).
+fp16→bf16 is the safe direction.</label></li>
+</ul>
+<h2 id="c6-performance--mfu-accounting">C.6 Performance &amp; MFU
+accounting</h2>
+<p><strong>Measure achieved TFLOPS from wall-clock, not a
+profiler</strong> (<a
+href="https://github.com/stas00/ml-engineering/blob/master/training/performance/README.md">performance</a>):</p>
+<pre><code>TFLOPS = model_size_B * factor * 2 * seqlen * GBS / (time_sec_per_iter * total_gpus * 1e12)</code></pre>
+<p><code>factor = 4</code> WITH activation/gradient checkpointing,
+<code>3</code> WITHOUT. For 100B+/MoE runs checkpointing is "almost
+always on," so use <strong>4</strong>. The <code>3*2</code> product is
+<em>model FLOPs</em> (→ MFU); <code>4*2</code> is <em>hardware
+FLOPs</em> incl. recompute (→ HFU); HFU &gt; MFU when recompute is on.
+<strong>CRITICAL:</strong> the timing must include DataLoader + logging
+overhead, not just fwd/bwd — otherwise comparisons are invalid.
+<code>GBS = MBS * DP * GAS</code>,
+<code>DP = N_GPUs / (TP*PP)</code>.</p>
+<p><strong>Compute MFU against measured MAMF, not theoretical
+peak.</strong> The handbook's central compute thesis (<a
+href="https://github.com/stas00/ml-engineering/blob/master/compute/accelerator/README.md">compute/accelerator</a>):
+vendor peak TFLOPS are unreachable; use <strong>MAMF (Maximum Achievable
+Matmul FLOPS)</strong> measured for YOUR shapes/dtype/stack. Measured
+bf16 efficiency (MAMF/theory): A100 86.9%, H100 80.3%, GH200 83.6%, B200
+77.6%, <strong>GB200 72.9% (1822/2500 per-chip)</strong>, Gaudi3 74.1%;
+AMD CDNA3 is much lower (MI300X 51.4%, MI355X 68.0%) and far more
+software-sensitive. <strong>Plan GB200 around ~73% bf16 MAMF until you
+measure better.</strong> fp8: B200 76.3%. Run
+<code>mamf-finder.py</code> on the real GB200 SKU with planned dtypes
+and your real M/N/K shapes (50 warmup + 100 measured iters/shape,
+<em>fastest</em> reported). Re-run after any driver/CUDA/cuBLAS/NCCL
+bump and at least every 6 months. <strong>Halve any published number
+that's ~2x a credible one</strong> — it's a 2:1 sparsity figure dense
+MoE can't use. Convert marketing GB to real GiB (192GB → 180GiB;
+subtract ~6.7%) when sizing memory.</p>
+<p><strong>Pace to the slowest accelerator.</strong> Silicon-lottery
+variance is &gt;5% MAMF on identical SKUs on the same node; across 100k
+chips it compounds and bottlenecks collectives. Profile every node,
+pool/retire stragglers. Measure SM/memory clocks UNDER sustained load
+(not idle); liquid-cooled nodes sustain higher clocks than air.
+Reference targets: A100 bf16 &gt;50% MFU (155 TFLOPS) was "fantastic";
+FlashAttention era ~180 TFLOPS; Megatron A100 MFU 22B=41.5%, 175B=51.4%,
+530B+=56–57%. <strong>Once you hit a good number, stop optimizing and
+start training</strong> — further gains are marginal, and
+cost/wall-clock scale as 1/MFU (50% MFU = 2x days, 2x $$).</p>
+<p><strong>Software tune-up tricks, ordered by leverage:</strong></p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Tensor-shape divisibility /
+tile-&amp;-wave quantization:</strong> Tensor Cores want multiples of 64
+(A100); A100 schedules 108 thread-blocks/wave (109 → a second
+nearly-idle wave). Rules: <code>vocab%64==0</code>; <code>b*s</code>,
+<code>h/a</code>, <code>h/t</code> divisible by powers of 2;
+<code>(b*a)/t</code> integer; minimize TP degree
+<code>t</code>.</label></li>
+<li><label><input type="checkbox" /><strong>SwiGLU MLP sizing:</strong>
+the naive <code>8/3*h</code> is misaligned and slow. Llama-2 H100
+h=4096: <code>8/3*h=10922</code> → 272.73 TFLOPS, but nearby
+<code>10944</code> → <strong>398.38 TFLOPS — a 46% free
+speedup</strong>. Brute-force-search near <code>8/3*h</code> with
+<code>swiglu-maf-bench.py</code>.</label></li>
+<li><label><input type="checkbox" /><strong>Gradient
+checkpointing:</strong> ~20–25% per-batch slowdown but 2–4x larger batch
+→ higher net throughput.</label></li>
+<li><label><input type="checkbox" /><strong>Gradient
+accumulation:</strong> <code>GAS=8</code> cuts DDP all-reduce calls 8x →
+20–30% speedup.</label></li>
+<li><label><input type="checkbox" /><strong>GC stragglers:</strong>
+automatic gc fires asynchronously across ranks → MFU spikes.
+<code>gc.disable()</code> at start, then <code>gc.collect()</code> at a
+fixed interval <strong>on all ranks</strong>.</label></li>
+<li><label><input type="checkbox" /><strong>DataLoader:</strong>
+<code>num_workers=0</code> is blocking (5.39 s); start at 2 (1.33 s).
+<code>pin_memory=True</code> + <code>.to(cuda, non_blocking=True)</code>
+(0.459 s vs 0.646 s). Avoid multiple workered DataLoaders (open hang
+bug).</label></li>
+<li><label><input type="checkbox" /><strong>NUMA affinity:</strong>
+cross-NUMA traffic degrades perf; map with
+<code>nvidia-smi topo -m</code>, bind via
+<code>numactl</code>/<code>pynvml</code>/SLURM
+<code>--gres-flags=enforce-binding --ntasks-per-socket=4</code> or
+<code>accelerate launch --enable_cpu_affinity</code>
+(≥0.28.0).</label></li>
+<li><label><input type="checkbox" /><strong>Fused optimizer</strong>
+(apex FusedAdam / torch <code>AdamW(fused=True)</code>).</label></li>
+</ul>
+<p><strong>Memory accounting profilers miss.</strong> Mixed-precision
+AdamW = 18 bytes/param (weights 6 + optim 8 + grads 4) + activations +
+logits. <strong>Logits (fp32) = <code>4*bs*seqlen*vocab</code> often
+dominate</strong> (Llama-3.1-8B @ seq32768: logits 16 GB vs checkpointed
+activations 8 GB). Hidden costs: <code>torch.distributed</code> init 1–2
+GB/GPU (grows with GPU count); CUDA kernel preload 0.5–2 GB. Set
+<code>PYTORCH_ALLOC_CONF=expandable_segments</code> for heavy-reshaping
+fragmentation OOMs.</p>
+<h2 id="c7-storage--io">C.7 Storage &amp; IO</h2>
+<p>Treat storage as <strong>three distinct workloads wanting three
+filesystems</strong> (<a
+href="https://github.com/stas00/ml-engineering/blob/master/storage/README.md">storage</a>):
+(1) sustained fast READS for the DataLoader stream; (2) fast BURST
+WRITES for checkpoints (accelerators idle during a synchronous save
+unless async/offloaded); (3) medium shared R/W for the codebase
+(millions of tiny Python files). Optimizing one FS for all three is the
+wrong instinct.</p>
+<p><strong>Core formula:
+<code>Throughput = IOPS * block_size</code>.</strong> Small files →
+optimize IOPS; large files → optimize throughput. A device with huge
+IOPS but small block size will NOT deliver checkpoint throughput.</p>
+<p><strong>Benchmark with fio — two mandatory flags.</strong> (1)
+<code>--direct=1</code> (O_DIRECT) so the page cache doesn't fabricate
+3x-too-good numbers — real training rarely re-reads the same blocks. (2)
+<code>--unlink=1</code> or fio reuses prior files and gives "seriously
+wrong" results. Before any usability timing, flush caches:
+<code>sudo sync; echo 3 | sudo tee /proc/sys/vm/drop_caches</code>. Use
+<code>./fio-scan</code> (6 benchmarks over 16KB/1MB/1GB at 4KB block,
+markdown output), <strong>but match parameters to YOUR workload</strong>
+(file size ~ checkpoint shard size, numjobs ~ writer count) — the
+default 16-job/16k-file example simulates Python files, not
+checkpoints.</p>
+<p><strong>Distributed-FS reality — the highest-value section.</strong>
+Only <strong>~80% of distributed large storage is reliable</strong> (GCP
+FileStore admits 89%; some deploys failed at 83%) — <strong>provision
+125 TB to reliably get 100 TB</strong>, plus ~25% buffer for hotspot
+saturation and in-partition backups that don't show in <code>df</code>.
+<strong>Prefer GPFS/IBM Storage Scale (or WekaIO) over Lustre:</strong>
+GPFS dynamically creates inodes (never exhausts), distributes metadata
+(no central bottleneck killing
+<code>ls</code>/<code>du</code>/<code>find</code> on millions of small
+files), reliably uses 100% capacity, and packs tiny files into
+sub-blocks. Lustre centralizes metadata, can hit "disk full" at ~80%
+when one sub-disk fills before rebalancing, and misreports offloaded
+file sizes (<code>du --apparent-size</code>, still imperfect). Avoid
+NFS; use the native NSD client.</p>
+<p><strong>Failure modes to pre-empt.</strong> (a) <strong>Inode
+exhaustion crashes jobs while <code>df</code> shows free space</strong>
+— monitor separately with <code>df -i</code>. (b) Block-size mismatch is
+a silent capacity killer: 16 MB blocks with 16 KB avg files = 1000x
+waste — use two partitions (4–8 KB for tiny files, 2–16 MB for large
+objects). (c) <code>/tmp</code> on compute nodes is small (&lt;100 GB)
+and not cleared between SLURM jobs → untar fails "No space left"; fix
+with <code>export TMPDIR=/scratch</code> in the job script.</p>
+<p><strong>Checkpoint &amp; data placement.</strong> Keep the last few
+checkpoints on <strong>local NVMe</strong> for fast crash-resume;
+async-offload older ones via cron/SLURM. Reference target: JeanZay 2021
+saved a <strong>2.3 TB checkpoint across 384 processes in 40 s on
+GPFS-over-NVMe (~57.5 GB/s aggregate)</strong> — the "insanely fast"
+class to aim for. <strong>Do NOT stream training data from cloud at
+train time</strong> — IDEFICS-80B was forced onto cloud dataloading,
+"spent many weeks" hardening it, and "it sucked"; the killer was
+RNG/DataSampler state sync causing repeated data. Keep data local.
+Verify transfer tools do MD5/SHA256 checksums (slow-but-safe beats
+fast-but-corrupt). Run perception benchmarks after dropping caches to
+catch a slow shared FS: <code>time python -c "import torch"</code> (20 s
+on slow NFS vs ~2 s NVMe), <code>time git status</code> (3.7 s vs 0.02 s
+SSD), <code>time conda create</code>,
+<code>time pytest --collect-only</code>.</p>
+<h2 id="c8-orchestration--slurm-realities">C.8 Orchestration / SLURM
+realities</h2>
+<p><strong>Launcher.</strong> For the main run use the <strong>torchrun
+(c10d rendezvous) launcher</strong> — it tolerates worker restarts (<a
+href="https://github.com/stas00/ml-engineering/blob/master/orchestration/slurm/README.md">slurm</a>).
+Canonical wrapper:
+<code>MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)</code>,
+<code>MASTER_PORT=6000</code>, then</p>
+<pre><code>LAUNCHER=&quot;python -u -m torch.distributed.run --nproc_per_node $GPUS_PER_NODE --nnodes $NNODES \
+  --rdzv_endpoint $MASTER_ADDR:$MASTER_PORT --rdzv_backend c10d --max_restarts 0 --tee 3 --node_rank \$SLURM_PROCID&quot;
+srun --wait=60 --kill-on-bad-exit=1 bash -c &quot;$LAUNCHER $PROGRAM&quot; 2&gt;&amp;1 | tee -a logfile</code></pre>
+<p><strong>THE #1 gotcha across every launcher:</strong>
+<code>\$SLURM_PROCID</code> MUST be <strong>backslash-escaped</strong>
+so it interpolates at <code>srun</code> time, not at <code>sbatch</code>
+parse time — otherwise every node reads PROCID=0 and the launcher
+<strong>hangs silently at rendezvous</strong>. Verify GB200's real
+per-node GPU count (don't assume 8 — check the NVL72 domain layout) when
+setting <code>GPUS_PER_NODE</code>. Use <code>--ntasks-per-node=1</code>
+for torchrun/accelerate (torchrun spawns the local procs itself),
+<code>--ntasks-per-node=&lt;gpus&gt;</code> for the native srun
+launcher. Always <code>--exclusive</code>.</p>
+<p><strong>Scale gotchas.</strong> (1) <strong>SLURM 22.05+
+regression:</strong> <code>srun</code> no longer inherits
+<code>--cpus-per-task</code> — your DataLoader workers silently get 1
+core. Detect:
+<code>srun python -c 'import os; print(len(os.sched_getaffinity(0)))'</code>;
+fix: <code>export SRUN_CPUS_PER_TASK=$SLURM_CPUS_PER_TASK</code>. (2)
+<strong>CPU sizing:</strong> cores/node ≥ num_gpus × (1 +
+dataloader_workers); e.g. 8×(1+2)=24. (3) <strong>Hyper-threading can
+CUT network throughput up to 4x</strong> (observed on AWS p4) —
+benchmark on/off, disable via <code>#SBATCH --hint=nomultithread</code>
+(check with <code>lscpu | grep Thread</code>).</p>
+<p><strong>Fault tolerance &amp; diagnosis.</strong> Self-healing array
+<code>#SBATCH --array=1-50%1</code> (see C.3). Per-node logs
+<code>#SBATCH --output=%x-%j-%N.out</code> (<code>%N</code>=node) to
+pinpoint a bad node. Test all GPUs across the allocation:
+<code>srun --jobid=$SLURM_JOBID bash -c 'python -c "import torch,socket; print(socket.gethostname(), torch.cuda.is_available())"'</code>;
+GPU soak <code>torch.ones((77*2**28)).cuda(local_rank)</code> on 80GB
+cards. Run diagnostics <strong>without consuming GPUs</strong> via
+<code>--gres=gpu:0</code>. Quarantine a bad node:
+<code>sbatch --exclude=bad-node script.slurm</code>; drain
+<code>scontrol update nodename=node-5 state=drain</code> (reclaim
+<code>state=idle</code>); catch stuck-process drains with
+<code>sinfo -R | grep "Kill task failed"</code>; <strong>extend wall
+time live</strong>
+<code>scontrol update JobID=$SLURM_JOB_ID TimeLimit=+10:00:00</code>.
+<strong>EXTERNAL TO THIS SECTION</strong> (must source elsewhere for
+100k GB200): topology-aware placement (switch/rack/NVLink-domain),
+<code>sbcast</code> binary broadcast, and srun-at-scale startup-latency
+mitigation — known gaps. Also enforce <strong>node proximity</strong>
+(GCP compact placement policy / Azure availability set) so
+tightly-coupled jobs don't take extra inter-switch hops.</p>
+<h2 id="c9-reproducibility--debugging-at-scale">C.9 Reproducibility
+&amp; debugging at scale</h2>
+<p><strong>The dual-mode reproducibility pattern</strong> (<a
+href="https://github.com/stas00/ml-engineering/blob/master/training/reproducibility/README.md">reproducibility</a>).
+Call <code>enforce_reproducibility()</code> with <strong>NO seed in the
+production 10T-token run</strong>: it picks a random seed, sets only the
+cheap RNG seeds (<code>random</code>, <code>numpy</code>,
+<code>torch.manual_seed</code>, <code>torch.cuda.manual_seed_all</code>)
+— <strong>NOT</strong> the cuDNN determinism flags, so <strong>zero
+throughput penalty</strong> — and <strong>logs the chosen seed</strong>.
+If anything goes wrong, change one line to
+<code>enforce_reproducibility(&lt;logged_seed&gt;)</code> to reproduce
+the exact RNG state, which <em>then</em> also sets
+<code>torch.backends.cudnn.deterministic=True; benchmark=False</code>.
+You get post-hoc reproducibility of a production incident without ever
+paying the determinism slowdown. <strong>Never set the cuDNN determinism
+flags in production.</strong> Gotcha: seeding the RNGs is
+<strong>not</strong> enough to make the DataLoader feed data in the same
+order — the DataLoader needs its own seed (per PyTorch randomness
+docs).</p>
+<p><strong>Per-job environment snapshot</strong> in the SLURM launcher
+(<code>$REPRO_DIR=$SAVE_DIR/repro/$SLURM_JOB_ID</code>):
+<code>module list 2&gt; modules.txt</code> (writes to STDERR),
+<code>/usr/bin/printenv | sort &gt; env.txt</code>,
+<code>pip freeze &gt; requirements.txt</code> (use
+<code>uv pip freeze</code>), plus a Perl one-liner walking
+<code>*.dist-info/direct_url.json</code> to dump <code>git diff</code>
+per editable install — because <code>pip freeze</code> captures only the
+SHA and <strong>silently misses uncommitted local edits</strong>.
+<strong>The war story:</strong> two engineers ran the <em>identical</em>
+SLURM script from the <em>same</em> directory and got very different
+TFLOPs; matching conda packages exactly did NOT close the gap — the
+culprit, found by diffing <code>printenv</code>, was
+<code>LD_PRELOAD</code> set on one and not the other (that cloud needed
+it for full HW perf). <strong>Takeaway: capture <code>printenv</code> on
+EVERY job; when two launches differ in throughput, diff env vars
+(LD_PRELOAD, LD_LIBRARY_PATH, vendor paths) BEFORE suspecting code or
+packages.</strong></p>
+<p><strong>Hang/deadlock debugging — the highest-value tool.</strong>
+<code>py-spy</code> attaches to a live, hung process without modifying
+it (<a
+href="https://github.com/stas00/ml-engineering/blob/master/debug/README.md">debug</a>):
+<code>py-spy dump -n -p PID</code>. <strong>The first line of the dumped
+stack is where it's stuck</strong> — for hangs almost always a NCCL
+collective or <code>barrier</code>. Per-node, dump all rank children:
+<code>pgrep -P $(pgrep -o python) | xargs -I {} py-spy dump --pid {}</code>.
+Across all nodes (have this one-liner ready):</p>
+<pre><code>srun --jobid=$JID --gres=gpu:0 --nodes=N --tasks-per-node=1 --output=trace-%N.out \
+  sh -c &#39;pgrep -P $(pgrep -o python) | xargs -I {} py-spy dump --native --pid {}&#39;</code></pre>
+<p><code>--gres=gpu:0</code> is <strong>mandatory</strong> (else the
+monitor srun blocks until training exits); the squeue jobid may differ
+from <code>SLURM_JOB_ID</code>; use <code>sh</code> not
+<code>bash</code>. Pre-install py-spy on every node image and enable
+ptrace fleet-wide ahead of time: <code>kernel.yama.ptrace_scope=0</code>
+in <code>/etc/sysctl.d/10-ptrace.conf</code> — <strong>a hang at scale
+is debugged by attaching, not restarting.</strong> When two ranks show
+divergent first-stack-lines (one in <code>barrier</code>, one
+elsewhere), you've found a missing collective.</p>
+<p>For fully-unresponsive (hardware-fault) processes py-spy can't attach
+— force a core dump (<code>gcore &lt;pid&gt;</code> /
+<code>kill -ABRT &lt;pid&gt;</code>, with
+<code>ulimit -c unlimited</code> and
+<code>kernel.core_pattern=/tmp/core-%e.%p.%h.%t</code> to override
+Ubuntu apport), then <code>gdb python core-file</code> →
+<code>thread apply all bt</code> (read bottom-to-top; a
+<code>ProcessGroupNCCL::WorkNCCL::handleNCCLGuard</code> frame = NCCL
+watchdog deliberately crashed on an async IB error). <strong>Async
+CUDA:</strong> failing CUDA gives nonsensical tracebacks — rerun with
+<code>CUDA_LAUNCH_BLOCKING=1</code> for a perfect in-context trace
+(BLOOM-176B ran with it at <em>zero</em> throughput loss). WARN: hangs
+on NCCL 2.14.3/pytorch 1.13 — pin <strong>NCCL≥2.17 /
+pytorch≥2.0</strong>. <strong>NaN/Inf:</strong>
+<code>DebugUnderflowOverflow(model)</code> registers forward hooks,
+prints the last 21 frames on first inf/nan (read bottom-up; the overflow
+is in the <em>previous</em> frames where magnitudes climbed) — then
+force fp32 / disable autocast around the offending module.</p>
+<p><strong>Pre-flight checklist</strong> (before every real run): probe
+each node group with <code>torch-distributed-gpu-test.py</code>
+(validates NCCL all-reduce + barrier + GPU alloc, prints pt/cuda/nccl
+versions); bake <code>--role $(hostname -s): --tee 3</code> into the
+launcher so all logs are <code>[host:rank]</code>-prefixed and
+interleaved tracebacks are grep-recoverable; set a SHORT
+<code>torch.distributed</code> init timeout (default 30 min) so a bad
+node fails fast.</p>
+<h2 id="sources">Sources</h2>
+<ul>
+<li>Network (inter/intra-node hardware &amp; comms): <a
+href="https://github.com/stas00/ml-engineering/blob/master/network/README.md">https://github.com/stas00/ml-engineering/blob/master/network/README.md</a></li>
+<li>Network benchmarks (all_reduce_bench, busbw/algbw): <a
+href="https://github.com/stas00/ml-engineering/blob/master/network/benchmarks/README.md">https://github.com/stas00/ml-engineering/blob/master/network/benchmarks/README.md</a></li>
+<li>Network debug (NCCL connectivity diagnostics): <a
+href="https://github.com/stas00/ml-engineering/blob/master/network/debug/README.md">https://github.com/stas00/ml-engineering/blob/master/network/debug/README.md</a></li>
+<li>Fault tolerance (auto-restart, checkpoint recovery, watchdogs): <a
+href="https://github.com/stas00/ml-engineering/blob/master/training/fault-tolerance/README.md">https://github.com/stas00/ml-engineering/blob/master/training/fault-tolerance/README.md</a></li>
+<li>Model parallelism (TP/PP/DP/ZeRO/EP, network-sizing math): <a
+href="https://github.com/stas00/ml-engineering/blob/master/training/model-parallelism/README.md">https://github.com/stas00/ml-engineering/blob/master/training/model-parallelism/README.md</a></li>
+<li>Training performance / MFU-TFLOPS / software tune-up: <a
+href="https://github.com/stas00/ml-engineering/blob/master/training/performance/README.md">https://github.com/stas00/ml-engineering/blob/master/training/performance/README.md</a></li>
+<li>Training instabilities (loss spikes, init std, resume bugs): <a
+href="https://github.com/stas00/ml-engineering/blob/master/training/instabilities/README.md">https://github.com/stas00/ml-engineering/blob/master/training/instabilities/README.md</a></li>
+<li>Reproducibility &amp; debugging of training runs: <a
+href="https://github.com/stas00/ml-engineering/blob/master/training/reproducibility/README.md">https://github.com/stas00/ml-engineering/blob/master/training/reproducibility/README.md</a></li>
+<li>Tensor precision / dtype (fp16/bf16/fp8, fp32 accumulators): <a
+href="https://github.com/stas00/ml-engineering/blob/master/training/dtype.md">https://github.com/stas00/ml-engineering/blob/master/training/dtype.md</a></li>
+<li>Storage / IO benchmarking (fio, GPFS vs Lustre, the 80% rule): <a
+href="https://github.com/stas00/ml-engineering/blob/master/storage/README.md">https://github.com/stas00/ml-engineering/blob/master/storage/README.md</a></li>
+<li>Compute / accelerators (MAMF, mamf-finder, MFU/HFU): <a
+href="https://github.com/stas00/ml-engineering/blob/master/compute/accelerator/README.md">https://github.com/stas00/ml-engineering/blob/master/compute/accelerator/README.md</a></li>
+<li>Orchestration / SLURM (launchers, self-healing arrays, diagnosis):
+<a
+href="https://github.com/stas00/ml-engineering/blob/master/orchestration/slurm/README.md">https://github.com/stas00/ml-engineering/blob/master/orchestration/slurm/README.md</a></li>
+<li>PyTorch debugging &amp; diagnostics (py-spy, CUDA_LAUNCH_BLOCKING,
+NaN): <a
+href="https://github.com/stas00/ml-engineering/blob/master/debug/README.md">https://github.com/stas00/ml-engineering/blob/master/debug/README.md</a></li>
+<li>Insights: The AI Battlefield Engineering essay (procurement, the 80%
+tax, GPU-count math): <a
+href="https://github.com/stas00/ml-engineering/blob/master/insights/ai-battlefield.md">https://github.com/stas00/ml-engineering/blob/master/insights/ai-battlefield.md</a></li>
+</ul>

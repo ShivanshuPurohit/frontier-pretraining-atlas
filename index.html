@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="robots" content="noindex, nofollow" />
+<title>The Frontier Pretraining Atlas — a field manual for the 10-trillion-parameter MoE</title>
+<meta name="description" content="A book-length field manual on what it actually takes to pretrain a 10T-total / 200B-active Mixture-of-Experts model on 100,000 GB200 GPUs: hardware, networking, parallelism, MoE systems, kernels, numerics, optimizers, scaling laws, data, dataloading, and fault tolerance." />
+<meta name="color-scheme" content="light dark" />
+<meta name="theme-color" content="#f4f2ec" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232f6fba'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' fill='white' text-anchor='middle' font-weight='bold'%3EFP%3C/text%3E%3C/svg%3E" />
+<link rel="stylesheet" href="book.css" />
+</head>
+<body>
+
+<nav class="nav">
+  <a class="home" href="index.html">The Frontier Pretraining Atlas <small>· a field manual for the 10T MoE</small></a>
+  <span class="spacer"></span>
+  <div class="progress-wrap"><div class="progress"></div></div>
+  <span class="spacer"></span>
+  <button class="theme-btn" aria-label="Toggle dark mode">◑ theme</button>
+</nav>
+
+<main class="wrap page">
+
+  <div class="cover"><div class="cv-in">
+    <div class="wordmark"><svg viewBox="0 0 30 30" aria-hidden="true"><rect x="1.2" y="1.2" width="27.6" height="27.6" rx="7" fill="none" stroke="currentColor" stroke-width="1.5"/><g fill="currentColor"><circle cx="9" cy="9" r="1.9"/><circle cx="15" cy="9" r="1.9"/><circle cx="21" cy="9" r="1.9"/><circle cx="9" cy="15" r="1.9"/><circle cx="15" cy="15" r="2.7"/><circle cx="21" cy="15" r="1.9"/><circle cx="9" cy="21" r="1.9"/><circle cx="15" cy="21" r="1.9"/><circle cx="21" cy="21" r="1.9"/></g></svg> The Frontier Pretraining Atlas</div>
+    <h1>What it takes to pretrain a 10-trillion-parameter MoE</h1>
+    <div class="cv-sub">A systems-and-data field manual · mid-2026 · MoE-only — dense is not relitigated.</div>
+    <div class="cv-stats">
+      <div><b>~110k</b><span>words</span></div>
+      <div><b>24</b><span>chapters + appendices</span></div>
+      <div><b>200+</b><span>cited sources</span></div>
+      <div><b>100k</b><span>GB200 worked example</span></div>
+    </div>
+  </div></div>
+
+  <p class="lede">Most writing about frontier models stops at the architecture diagram. This one keeps going — into the GB200 NVLink domains, the all-to-all that gates MoE throughput, the FP4 grouped GEMMs, the optimizer that finally broke the AdamW monoculture, the data taxonomies nobody photographs, and the fault-tolerance math that decides whether a 100,000-GPU run survives the month. The worked example throughout is concrete: a <strong>10T-total / 200B-active</strong> Mixture-of-Experts model on <strong>100,000 GB200</strong> GPUs.</p>
+
+  <hr />
+
+  <p>The reference bar for this book is the worklog-style technical post — the JAX <a href="https://jax-ml.github.io/scaling-book/">Scaling Book</a>, the DeepSeek-V3 report, Jianlin Su's <span class="mono">kexue.fm</span> — where every figure answers one question and every number names its denominator. Frontier labs disclose almost nothing, so claims here carry an explicit epistemic tier: <span class="conf conf-confirmed">confirmed</span> (in a paper, datasheet, or source tree), <span class="conf conf-leaked">leaked</span> (credible reconstruction — SemiAnalysis, Epoch AI), and <span class="conf conf-rumored">rumored</span> (single-source, directional). Where a number is a marketing or sparse-peak figure, it is flagged.</p>
+
+  <figure class="fig" data-fig="meshlayout">
+    <figcaption class="figcap">
+      <b>The whole problem in one figure.</b> A 10T/200B-active MoE does not fit any single parallelism axis. The build is a factorization: keep expert- and tensor-parallelism inside the NVLink (NVL72) domain where all-to-all is cheap, run pipeline parallelism across islands, and let data parallelism span the rest. Every chapter is, in some sense, about one of these blocks.
+      <span class="meta"><span>Target · <b>10T / 200B-active</b></span><span>Fabric · <b>100k GB200</b></span><span>Detail · <b>Chapters 4, 5, 20</b></span></span>
+    </figcaption>
+    <script type="application/json" class="spec">{"deviceTotal":100000,"axes":[{"id":"EP","name":"expert","size":8,"fam":"moe"},{"id":"TP","name":"tensor","size":8,"fam":"compute"},{"id":"PP","name":"pipeline","size":16,"fam":"data"},{"id":"DP","name":"data","size":98,"fam":"mem"}],"note":"EP×TP = 64 kept inside one NVL72 domain · PP across islands · DP outer"}</script>
+  </figure>
+
+  <div class="callout note">
+    <div class="ct">How to read this</div>
+    <p>The chapters are self-contained and cross-referenced. <b>Systems engineers</b> building the run: 2 → 3 → 4 → 5 → 6 → 14 → 15, then the punch-list (20), with Appendices A and C at your elbow. <b>Pretraining scientists</b>: 8 → 9 → 10 → 11 → 12 → 13 → 16 → 18. <b>Sizing the bet</b>: the argument below, then 1 → 6 → 20 → Appendix B. <b>Completists</b>: front to back — it is designed to take days. Every figure states its <b>regime</b> and its <b>evidence</b>, because a number without a denominator is just a vibe.</p>
+  </div>
+
+  <h2><span class="sec-num">▸</span>The argument in brief</h2>
+  <p>Ten claims, each expanded, sourced, and quantified inside:</p>
+  <ul>
+    <li>The target sits at the frontier of the <em>announced</em> envelope, not beyond it — the bottleneck is whether your software extracts <span class="f-compute">35% MFU</span> instead of 18%, and whether the run survives months of failure. <a href="ch01.html">(Ch 1)</a></li>
+    <li>At this scale you are <span class="f-comms">communication-bound on the MoE all-to-all</span> — keep expert parallelism inside the NVLink domain and overlap the dispatch/combine with compute. <a href="ch05.html">(Ch 5)</a></li>
+    <li>Networking became a protocol problem and the protocol changed: OpenAI's <span class="f-comms">MRC</span> — packet spraying, SRv6, microsecond failover — is the systems disclosure of the year. <a href="ch03.html">(Ch 3)</a></li>
+    <li>The MFU you actually get is <span class="f-compute">20–40%</span>; anyone quoting 50%+ is using sparse peak or a dense Llama-style transformer. <a href="ch06.html">(Ch 6)</a></li>
+    <li>FP8 is the floor; <span class="f-prec">FP4 QAT on the expert weights</span> is the 2026 frontier, and it is real. <a href="ch09.html">(Ch 9)</a></li>
+    <li>The optimizer monoculture broke: <span class="f-optim">Muon / MuonClip</span> trained a trillion-parameter MoE with zero loss spikes. <a href="ch10.html">(Ch 10)</a></li>
+    <li>"Scaling laws" now means <em>your own</em> laws, fit on <em>your own</em> data, with quality-dependent exponents — not Chinchilla. <a href="ch12.html">(Ch 12)</a></li>
+    <li>Data curation is the highest-leverage, least-photographed work — taxonomies are a template, not a ceiling. <a href="ch13.html">(Ch 13)</a></li>
+    <li>The dataloader is a distributed storage system with a hard real-time SLA, and goodput — not MFU — is the real metric. <a href="ch14.html">(Ch 14)</a></li>
+    <li>The payoff is a build-order, not a parts list. <a href="ch20.html">(Ch 20)</a></li>
+  </ul>
+
+  <div class="pull">At 100k GB200 you are communication-bound on the MoE all-to-all, not compute- or memory-bound. Almost every other decision follows from that one fact.</div>
+
+  <!-- ===================== PART I ===================== -->
+  <p class="part-label">Part I · The 100,000-GPU machine</p>
+  <div class="toc">
+    <a class="toc-card" href="ch01.html"><div class="toc-num" data-fam="norm">1</div><div class="toc-body">
+      <div class="toc-t">The mid-2026 frontier landscape</div>
+      <div class="toc-d">Who is training what, at what scale, and what it costs — GPT-5, Gemini, Grok, Llama 4, DeepSeek V4, Kimi, MAI — with confidence labels, and where the 10T target sits.</div>
+      <div class="toc-meta"><span>~18 min</span><span>· confirmed vs leaked vs rumored</span></div></div></a>
+    <a class="toc-card" href="ch02.html"><div class="toc-num" data-fam="compute">2</div><div class="toc-body">
+      <div class="toc-t">The 100k-GPU machine</div>
+      <div class="toc-d">GB200 NVL72, Blackwell numerics, and the dense-vs-sparse FLOP trap. What an exaflop-class cluster actually is, and what changes vs Hopper.</div>
+      <div class="toc-meta"><span>~18 min</span><span>· dense FP8 ≈ 0.45 EFLOP/s</span></div></div></a>
+    <a class="toc-card" href="ch03.html"><div class="toc-num" data-fam="comms">3</div><div class="toc-body">
+      <div class="toc-t">Networking & collectives</div>
+      <div class="toc-d">MRC, Ultra Ethernet, Spectrum-X, NVLink domains, and the all-to-all problem that gates MoE throughput at 100k+ GPUs.</div>
+      <div class="toc-meta"><span>~22 min</span><span>· packet spraying + SRv6</span></div></div></a>
+  </div>
+
+  <!-- ===================== PART II ===================== -->
+  <p class="part-label">Part II · Mapping a 10T MoE onto it</p>
+  <div class="toc">
+    <a class="toc-card" href="ch04.html"><div class="toc-num" data-fam="data">4</div><div class="toc-body">
+      <div class="toc-t">Parallelism strategy</div>
+      <div class="toc-d">Laying a 10T/200B-active model across 100k GPUs: the EP×TP×PP×DP×CP factorization, the memory math, and a concrete proposed layout.</div>
+      <div class="toc-meta"><span>~24 min</span><span>· interactive mesh + memory</span></div></div></a>
+    <a class="toc-card" href="ch05.html"><div class="toc-num" data-fam="moe">5</div><div class="toc-body">
+      <div class="toc-t">MoE systems engineering</div>
+      <div class="toc-d">Expert parallelism, all-to-all, DeepEP, DualPipe, grouped GEMM, dropless routing — the systems layer where the run lives or dies. Grounded in MaxText <span class="mono">moe.py</span>.</div>
+      <div class="toc-meta"><span>~24 min</span><span>· animated all-to-all</span></div></div></a>
+    <a class="toc-card" href="ch06.html"><div class="toc-num" data-fam="compute">6</div><div class="toc-body">
+      <div class="toc-t">Framework shoot-out</div>
+      <div class="toc-d">Megatron-Core vs NeMo vs MaxText/JAX vs TorchTitan — an opinionated comparison for a 100k-GB200 build, with the JAX-on-GB200 risk named.</div>
+      <div class="toc-meta"><span>~24 min</span><span>· MFU evidence + recommendation</span></div></div></a>
+    <a class="toc-card" href="ch07.html"><div class="toc-num" data-fam="data">7</div><div class="toc-body">
+      <div class="toc-t">The Scaling Book, applied</div>
+      <div class="toc-d">The whole of "How To Scale Your Model" distilled and re-derived on Blackwell — with a fully worked 10T/200B roofline and comms-volume calculation.</div>
+      <div class="toc-meta"><span>~22 min</span><span>· every formula, applied</span></div></div></a>
+  </div>
+
+  <!-- ===================== PART III ===================== -->
+  <p class="part-label">Part III · The numerical core</p>
+  <div class="toc">
+    <a class="toc-card" href="ch08.html"><div class="toc-num" data-fam="attn">8</div><div class="toc-body">
+      <div class="toc-t">Attention & kernels in 2026</div>
+      <div class="toc-d">FlashAttention-4, MLA, native sparse attention, and the linear/hybrid attention zoo — the kernel substrate of the modern stack.</div>
+      <div class="toc-meta"><span>~20 min</span><span>· FA4 on CuTe-DSL</span></div></div></a>
+    <a class="toc-card" href="ch09.html"><div class="toc-num" data-fam="prec">9</div><div class="toc-body">
+      <div class="toc-t">Low-precision training</div>
+      <div class="toc-d">FP8, MXFP8, FP4/NVFP4 QAT, and stability at the 4-bit frontier — the single largest lever on effective FLOP/$, and the one most likely to silently corrupt a run.</div>
+      <div class="toc-meta"><span>~22 min</span><span>· interactive dtype toggle</span></div></div></a>
+    <a class="toc-card" href="ch10.html"><div class="toc-num" data-fam="optim">10</div><div class="toc-body">
+      <div class="toc-t">Optimizers & HP transfer</div>
+      <div class="toc-d">Muon, MuonClip, Shampoo/SOAP, muP, and the schedules — the most actionable single change in the report, already in the MaxText tree.</div>
+      <div class="toc-meta"><span>~20 min</span><span>· Muon vs Adam, measured</span></div></div></a>
+    <a class="toc-card" href="ch11.html"><div class="toc-num" data-fam="comms">11</div><div class="toc-body">
+      <div class="toc-t">Training stability</div>
+      <div class="toc-d">The loss-spike taxonomy, why the failures are late-emergent, and the mitigation stack — z-loss, QK-norm, QK-Clip, skip-on-spike — most of it already in MaxText.</div>
+      <div class="toc-meta"><span>~18 min</span><span>· the Kimi K2 zero-spike run</span></div></div></a>
+  </div>
+
+  <!-- ===================== PART IV ===================== -->
+  <p class="part-label">Part IV · Data, scale & the long run</p>
+  <div class="toc">
+    <a class="toc-card" href="ch12.html"><div class="toc-num" data-fam="data">12</div><div class="toc-body">
+      <div class="toc-t">Modern scaling laws</div>
+      <div class="toc-d">Beyond Chinchilla — for MoE sparsity, for data quality, for precision, and for your own dataset. How to actually run a scaling-law campaign.</div>
+      <div class="toc-meta"><span>~22 min</span><span>· the data wall</span></div></div></a>
+    <a class="toc-card" href="ch13.html"><div class="toc-num" data-fam="data">13</div><div class="toc-body">
+      <div class="toc-t">Data curation in 2026</div>
+      <div class="toc-d">From Common Crawl to taxonomied corpora, custom crawlers, and active selection — the highest-leverage, least-photographed work in the building.</div>
+      <div class="toc-meta"><span>~24 min</span><span>· beyond annotation</span></div></div></a>
+    <a class="toc-card" href="ch14.html"><div class="toc-num" data-fam="mem">14</div><div class="toc-body">
+      <div class="toc-t">SOTA dataloading & I/O</div>
+      <div class="toc-d">The bottleneck nobody photographs: a deterministic, checkpointable, exactly-sharded loader with a hard real-time SLA at 12,500 hosts.</div>
+      <div class="toc-meta"><span>~20 min</span><span>· Grain at 100k-host scale</span></div></div></a>
+    <a class="toc-card" href="ch15.html"><div class="toc-num" data-fam="mem">15</div><div class="toc-body">
+      <div class="toc-t">Fault tolerance</div>
+      <div class="toc-d">Keeping 100k GPUs training for months: MTBI math, async + in-memory checkpointing, SDC detection, and why goodput — not MFU — is the real metric.</div>
+      <div class="toc-meta"><span>~20 min</span><span>· GB200 MTBI reality</span></div></div></a>
+    <a class="toc-card" href="ch16.html"><div class="toc-num" data-fam="optim">16</div><div class="toc-body">
+      <div class="toc-t">Midtraining & long-context</div>
+      <div class="toc-d">The stage that quietly makes the model: WSD annealing, high-quality upsampling, RoPE scaling, and context-parallel training.</div>
+      <div class="toc-meta"><span>~16 min</span><span>· the decay-phase data shift</span></div></div></a>
+  </div>
+
+  <!-- ===================== PART V ===================== -->
+  <p class="part-label">Part V · The frontier & the payoff</p>
+  <div class="toc">
+    <a class="toc-card" href="ch17.html"><div class="toc-num" data-fam="moe">17</div><div class="toc-body">
+      <div class="toc-t">The Chinese frontier</div>
+      <div class="toc-d">DeepSeek, Qwen, Kimi, MiniMax, GLM, Step — the most informative open systems reports, and what they reveal that closed labs hide.</div>
+      <div class="toc-meta"><span>~24 min</span><span>· V3 → V4, under export controls</span></div></div></a>
+    <a class="toc-card" href="ch18.html"><div class="toc-num" data-fam="attn">18</div><div class="toc-body">
+      <div class="toc-t">The theory corner</div>
+      <div class="toc-d">Jianlin Su and the analytic threads — RoPE extrapolation, log-n attention scaling, muP — each mapped to a knob you will actually set.</div>
+      <div class="toc-meta"><span>~16 min</span><span>· kexue.fm, distilled</span></div></div></a>
+    <a class="toc-card" href="ch19.html"><div class="toc-num" data-fam="compute">19</div><div class="toc-body">
+      <div class="toc-t">Public throughput signals</div>
+      <div class="toc-d">MLPerf Training and the MFU leaderboards — read as a floor, not a forecast, with the software-maturity ramp made explicit.</div>
+      <div class="toc-meta"><span>~13 min</span><span>· reading the tea leaves</span></div></div></a>
+    <a class="toc-card" href="ch20.html"><div class="toc-num" data-fam="comms">20</div><div class="toc-body">
+      <div class="toc-t">The punch-list</div>
+      <div class="toc-d">The payoff chapter: a prioritized, MaxText-specific engineering build-order for the 10T/200B/100k-GB200 run. The reason the rest exists.</div>
+      <div class="toc-meta"><span>~24 min</span><span>· what to fix, in order</span></div></div></a>
+  </div>
+
+  <!-- ===================== APPENDICES ===================== -->
+  <p class="part-label">Appendices</p>
+  <div class="toc">
+    <a class="toc-card" href="apxA.html"><div class="toc-num" data-fam="data">A</div><div class="toc-body">
+      <div class="toc-t">The scaling cheat-sheet</div>
+      <div class="toc-d">Every formula you need in one place — rooflines, FLOPs, memory, collective costs — each with a one-line "use it when" gloss and a Blackwell value.</div>
+      <div class="toc-meta"><span>~14 min</span><span>· reference</span></div></div></a>
+    <a class="toc-card" href="apxB.html"><div class="toc-num" data-fam="norm">B</div><div class="toc-body">
+      <div class="toc-t">The operational & economic reality</div>
+      <div class="toc-d">Cluster TCO, the 2026–2027 hardware roadmap (Rubin, TPUv7, Trainium3, MI400, Ascend), multi-datacenter training, and the SemiAnalysis numbers.</div>
+      <div class="toc-meta"><span>~24 min</span><span>· ground-truth</span></div></div></a>
+    <a class="toc-card" href="apxC.html"><div class="toc-num" data-fam="mem">C</div><div class="toc-body">
+      <div class="toc-t">The operational playbook</div>
+      <div class="toc-d">Stas Bekman's ML-Engineering distilled into an executable 100k-GPU checklist: network benchmarking, fault tolerance, instabilities, I/O.</div>
+      <div class="toc-meta"><span>~22 min</span><span>· run it against your stack</span></div></div></a>
+    <a class="toc-card" href="apxD.html"><div class="toc-num" data-fam="norm">D</div><div class="toc-body">
+      <div class="toc-t">Bibliography of non-obvious resources</div>
+      <div class="toc-d">~200 papers, repos, blogs, datasets, and courses surfaced during research — filtered to what you probably haven't bookmarked.</div>
+      <div class="toc-meta"><span>~10 min</span><span>· the part most likely to surprise you</span></div></div></a>
+  </div>
+
+  <hr />
+  <p class="srcref">Built from primary sources — arXiv papers, official technical reports, framework source code, the JAX Scaling Book, a SemiAnalysis archive, Stas Bekman's ML-Engineering, and a live MaxText checkout (HEAD 2026-06-22) — with every load-bearing number put through an adversarial verification pass. Prose: CC BY 4.0. Design system adapted from the MiniMax-M3 Inference Atlas. Where a number is a marketing or sparse figure, it is flagged; where the open literature does not know, the book says so.</p>
+
+</main>
+
+<script src="book.js"></script>
+</body>
+</html>

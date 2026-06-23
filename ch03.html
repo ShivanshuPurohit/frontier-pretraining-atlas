@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="robots" content="noindex, nofollow" />
+<title>Networking &amp; collectives · The Frontier Pretraining Atlas</title>
+<meta name="description" content="Networking &amp; collectives — a field manual for the 10-trillion-parameter MoE." />
+<meta name="color-scheme" content="light dark" />
+<meta name="theme-color" content="#f4f2ec" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232f6fba'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' fill='white' text-anchor='middle' font-weight='bold'%3EFP%3C/text%3E%3C/svg%3E" />
+<link rel="stylesheet" href="book.css" />
+</head>
+<body>
+<nav class="nav">
+  <a class="home" href="index.html">The Frontier Pretraining Atlas <small>· a field manual for the 10-trillion-parameter MoE</small></a>
+  <span class="spacer"></span>
+  <div class="chrail"><a href="index.html">Contents</a><a href="ch01.html" data-rail="ch01">01</a><a href="ch02.html" data-rail="ch02">02</a><a href="ch03.html" data-rail="ch03" class="cur">03</a><a href="ch04.html" data-rail="ch04">04</a><a href="ch05.html" data-rail="ch05">05</a><a href="ch06.html" data-rail="ch06">06</a><a href="ch07.html" data-rail="ch07">07</a><a href="ch08.html" data-rail="ch08">08</a><a href="ch09.html" data-rail="ch09">09</a><a href="ch10.html" data-rail="ch10">10</a><a href="ch11.html" data-rail="ch11">11</a><a href="ch12.html" data-rail="ch12">12</a><a href="ch13.html" data-rail="ch13">13</a><a href="ch14.html" data-rail="ch14">14</a><a href="ch15.html" data-rail="ch15">15</a><a href="ch16.html" data-rail="ch16">16</a><a href="ch17.html" data-rail="ch17">17</a><a href="ch18.html" data-rail="ch18">18</a><a href="ch19.html" data-rail="ch19">19</a><a href="ch20.html" data-rail="ch20">20</a><a href="apxA.html" data-rail="apxA">·A</a><a href="apxB.html" data-rail="apxB">·B</a><a href="apxC.html" data-rail="apxC">·C</a><a href="apxD.html" data-rail="apxD">·D</a></div>
+  <div class="progress-wrap"><div class="progress"></div></div>
+  <button class="theme-btn" aria-label="Toggle dark mode">◑ theme</button>
+</nav>
+<main class="wrap page">
+<p class="eyebrow">Chapter 03 · The network is the training system</p>
+<h1>Networking and collectives at 100k+ GPUs: MRC, Ultra Ethernet, Spectrum-X, NVLink domains, and the all-to-all problem</h1>
+<p class="lede">For a 10T-total / 200B-active MoE on 100,000 GB200 GPUs the network is not a supporting subsystem — it <em>is</em> the training system. At this scale the model is a communication schedule with arithmetic bolted on, and the gap between a 38% MFU run and a 22% MFU run is almost entirely a function of how well you hide the collectives and how brutally one bad link can stall a synchronous step that 100,000 GPUs are all waiting on.</p>
+<p class="byline"><span>~28 min read</span><span class="dot">6 figures</span><span class="dot">grounded in OpenAI MRC + DeepEP/NCCL-GIN</span></p>
+<hr />
+<figure class="fig" data-fig="packetspray">
+  <figcaption class="figcap"><b>Figure — MRC packet spray.</b> One RDMA transfer is split across many paths; when a link dies (red) packets reroute in microseconds. This multipath-with-failover is why a 100k-GPU fabric keeps moving when — not if — a link drops.
+  <span class="meta"><span>Protocol · <b>Multipath Reliable Connection</b></span><span>Source · <b>OpenAI / OCP MRC</b></span></span></figcaption>
+  <script type="application/json" class="spec">{"paths":10,"fail":true}</script>
+</figure>
+<figure class="fig" data-fig="topology">
+  <figcaption class="figcap"><b>Figure — Rail-optimized fabric.</b> NVL72 scale-up domains under a leaf/spine scale-out network. The whole game is keeping MoE all-to-all <em>inside</em> a domain, where NVLink is ~18× cheaper than crossing the spine.
+  <span class="meta"><span>Scale-up · <b>NVL72 · 72 GPU</b></span><span>Scale-out · <b>rail-optimized Ethernet/IB</b></span></span></figcaption>
+  <script type="application/json" class="spec">{"domains":7}</script>
+</figure>
+
+<p>The expert-parallel (<span class="f-moe">EP</span>) <span class="f-comms">all-to-all</span> that shuttles tokens to their routed experts dominates the inner loop; the data-parallel (DP) and tensor-parallel (TP) gradient/activation reductions dominate the outer loop; and the difference between a fast run and a stalled one is how well you hide these collectives and survive a single bad link. This chapter is about the physical fabric, the transport, and the collective software that make a synchronous all-to-all survivable and fast at this scale.</p>
+
+<p>The architecture is two disjoint worlds, and you must reason about them separately. The <strong>scale-up domain</strong> is the <span class="f-comms">NVLink5 / NVL72</span> NVSwitch fabric inside a rack: 72 Blackwell GPUs in one coherent NVLink namespace. The <strong>scale-out domain</strong> is the 800G RDMA Ethernet (or InfiniBand) plane that stitches ~1,389 NVL72 racks into a 100k-GPU job. The scale-up answer is settled — NVL72/NVLink5 — and the engineering interest is almost entirely in the scale-out plane and in the collective libraries that span the boundary. The central new artifact of mid-2026 is OpenAI's <strong>Multipath Reliable Connection (MRC)</strong>, and the central recurring problem is the <span class="f-comms">MoE all-to-all</span>, so we organize around those.</p>
+
+<div class="pull">MRC makes the packet fabric survivable; DeepEP/GIN/MegaMoE make the all-to-all invisible; NVL72 keeps the high-fanout hop on copper at 18× the scale-out bandwidth; and the routing config keeps the RDMA leg small enough that ~50% line-rate efficiency is still enough.</div>
+
+<div class="stats">
+  <div class="stat" data-fam="comms"><div class="v">1.8<span class="u">TB/s</span></div><div class="l">NVLink5 per-GPU, in NVL72</div></div>
+  <div class="stat" data-fam="comms"><div class="v">18<span class="u">×</span></div><div class="l">NVLink : RDMA bandwidth ratio</div></div>
+  <div class="stat" data-fam="moe"><div class="v">256<span class="u">exp</span></div><div class="l">routed experts, top-8 (V3-shaped)</div></div>
+  <div class="stat" data-fam="compute"><div class="v">6144<span class="u">F/B</span></div><div class="l">FLOPs/byte to hide the all-to-all</div></div>
+</div>
+
+<figure class="fig" data-fig="flow">
+  <figcaption class="figcap"><b>Figure 1 — The MoE all-to-all across NVL72 rails.</b> The router scores tokens, dispatch all-to-all scatters <span class="f-comms">top-8 rows</span> to experts (NVLink inside the rack, RDMA only for cross-group residue), the grouped GEMM computes, then combine all-to-all gathers them back — the two red legs are the all-to-all tax the rest of the chapter fights.
+    <span class="meta"><span>Regime · <b>EP inside NVL72, RDMA residue cross-rack</b></span><span>Evidence · <b>DeepEP asymmetric-domain forwarding</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "cols":4,"rows":1,"anim":true,
+    "nodes":[
+      {"id":"r","label":"router\n(node-limited gate)","fam":"moe","col":0,"row":0},
+      {"id":"d","label":"dispatch\n(NVLink→RDMA→NVLink)","fam":"comms","col":1,"row":0},
+      {"id":"g","label":"expert\ngrouped-GEMM","fam":"compute","col":2,"row":0},
+      {"id":"c","label":"combine\n(all-to-all)","fam":"comms","col":3,"row":0}
+    ],
+    "edges":[
+      {"from":"r","to":"d","label":"top_k idx"},
+      {"from":"d","to":"g","label":"ragged rows"},
+      {"from":"g","to":"c","label":"expert out"}
+    ] }</script>
+</figure>
+
+<h2 id="scale-up"><span class="sec-num">01</span>The scale-up domain: NVL72, NVLink5, and why 72 is the magic number</h2>
+
+<p>The GB200 NVL72 is the unit cell. Inside it, <span class="f-comms">NVLink5</span> gives each Blackwell GPU <strong>1.8 TB/s of bidirectional bandwidth</strong> — 18 links × 100 GB/s each, built on 224G SerDes — and the NVSwitch fabric delivers <strong>130 TB/s of aggregate all-to-all bandwidth</strong> across the 72-GPU domain, presented as a single flat NVLink namespace (<a href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">NVIDIA GB200 NVL72</a>). That 1.8 TB/s per GPU is roughly <strong>18× the 800 Gb/s (100 GB/s) per-GPU scale-out bandwidth</strong> a ConnectX-8 SuperNIC provides. This bandwidth asymmetry — a <strong>~18:1 ratio</strong> between the intra-rack NVLink hop and the inter-rack RDMA hop — is the single most important number for MoE placement, and every routing and parallelism decision downstream is a consequence of it.</p>
+
+<div class="callout key"><div class="ct">The one ratio to remember</div>
+  <p>NVLink is <strong>~18× faster than RDMA</strong> per GPU (1.8 TB/s vs 100 GB/s). Keep the high-fanout part of the all-to-all on copper inside the NVL72 and let the 800G plane see only the irreducible inter-rack residue — every routing and parallelism decision in this chapter is downstream of that ratio.</p></div>
+
+<p>The compute side deserves a correction that propagates into every roofline you draw. NVIDIA's headline GB200 NVL72 figures — 1,440 PFLOP/s FP4, 720 PFLOP/s FP8, 360 PFLOP/s BF16 per rack — are <strong>sparse (2:4 structured sparsity) numbers</strong>, footnoted on NVIDIA's own page as "Dense is one-half sparse spec shown." For dense training FLOPs, which is what you actually accumulate during pretraining, the real per-rack peaks are <strong>360 PFLOP/s dense FP8 and 180 PFLOP/s dense BF16</strong>, i.e. <strong>~4.5 PFLOP/s dense FP8</strong> and <strong>~2.25 PFLOP/s dense BF16 per B200 GPU</strong> (<a href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">NVIDIA GB200 NVL72</a>). A 100,000-GPU cluster is therefore <strong>~0.45 EFLOP/s dense FP8 peak</strong>, not the ~1.0 EFLOP/s you get by counting sparsity. Quote the dense number, state the sparse caveat, and reference MFU (realistically <strong>35–40% FP8</strong> for a well-tuned large MoE in 2025–2026, often lower under heavy routing) against the dense peak — otherwise you over-provision compute relative to network and end up network-bound with idle tensor cores.</p>
+
+<div class="callout warn"><div class="ct">Quote dense, not sparse, or you will over-provision compute</div>
+  <p>The 720/360/180 PFLOP/s rack figures are <strong>2:4-sparse</strong>; dense is one-half. Pretraining accumulates dense FLOPs, so a 100k-GPU cluster is <strong>~0.45 EFLOP/s dense FP8</strong>, not ~1.0. Provision network against the dense number or your tensor cores sit idle while the fabric saturates.</p></div>
+
+<p>The reason 72 is the magic number for MoE specifically: it is the largest expert-parallel group you can form where every dispatch/combine hop is an NVLink hop. DeepSeek-style <strong>node-limited (group-limited) routing</strong>, which caps each token to at most <strong>M=4 nodes</strong> (<a href="https://arxiv.org/html/2412.19437v1">DeepSeek-V3</a>), is explicitly designed so an expert group can be co-located inside one NVLink domain; the RDMA leg of the all-to-all then carries only cross-group traffic. On NVL72 you have far more headroom than the 8-GPU HGX nodes DeepSeek-V3 was tuned for, and the right move is to place an entire expert group — and ideally its redundant <span class="k k-moe">EPLB</span> replicas — inside a single rack so the high-fanout part of the all-to-all stays on the 130 TB/s NVSwitch fabric and the 800G plane sees only the irreducible inter-rack residue.</p>
+
+<h2 id="mrc"><span class="sec-num">02</span>MRC: spray-and-route over RoCE, source-routed by SRv6</h2>
+
+<p>The load-bearing scale-out artifact for a 2026 100k-GPU build is OpenAI's <strong>Multipath Reliable Connection (MRC)</strong>, published as arXiv 2605.04333 (50 authors across OpenAI and Microsoft) and contributed to the Open Compute Project as the <strong>MRC 1.0</strong> spec (<a href="https://arxiv.org/abs/2605.04333">arXiv 2605.04333</a>; <a href="https://www.opencompute.org/documents/ocp-mrc-1-0-pdf">OCP MRC 1.0</a>). Understanding MRC is the fastest way to understand where the entire scale-out fabric debate landed by mid-2026.</p>
+
+<p><strong>MRC is not a new transport built from scratch.</strong> It extends RoCEv2's Reliable Connection (RC) semantics and keeps the RoCE verbs / queue-pair (QP) abstraction intact, so it slots into the existing NIC and NCCL software stack. Its one radical restriction is the enabler for everything else: an MRC connection supports <strong>only <span class="k k-comms">write</span> and <span class="k k-comms">write-with-immediate</span></strong> — one-sided RDMA writes, no reads, no sends. Why does that unlock packet spraying? Because every data packet of a one-sided write already carries the RDMA virtual address and rkey of its destination. The receiving NIC can therefore DMA each arriving packet directly to its final memory location <em>regardless of arrival order</em>. There is no reorder buffer, because there is nothing to reorder — order is irrelevant when every packet is self-addressing. This is the precise mechanism that kills the central problem of naive multipath RDMA, where out-of-order arrival across sprayed paths forces a reorder buffer that destroys throughput (<a href="https://arxiv.org/abs/2605.04333">arXiv 2605.04333</a>).</p>
+
+<figure class="fig" data-fig="compare">
+  <figcaption class="figcap"><b>Figure 2 — MRC write-only spray vs classic multipath RDMA.</b> Classic RDMA needs a reorder buffer because packets can carry reads/sends; MRC's write-only restriction makes every packet self-addressing, so the NIC DMAs each one straight to its final address and no reorder buffer exists to throttle throughput.
+    <span class="meta"><span>Regime · <b>scale-out, 800G RoCE</b></span><span>Evidence · <b>OpenAI MRC paper</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "left":{"title":"Classic multipath RDMA","fam":"norm","items":["read / send / write verbs","packets not self-addressing","reorder buffer mandatory on spray","out-of-order arrival throttles throughput","link flap → routing reconvergence (seconds)"]},
+    "right":{"title":"MRC (write-only)","fam":"comms","items":["write + write-with-immediate only","every packet carries addr + rkey","DMA to final address, any order","no reorder buffer — nothing to reorder","drop dead EV in microseconds, run degraded"]},
+    "rows":[
+      {"k":"reorder buffer","left":"required","right":"none"},
+      {"k":"path selection","left":"ECMP hash (1 path/QP)","right":"static SRv6, 128–256 EVs"},
+      {"k":"failover","left":"seconds (reconverge)","right":"microseconds (drop EV)"},
+      {"k":"1 QP throughput","left":"~50% (hash collisions)","right":"beats 16 RoCEv2 QPs"}
+    ] }</script>
+</figure>
+
+<p><strong>Spraying and routing.</strong> Each packet is tagged with a 32-bit <strong>Entropy Value (EV)</strong> striped across the UDP source port and the IPv6 flow label. A QP generates a pool of typically <strong>128–256 EVs</strong> at startup and rotates through them packet by packet, so a single connection's bytes fan out across up to 256 physical paths. Path selection is <strong>static SRv6 source routing</strong> using micro-segment IDs (uSIDs, the <code>uN</code> flavor where each switch on the path is explicitly named in the segment list): every EV maps deterministically to exactly one physical path to the destination NIC. Switch forwarding tables are configured at install and essentially never change. This is the reliability thesis: <strong>the control plane is dumb and static</strong>, so there is no routing-protocol reconvergence to wait on when something breaks (<a href="https://arxiv.org/abs/2605.04333">arXiv 2605.04333</a>).</p>
+
+<p><strong>Failover in microseconds.</strong> When a link or path fails, the NIC simply <strong>stops using the affected EV(s)</strong> — it removes them from the rotation. With 256 EVs, a single dead path costs you ~0.4% of your paths and is dropped in <strong>microseconds</strong>, so the job runs slightly degraded instead of stalling. The slow path — a full QP remap after a NIC↔T0 (top-of-rack) link is lost entirely — is the "few seconds" event, but it is rare and localized. Contrast this with conventional fabrics where a link flap triggers seconds of routing-protocol reconvergence during which a synchronous collective across 100k GPUs simply hangs. <strong>This microsecond failover is the actual product</strong>, and the reason MRC exists.</p>
+
+<p><strong>Loss and congestion handling, straight from the UEC playbook.</strong> MRC <strong>disables PFC</strong> (Priority Flow Control) entirely — no more PFC-deadlock and head-of-line-blocking pathologies that plague vanilla RoCEv2 at scale. Loss is handled with <strong>SACK fast retransmit</strong>; <strong>ECN</strong> is used purely as a load-balancing signal rather than a hard backpressure mechanism; and <strong>packet trimming</strong> forwards the headers of would-be-dropped packets as priority NACKs, so a sender learns about congestion-induced loss immediately rather than via timeout. This trim-and-spray-and-NACK design is lifted directly from the Ultra Ethernet Consortium's transport (§03).</p>
+
+<div class="codecard">
+  <div class="src-meta"><span class="file">mrc_qp.c</span><span class="tag">MRC packet spray (illustrative)</span><span class="tag">write-only RC</span><span class="tag">trimmed</span></div>
+  <div class="annot-grid">
+<pre class="code"><code>// MRC connection: write-only verbs unlock reorder-free spray
+struct mrc_qp {
+    uint32_t ev_pool[256];   // 128–256 Entropy Values  // [1]
+    int      ev_cursor;
+    srv6_usid_path_t path_for_ev[256];  // static, set at install  // [2]
+};
+
+ssize_t mrc_post_write(struct mrc_qp *qp, void *src, size_t len,
+                       uint64_t remote_addr, uint32_t rkey) {  // [3]
+    for (size_t off = 0; off < len; off += MTU) {
+        uint32_t ev = qp->ev_pool[qp->ev_cursor++ % 256];  // rotate per packet
+        if (ev_is_dead(qp, ev)) continue;                  // failover: skip EV  // [4]
+        pkt_t p = { .udp_src = ev & 0xffff,                // EV → UDP src + flow label
+                    .ipv6_flow = (ev >> 16),
+                    .srv6 = qp->path_for_ev[ev],           // deterministic path
+                    .rdma_addr = remote_addr + off,        // self-addressing  // [5]
+                    .rkey = rkey, .imm = WRITE_IMM };
+        nic_tx(&p, src + off, MTU);                        // no reads, no sends
+    }
+}
+</code></pre>
+    <div class="annot-list">
+      <div class="annot"><p><span class="badge">1</span><span class="anh">256 paths per QP.</span> A pool of 128–256 EVs striped across UDP src port + IPv6 flow label fans one connection across up to 256 physical paths.</p></div>
+      <div class="annot"><p><span class="badge">2</span><span class="anh">Static SRv6.</span> Each EV maps deterministically to one uSID source-routed path; forwarding tables are set at install and never reconverge.</p></div>
+      <div class="annot"><p><span class="badge">3</span><span class="anh">Write-only verbs.</span> Only <code>write</code>/<code>write-with-immediate</code> — every packet carries the destination address, so order is irrelevant.</p></div>
+      <div class="annot"><p><span class="badge">4</span><span class="anh">Microsecond failover.</span> A dead path just drops its EV from rotation (~0.4% of paths) — no reconvergence, the job runs slightly degraded.</p></div>
+      <div class="annot"><p><span class="badge">5</span><span class="anh">No reorder buffer.</span> The NIC DMAs each self-addressing packet straight to its final memory location regardless of arrival order.</p></div>
+    </div>
+  </div>
+</div>
+
+<p><strong>The measured numbers worth committing to memory</strong> (<a href="https://arxiv.org/abs/2605.04333">arXiv 2605.04333</a>):</p>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Metric</th><th>MRC measured</th></tr></thead>
+  <tbody>
+    <tr><td>ConnectX-8 point-to-point throughput</td><td class="num">~770 Gb/s (96% of 800G line rate)</td></tr>
+    <tr><td>T0-local (intra-leaf) latency</td><td class="num">5.09 µs</td></tr>
+    <tr><td>Cross-T1 (spine-crossing) latency</td><td class="num">6.54 µs</td></tr>
+    <tr><td>NCCL at 42,000 GPUs</td><td class="num">92 GB/s sustained</td></tr>
+    <tr><td>Single MRC QP (256 paths) vs RoCEv2</td><td>beats 16 RoCEv2 QPs</td></tr>
+    <tr><td>Single ECMP-pinned RoCEv2 QP</td><td class="num">~50% of achievable throughput (hash collisions)</td></tr>
+    <tr><td>Topology scale (two-tier multi-plane Clos)</td><td class="num">131,072 GPUs, longest path = 3 switches</td></tr>
+  </tbody>
+  <caption>The RoCEv2 comparison is the damning one — one MRC QP spraying 256 paths beats sixteen ECMP-pinned RoCEv2 QPs.</caption>
+</table></div>
+
+<p>The RoCEv2 comparison is the damning one. A single RoCEv2 QP, pinned by ECMP hashing to one path, achieves only about <strong>half</strong> of achievable throughput because of hash collisions with other flows on the same path. One MRC QP spraying 256 paths beats sixteen RoCEv2 QPs. And the topology win is structural: the two-tier multi-plane Clos scales to <strong>131,072 GPUs with a longest path of just 3 switches</strong>, versus the 5–7 switch hops of a conventional three-tier fat-tree, which is why the cross-T1 latency stays at 6.54 µs even at full scale.</p>
+
+<p><strong>Hardware and deployment.</strong> MRC's SRv6 + spray design is implemented across <strong>NVIDIA ConnectX-8</strong> (800G), <strong>AMD Pollara</strong> (400G) and <strong>Vulcano</strong> (800G), and <strong>Broadcom Thor Ultra</strong> NICs, with the SRv6 forwarding handled by <strong>NVIDIA Spectrum-4/5</strong> and <strong>Broadcom Tomahawk 5</strong> switch silicon — explicitly multi-vendor, which is the point. It is deployed in production on OpenAI's <strong>OCI Abilene</strong> site and <strong>Microsoft Fairwater</strong> GB200 superclusters (<a href="https://www.opencompute.org/documents/ocp-mrc-1-0-pdf">OCP MRC 1.0</a>). For a greenfield 100k build, MRC over Spectrum-X / Tomahawk-5 is the baseline scale-out transport, and the multi-vendor NIC/switch support is precisely what lets you dual-source and avoid being captive to a single supplier's lead times.</p>
+
+<div class="callout do"><div class="ct">Baseline MRC over Spectrum-X / Tomahawk-5</div>
+  <p>For a greenfield 100k build, MRC over Spectrum-X / Tomahawk-5 is the scale-out transport. The multi-vendor NIC support (ConnectX-8, AMD Pollara/Vulcano, Broadcom Thor Ultra) is the lever that lets you dual-source at 100k-NIC volume and avoid single-supplier lead-time captivity.</p></div>
+
+<h2 id="fabric-wars"><span class="sec-num">03</span>The fabric wars: InfiniBand vs RoCEv2 vs Ultra Ethernet</h2>
+
+<p>MRC is one point in a three-way contest. Here is the honest June-2026 comparison for the scale-out plane.</p>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th></th><th>InfiniBand XDR (Quantum-X800)</th><th>RoCEv2 / Spectrum-X</th><th>Ultra Ethernet (UEC 1.0) / MRC</th></tr></thead>
+  <tbody>
+    <tr><td>Link rate</td><td>800G</td><td>800GbE</td><td>800GbE</td></tr>
+    <tr><td>Small-msg latency</td><td class="num">~1 µs</td><td class="num">~1–2 µs</td><td class="num">~5–6.5 µs (MRC measured)</td></tr>
+    <tr><td>Routing</td><td>HW adaptive routing</td><td>ECMP (vanilla) / spray (Spectrum-X)</td><td>Coordinated spray + SRv6 (MRC)</td></tr>
+    <tr><td>Flow control</td><td>Credit-based</td><td>PFC (deadlock-prone)</td><td>LLR + CBFC (UET); PFC off (MRC)</td></tr>
+    <tr><td>In-network reduction</td><td>SHARPv4 (14.4 TFLOPS, ~9× allreduce)</td><td>none</td><td>none (offload to SHARP if NVLink/IB hybrid)</td></tr>
+    <tr><td>Multi-vendor</td><td>NVIDIA-only</td><td>multi-vendor</td><td>multi-vendor</td></tr>
+    <tr><td>Cost/port</td><td>highest</td><td>moderate</td><td>moderate</td></tr>
+  </tbody>
+  <caption>The determinism advantage IB historically held over Ethernet is exactly what MRC was engineered to erase.</caption>
+</table></div>
+
+<p><strong>InfiniBand XDR</strong> via Quantum-X800 (the Q3400 switch, 144×800G ports) remains the deterministic gold standard: ~1 µs small-message latency, hardware adaptive routing, and crucially <strong>SHARPv4</strong> in-network reduction delivering 14.4 TFLOPS of in-switch compute with claims of up to 9× traffic reduction on allreduce (<a href="https://developer.nvidia.com/blog/advancing-performance-with-nvidia-sharp-in-network-computing/">NVIDIA SHARP</a>). Its weaknesses are that it is NVIDIA-only and the most expensive per-port, and that the determinism advantage it historically held over Ethernet is exactly what MRC was engineered to erase.</p>
+
+<p><strong>Vanilla RoCEv2</strong> is the cautionary tale: the ECMP hash-collision problem (a flow gets pinned to one path and collides) and PFC deadlock are the two pathologies that the entire spray-fabric movement exists to fix. <strong>Spectrum-X</strong> is NVIDIA's answer — RoCE plus adaptive routing and congestion control — and it is reported to come within ~5% of IB NDR on 8-node NCCL allreduce. Spectrum-X is the switch substrate MRC frequently runs on.</p>
+
+<p><strong>Ultra Ethernet (UEC 1.0, published June 2025)</strong> defines the <strong>Ultra Ethernet Transport (UET)</strong>, which brings packet spraying with <em>coordinated</em> path selection (not bare ECMP hashing), <strong>Link Layer Retry (LLR)</strong> and <strong>Credit-Based Flow Control (CBFC)</strong> to give Ethernet InfiniBand-like lossless behavior, plus new sender- and receiver-driven congestion control (<a href="https://ultraethernet.org/uec-progresses-towards-v1-0-set-of-specifications/">UEC 1.0</a>). The cleanest way to position MRC is as <strong>OpenAI's productionized superset of UEC</strong>: it takes UEC's spray + trim + congestion-control machinery and adds two things UET handles differently — <strong>SRv6 source routing</strong> (deterministic per-EV paths instead of UET's coordinated-but-still-fabric-chosen paths) and the <strong>write-only-RDMA reorder-free trick</strong> (UET instead carries its own reordering model). Tom Herbert's protocol-engineer review of UET 1.0 is worth reading for the design tensions in UET's reordering and congestion-control internals that MRC's choices were specifically made to sidestep (<a href="https://medium.com/@tom_84912/a-mostly-unbiased-review-of-the-ultra-ethernet-specification-10d816227839">Herbert, UET review</a>).</p>
+
+<figure class="fig" data-fig="bars">
+  <figcaption class="figcap"><b>Figure 3 — Scale-out fabric: achievable per-NIC bandwidth, 800G plane.</b> All three contenders run 800G links, but ECMP-pinned RoCEv2 throws away ~half to hash collisions while MRC's 256-path spray reaches ~770 Gb/s (96% of line rate); IB XDR is the latency king. The dashed line is the 800 Gb/s line rate.
+    <span class="meta"><span>Regime · <b>single QP / NIC, 800G</b></span><span>Evidence · <b>MRC paper + IB/Spectrum-X specs</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "ylabel":"achievable Gb/s per NIC","unit":"","max":880,
+    "bars":[
+      {"label":"InfiniBand\nXDR","value":760,"fam":"norm"},
+      {"label":"RoCEv2\nECMP-pinned","value":400,"fam":"compute"},
+      {"label":"Spectrum-X\nspray","value":720,"fam":"moe"},
+      {"label":"MRC\n256-path","value":770,"fam":"comms"}
+    ],
+    "ref":{"y":800,"label":"800G line rate"} }</script>
+</figure>
+
+<p><strong>Recommendation for the 100k GB200 build.</strong> The hyperscalers have already voted, and you should follow them: <strong>Ethernet-based spray fabrics (MRC / UEC / Spectrum-X), not InfiniBand</strong>, for the scale-out plane. The drivers are multi-vendor sourcing (no single-supplier captivity at 100k-NIC volume), blast-radius isolation, and the fact that MRC closes the determinism gap that historically justified IB's premium. Keep IB-style SHARP in the toolbox via the NVLink-SHARP path (§06), not via an IB scale-out fabric. The ~5 µs MRC latency floor vs IB's ~1 µs is a real regression, but for bandwidth-bound MoE all-to-all on large messages it is irrelevant — and the microsecond <em>failover</em> advantage at 100k GPUs dwarfs the per-message latency difference.</p>
+
+<h2 id="topology"><span class="sec-num">04</span>Topology: rail-optimized fat-tree vs multi-plane (Oracle Acceleron)</h2>
+
+<p>Two structurally different scale-out topologies are on the table, and the choice interacts directly with MRC.</p>
+
+<p><strong>Rail-optimized fat-tree</strong> is the classic NVIDIA reference architecture. GPU <em>i</em> in every node connects to leaf switch <em>i</em>, organized into Scalable Units of 32 nodes, so that same-rail traffic crosses exactly one leaf and only cross-rail traffic climbs to the spine. With ConnectX-8 SuperNICs at 800 Gb/s/GPU, each NVL72 rack offers <strong>57.6 Tb/s of scale-out bandwidth</strong> (72 × 800 Gb/s) (<a href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">NVIDIA GB200 NVL72</a>). The rail structure is a good match for collectives where ranks aligned on the same rail dominate the traffic, but it has the failure characteristic that a leaf or spine failure degrades the whole fabric until reconvergence.</p>
+
+<p><strong>Oracle Acceleron multiplanar</strong> is the structurally different bet and the most relevant non-NVIDIA primary source. Instead of one fabric, Acceleron splits each GPU's NIC across <strong>multiple fully-disjoint network planes</strong>, connecting a single GPU to several switches simultaneously (<a href="https://blogs.oracle.com/cloud-infrastructure/first-principles-acceleron-multiplanar-networking">Oracle Acceleron</a>). The payoffs are: (1) <strong>elimination of fate-sharing</strong> — a plane failure reroutes instantly onto surviving planes instead of degrading the whole job; (2) a <strong>flatter fabric</strong> with fewer tiers, which lowers latency, power, and cost; and (3) it is RoCEv2-based, so it composes with the spray transports above. OCI's <strong>Zettascale10</strong> targets up to <strong>800,000 GPUs / 16 zettaFLOPS, H2 2026</strong>, on this architecture.</p>
+
+<p>The key insight is that <strong>multiplanar and MRC are complementary, not competing</strong>: MRC sprays <em>within</em> the redundant planes that Acceleron provides. Disjoint planes give MRC's microsecond EV-failover a richer substrate — when an entire plane degrades, you fail over to a wholly independent plane rather than just dropping EVs within one fabric. For a 100k greenfield build, <strong>baseline a disjoint multi-plane fabric (Acceleron-style) running MRC, against a single-plane rail-optimized fat-tree, and prefer the former.</strong> The fate-sharing elimination is worth the extra NIC ports and cabling complexity at this scale, because at 100k GPUs the probability that <em>some</em> fabric element is degraded at any given moment approaches one, and a single-plane fabric forces every such event into the job's critical path.</p>
+
+<div class="callout do"><div class="ct">Prefer disjoint multi-plane + MRC over single-plane fat-tree</div>
+  <p>At 100k GPUs the probability that <em>some</em> fabric element is degraded approaches one. Disjoint planes (Acceleron-style) eliminate fate-sharing and give MRC's EV-failover a richer substrate — a whole-plane failure reroutes to an independent plane. The extra NIC ports and cabling are worth keeping every such event off the job's critical path.</p></div>
+
+<h2 id="google-ici"><span class="sec-num">05</span>The contrast that matters: Google ICI + optical circuit switching</h2>
+
+<p>Everything above is packet-switched Ethernet. The architectural antithesis — and the forward-looking signal you should track — is Google's TPU fabric and its emerging GPU-side analogs.</p>
+
+<p>TPU <strong>ICI (Inter-Chip Interconnect)</strong> is a 3D torus of optical-circuit-switched cubes: 4×4×4 = 64 TPUs per cube, up to <strong>1.2 TB/s/chip</strong>, with <strong>MEMS-based optical circuit switches (OCS)</strong> — 2D mirror arrays / beam steering — reconfiguring the torus on a per-job basis. OCP's April 2026 OCS white paper and Google's own numbers cite <strong>~40% power and ~30% cost reduction</strong> versus an equivalent electrical-packet switching tier, with the OCS handling only the inter-cube optical links while intra-cube links stay copper (<a href="https://www.opencompute.org/documents/ocp-ocs-white-paper-april-2026-final-pdf">OCP OCS white paper</a>). The defining property is that <strong>circuit-switched means zero in-network congestion</strong>: you build a contention-free topology that exactly matches the collective, rather than statistically load-balancing a packet fabric and hoping spraying smooths the tail. The MEMS reconfiguration is slow (milliseconds), so it is used for <em>job-granularity</em> topology, not per-collective.</p>
+
+<p>The genuinely forward-looking resource — and the one most directly relevant to MoE — is <strong>PCCL</strong> (arXiv 2509.15450, Cornell, Sep 2025) (<a href="https://arxiv.org/abs/2509.15450">PCCL</a>). PCCL does <strong>per-collective-round</strong> topology reconfiguration on a photonic scale-up fabric, using MZI (Mach-Zehnder interferometer) switches on optical interposers that reconfigure in <strong>microseconds</strong> rather than the milliseconds of MEMS. The thesis is inverted from a decade of collective research: <strong>"collective-aware topologies, not topology-aware collectives."</strong> Instead of synthesizing a clever algorithm for a fixed topology, you reconfigure the topology to match each collective. On a 4×4×4 torus, PCCL is <strong>7.5× faster on a 32 MB all-to-all</strong> and <strong>up to 2.5–3× faster on allreduce</strong> versus TACCL/TACOS/NCCL-class baselines, yielding <strong>1.3× end-to-end training throughput</strong>.</p>
+
+<p>The explicit motivation is MoE, and it names the exact problem this chapter circles: MoE "alternates between latency-sensitive AllToAll requiring low-diameter topologies and bandwidth-hungry AllReduce favoring ring-like high-diameter topologies" — <strong>no fixed topology serves both</strong>, costing 2–4× from congestion plus dilation. This is the deep structural reason the all-to-all problem is hard: the EP dispatch/combine wants a low-diameter, high-radix topology to minimize hop count for small scattered messages, while the DP/TP allreduce wants a ring-like high-diameter topology to maximize bisection bandwidth for large contiguous reductions. A packet fabric — MRC included — picks one compromise topology and lives with both being suboptimal.</p>
+
+<div class="callout note"><div class="ct">The forward bet: photonic scale-up <span class="conf conf-rumored">not yet productized</span></div>
+  <p><strong>MRC and IB make the packet fabric survivable and fast-enough; they do not solve the all-to-all-vs-allreduce topology conflict at its root. PCCL/photonic scale-up does.</strong> For mid-2026 you build on MRC because photonic scale-up is not yet productized at 100k scale, but architect software (collective abstractions, expert placement) so a future photonic scale-up domain is a drop-in — that is where the all-to-all problem actually gets solved.</p></div>
+
+<h2 id="collective-stack"><span class="sec-num">06</span>The collective stack: NCCL, NVSHMEM, IBGDA, DeepEP, GIN, SHARP</h2>
+
+<p>The fabric is inert without the collective software that drives it. For a GB200 MoE there are three load-bearing layers, and they map onto the two domains (NVLink scale-up, RDMA scale-out) explicitly.</p>
+
+<h3 id="deepep">DeepEP — the device-initiated sparse all-to-all substrate</h3>
+
+<p><span class="k k-comms">DeepEP</span> is the reference EP communication library and the right mental model for dispatch/combine. The original (V1) design split into two kernel families. <strong>High-throughput (HT) / normal kernels</strong> (training and prefill) use NVSHMEM, run ~24 QPs, and do <strong>asymmetric-domain forwarding</strong>: a token destined for a remote expert goes over IB/RDMA to the matching <em>in-node index</em> on the destination rack, then hops over NVLink to the actual target expert — overlapping the RDMA and NVLink legs so both domains saturate concurrently. <strong>Low-latency (LL) kernels</strong> (decode) use a pure-RDMA full mesh over <strong>IBGDA</strong> (InfiniBand GPUDirect Async, where the GPU programs the NIC doorbell directly with no CPU in the loop), 8–16 QPs, with a <strong>hook-based comm/compute overlap that consumes zero SMs</strong> (<a href="https://github.com/deepseek-ai/DeepEP/blob/main/docs/legacy.md">DeepEP legacy docs</a>). The whole HT path saturates both NVLink and RDMA with only ~20–24 SMs.</p>
+
+<p>The <strong>V2 rewrite</strong> is the more important development for GB200. It unifies HT and LL kernels behind a single <code>ElasticBuffer</code> interface, drops SM consumption from <strong>24 → 4–6 SMs</strong>, and — critically — replaces the NVSHMEM transport with an <strong>NCCL "Gin" backend</strong>, giving you NCCL's elasticity and fault tolerance under the same low-latency device-initiated all-to-all. V2 adds <strong>SM100 (Blackwell) support</strong> with measured <strong>726/740 GB/s dispatch/combine over NVLink at EP8</strong> (max-perf, 64 SMs) and 643/675 GB/s at the minimal-SM config; SM90/CX7 RDMA is ~90 GB/s at EP8×2 (<a href="https://github.com/deepseek-ai/DeepEP/blob/main/README.md">DeepEP README</a>). The NVIDIA-authored <strong><code>hybrid-ep</code> branch</strong> is the one to track for GB200: it uses <strong>TMA copies and warp-level pipelining</strong> to minimize SM occupancy while saturating both NVLink and RDMA, plus experimental NIXL/UCX integration.</p>
+
+<div class="stats">
+  <div class="stat" data-fam="comms"><div class="v">24<span class="u">→4–6</span></div><div class="l">SM cost, DeepEP V1→V2</div></div>
+  <div class="stat" data-fam="comms"><div class="v">726<span class="u">GB/s</span></div><div class="l">V2 SM100 NVLink dispatch, EP8</div></div>
+  <div class="stat" data-fam="comms"><div class="v">7.2<span class="u">TB/s</span></div><div class="l">Blackwell NVLink-SHARP allreduce</div></div>
+</div>
+
+<div class="callout miss"><div class="ct">Verify hybrid-ep SM100 status before committing <span class="conf conf-rumored">verify</span></div>
+  <p>The NVIDIA-authored <code>hybrid-ep</code> branch is the most GB200-relevant DeepEP variant (TMA + warp pipelining, near-zero SM), but its documented GPU support still listed <strong>SM80/SM90 at survey time</strong> — confirm SM100 status before you build against it, because Blackwell is the whole point.</p></div>
+
+<h3 id="nccl-gin">NCCL 2.28 GIN — DeepEP-style device-initiated RDMA, in NCCL</h3>
+
+<p>NVIDIA's NCCL 2.28 introduces a <strong>Device API</strong> with three modes (<a href="https://arxiv.org/abs/2511.15076">NCCL GIN, arXiv 2511.15076</a>): <strong>LSA</strong> (Load/Store Accessible) for NVLink/PCIe, <strong>Multimem</strong> for NVLink-SHARP multicast/reduce, and <strong>GIN</strong> (GPU-Initiated Networking) for network RDMA. GIN has two backends: a <strong>GDAKI backend</strong> where DOCA GPUNetIO lets GPU threads program the NIC directly (the IBGDA idea, generalized), and a <strong>Proxy backend</strong> using lock-free GPU→CPU queues with 64-byte descriptors that works on any RDMA NIC. GIN is integrated with DeepEP and pplx-kernels, so you get NVSHMEM-class latency <em>plus</em> NCCL's collective ecosystem, elasticity, and fault tolerance. For a 100k-GPU run where fault tolerance is not optional, this is the strategically correct substrate — it lets you ride NCCL's mature failure-recovery while getting device-initiated all-to-all performance.</p>
+
+<h3 id="sharp">SHARP — in-network allreduce offload</h3>
+
+<p><span class="k k-comms">SHARP</span> offloads the <em>allreduce</em> side (the DP/TP gradient sync that overlaps with the EP all-to-all). NCCL 2.27 added both <strong>NVLink-SHARP and IB-SHARP</strong>; Blackwell <strong>NVLink-SHARP does 7.2 TB/s in-domain allreduce, 4× Hopper</strong>, and IB SHARPv4 on Quantum-X800 adds 14.4 TFLOPS of in-switch compute (<a href="https://developer.nvidia.com/blog/advancing-performance-with-nvidia-sharp-in-network-computing/">NVIDIA SHARP</a>). The architectural point for an Ethernet scale-out build: you lose IB-SHARP on the scale-out plane (you chose Ethernet), but you keep <strong>NVLink-SHARP inside each NVL72</strong>, which is where most of your high-bandwidth allreduce traffic should be confined anyway via TP-within-rack placement. Run the gradient allreduce hierarchically — NVLink-SHARP within rack, ring/tree allreduce across racks over MRC — and overlap it with the EP all-to-all of the next micro-batch.</p>
+
+<h2 id="bottleneck"><span class="sec-num">07</span>The MoE all-to-all bottleneck: quantifying it on this fabric</h2>
+
+<p>Now the central problem. Take DeepSeek-V3-class routing as the template: hidden dimension <strong>7,168</strong>, <strong>256 routed experts, top-8</strong>, <strong>FP8 dispatch / BF16 combine</strong> (<a href="https://arxiv.org/pdf/2412.19437">DeepSeek-V3</a>).</p>
+
+<p><strong>Volume math.</strong> Per token per MoE layer, dispatch moves the top-8 copies of the 7,168-dim activation outbound, and combine returns them inbound. The asymmetry is structural: dispatch in FP8 is <strong>8 × 7,168 × 1 ≈ 57 KB up</strong>, while combine in BF16 is <strong>8 × 7,168 × 2 ≈ 115 KB down</strong>. The general formula is <code>2 · top_k · d_model · bytes</code> bidirectional per token per layer; FP8 dispatch halves the up leg. This is exactly why DeepEP reports higher combine bandwidth ceilings than dispatch — the combine leg moves twice the bytes. For a micro-batch of 8,192 tokens per EP-rank, dispatch+combine is <strong>~1.4 GB of cross-fabric traffic per layer per rank</strong>, multiplied across ~58 MoE layers.</p>
+
+<div class="formula"><span class="lbl">comms</span>
+  <span class="eq">AllToAll bytes / token / layer = 2 · top<sub>k</sub> · d<sub>model</sub> · bytes</span>
+  <span class="note">Doubled for dispatch + combine. With top<sub>k</sub>=8, d<sub>model</sub>=7168: FP8 dispatch ≈ 57 KB up, BF16 combine ≈ 115 KB down. At 8,192 tokens/rank that is ~1.4 GB cross-fabric per layer per rank. The term that gates MoE MFU.</span></div>
+
+<p><strong>What the fabric actually delivers.</strong> This is where the dossier numbers turn from comforting to sobering. DeepEP's published internode RDMA throughput (H800 / CX-7, 50-node) is only <strong>43–58 GB/s per GPU</strong> on dispatch/combine — i.e. the all-to-all sustains <strong>~50–60% of the 400G NIC line rate</strong>, and that ceiling is set by spray efficiency and expert-skew, not raw link rate (<a href="https://github.com/deepseek-ai/DeepEP/blob/main/docs/legacy.md">DeepEP legacy docs</a>). Worse, per-token internode bandwidth <em>falls as expert count grows</em>, because each token fans out to more remote NVLink domains: the LL pure-RDMA path goes from <strong>77 µs / 98 GB/s at 8 experts</strong> to <strong>194 µs / 39 GB/s at 256 experts</strong>, with combine latency 1.5–1.8× the dispatch latency. The normal-kernel internode RDMA peaks around 58 GB/s at EP32 and sags to ~50 GB/s at EP64.</p>
+
+<figure class="fig narrow" data-fig="line">
+  <figcaption class="figcap"><b>Figure 4 — Per-token RDMA bandwidth falls as expert count rises.</b> DeepEP's LL pure-RDMA dispatch decays from 98 GB/s at EP8 to 39 GB/s at EP256 — below a single CX7's ~50 GB/s line rate past ~128 experts. This is the motivation for node-limited routing and for keeping expert groups inside one NVL72.
+    <span class="meta"><span>Regime · <b>LL pure-RDMA, internode</b></span><span>Evidence · <b>DeepEP legacy docs</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "xlabel":"routed experts (EP fan-out)","ylabel":"GB/s per token","logx":true,
+    "series":[
+      {"name":"LL dispatch","fam":"comms","pts":[[8,98],[32,58],[64,50],[128,46],[256,39]]},
+      {"name":"CX7 line rate","fam":"norm","dash":true,"pts":[[8,50],[256,50]]}
+    ],
+    "annotations":[{"x":128,"y":46,"text":"crosses line rate"},{"x":256,"y":39,"text":"39 GB/s floor"}] }</script>
+</figure>
+
+<p>On 800G ConnectX-8 with MRC spraying 256 paths you roughly double the absolute number — a <strong>~90–110 GB/s/GPU envelope</strong> is plausible, consistent with the LL-kernel's 98–127 GB/s NVLink-assisted figures and DeepEP-V2's measured ~90 GB/s RDMA at EP8×2. <strong>But the fraction of line rate stays stubbornly at ~50–60%</strong>, because the bottleneck migrates from link bandwidth to <strong>all-to-all incast and load imbalance</strong>: many senders hit one receiver simultaneously (incast), and a hot expert receives disproportionate traffic (skew). Doubling the link rate does not double the effective all-to-all throughput when the limiter is the receiver's incast queue and the slowest (hottest) expert's serialization.</p>
+
+<p><strong>Concretely, at 100 GB/s/GPU effective:</strong> the ~115 KB combine per token per layer is <strong>~1.15 µs of serialized fabric time per token per layer if unoverlapped.</strong> That number, multiplied by tokens and layers, is catastrophic if exposed. Which is the entire point: <strong>the game is overlap, not bandwidth.</strong></p>
+
+<div class="callout key"><div class="ct">The fraction of line rate, not the absolute, is the planning number</div>
+  <p>Doubling 400G → 800G roughly doubles the absolute GB/s but leaves the all-to-all stuck at <strong>~50–60% of line rate</strong>, because the limiter is incast + expert skew, not link bandwidth. Provision for incast and skew, not for line rate — and remember the real game is <strong>overlap, not bandwidth</strong>.</p></div>
+
+<h2 id="overlap"><span class="sec-num">08</span>How the all-to-all is actually hidden</h2>
+
+<p>Three mechanisms, layered, hide these microseconds under expert compute.</p>
+
+<figure class="fig" data-fig="barshare">
+  <figcaption class="figcap"><b>Figure 5 — Where an EP-scale MoE layer's time goes, pre-fusion.</b> At expert parallelism spanning many NVL72 domains, the all-to-all dispatch+combine (~44%) rivals the expert GEMM — which is exactly why the V4 MegaMoE kernel fuses the two legs with the GEMM to hide comms inside compute.
+    <span class="meta"><span>Regime · <b>EP across NVL72, pre-fusion</b></span><span>Evidence · <b>DeepEP / DualPipe budgets</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "title":"one MoE layer, EP-scale","unit":"% of layer time",
+    "items":[
+      {"label":"expert grouped-GEMM","value":46,"fam":"compute"},
+      {"label":"dispatch all-to-all","value":24,"fam":"comms"},
+      {"label":"combine all-to-all","value":20,"fam":"comms"},
+      {"label":"routing + permute glue","value":10,"fam":"moe"}
+    ],
+    "note":"All-to-all (dispatch+combine) ≈ 44% — the budget MegaMoE collapses by overlapping it with the GEMM." }</script>
+</figure>
+
+<p><strong>DualPipe scheduling (V3).</strong> Each forward/backward chunk is decomposed into four phases — <strong>attention, all-to-all dispatch, MLP, all-to-all combine</strong> — with backward further split into backward-for-input and backward-for-weights, and a hand-tuned schedule overlaps the all-to-all of one micro-batch with the GEMMs of another (<a href="https://arxiv.org/html/2412.19437v1">DeepSeek-V3</a>). The bubble count drops to <code>(PP/2−1)(F&amp;B+B−3W)</code> versus 1F1B's <code>(PP−1)(F+B)</code>. The cost is <strong>two resident parameter copies</strong> (the bidirectional schedule), which is cheap because EP already shards the experts. The comms side reserves <strong>20 SMs</strong> across 10 warp-specialized channels with custom PTX and auto-tuned chunk sizes to limit L2 interference — that 20-SM tax is exactly what DeepEP-V2 (4–6 SMs) and the V4 mega-kernel are built to eliminate.</p>
+
+<p><strong>The fundamental overlap condition.</strong> DeepSeek-V4 frames it crisply: you need roughly <strong>6,144 FLOPs/Byte</strong> for the MoE compute to fully hide the communication (<a href="https://arxiv.org/html/2606.19348v1">DeepSeek-V4</a>). The expert GEMM does ~<code>6·h·d</code> FLOPs per token-expert against ~<code>3·h</code> bytes of communication, so the ratio is set by the expert intermediate dimension <code>d</code>. If your experts are too narrow relative to your network, the comm cannot be hidden no matter how clever the schedule — which is an argument for <em>wider, fewer</em> experts when the network is the binding constraint, and a direct input to your expert-sizing decision.</p>
+
+<div class="formula"><span class="lbl">compute</span>
+  <span class="eq">ratio to beat = (6 · h · d) FLOPs / (3 · h) bytes ≈ 6144 FLOP/byte</span>
+  <span class="note">Stay above this and the expert GEMM hides the all-to-all under compute. The ratio is set by the expert intermediate dimension d — narrow experts cannot hide comms, an argument for wider, fewer experts when the network binds.</span></div>
+
+<p><strong>Device-initiated overlap (DeepEP hook + GIN).</strong> DeepEP's hook mechanism issues the RDMA and returns, letting the grouped-GEMM proceed; the transfer completes asynchronously and consumes zero SMs. GIN's device-initiated puts do the same inside NCCL. This is what buries the ~1 µs/token/layer fabric time under the expert grouped-GEMM.</p>
+
+<p><strong>The V4 endgame — a single fused mega-kernel.</strong> DeepSeek-V4 (arXiv 2606.19348) replaces the DualPipe + DeepEP two-piece overlap with a <strong>single fused MoE mega-kernel ("MegaMoE", open-sourced in DeepGEMM)</strong> that fuses EP-dispatch → first <span class="f-prec">FP8×FP4</span> expert GEMM → SwiGLU+requant → second <span class="f-prec">FP8×FP4</span> GEMM → EP-combine into one <strong>symmetric-memory</strong> kernel (<a href="https://arxiv.org/html/2606.19348v1">DeepSeek-V4</a>). The mechanism is <strong>expert "waves"</strong>: the current wave computes on the tensor cores while the next wave's tokens transfer over NVLink and finished experts' results are sent back, all concurrently — finer-grained than the prior Comet-style overlap. On SM100 it uses three warp roles (dispatch / UMMA-non-epilogue / epilogue), Tensor Memory, UE8M0 2D-TMA scale descriptors, and a <code>MegaMoEScheduler</code> that prioritizes NVLink-active tiles (<a href="https://deepwiki.com/deepseek-ai/DeepGEMM/4.4-mega-moe-kernel-implementation">DeepGEMM MegaMoE</a>). Measured speedup is <strong>1.50–1.73× general, up to 1.96× latency-sensitive</strong> over the non-fused baseline. For a 100k GB200 build this is the target: the fused kernel makes the all-to-all genuinely invisible by interleaving transfer and MMA at wave granularity rather than at kernel-boundary granularity.</p>
+
+<div class="callout do"><div class="ct">Ship the V4 MegaMoE fused kernel as the overlap target</div>
+  <p>MegaMoE deletes DualPipe's 20-SM overlap tax and the two-piece dispatch/GEMM/combine handoff in one move, for <strong>1.5–1.96×</strong>, by interleaving NVLink transfer and tensor-core MMA at <em>wave</em> granularity rather than kernel-boundary granularity. This is what makes the all-to-all genuinely invisible on GB200.</p></div>
+
+<p><strong>LL decode budgets.</strong> For the inference/decode side, the LL-kernel dispatch latencies of <strong>77–194 µs</strong> and combine of <strong>114–314 µs</strong> (8 → 256 experts) are the budget you must hide behind expert compute. If your per-expert compute is smaller than this, decode is comms-bound and you need EPLB replication of hot experts plus larger batched decode to amortize.</p>
+
+<h2 id="tail"><span class="sec-num">09</span>What MRC actually buys the all-to-all: tail suppression</h2>
+
+<p>A crucial clarification: <strong>MRC's contribution to the all-to-all is not throughput — it is tail-latency suppression.</strong> At 100k GPUs a synchronous training step waits on the <em>slowest</em> all-to-all transfer across the whole job. In a conventional fabric, a single link flap spikes the p99.9 of these transfers to <em>seconds</em> during routing reconvergence, and that one stall propagates to all 100k GPUs. MRC's static SRv6 + EV-spray design means one dead path out of 256 costs ~0.4% of paths and is dropped in microseconds, so the <strong>p99.9 tail no longer spikes to seconds on a single link event</strong> (<a href="https://arxiv.org/abs/2605.04333">arXiv 2605.04333</a>). For a synchronous 100k-GPU step, <strong>tail-latency suppression is worth more than peak bandwidth</strong>, and that is precisely the problem MRC was built to solve. You provision bandwidth with 800G NICs and spraying; you provision <em>step-time stability</em> with MRC's failover semantics.</p>
+
+<div class="callout key"><div class="ct">MRC buys p99.9 tail suppression, not peak bandwidth</div>
+  <p>A synchronous 100k-GPU step waits on the <em>slowest</em> transfer. MRC keeps a single link event from spiking the p99.9 to seconds — you provision <strong>bandwidth</strong> with 800G NICs and spraying, and <strong>step-time stability</strong> with MRC's microsecond EV-failover. At this scale the second matters more.</p></div>
+
+<h2 id="placement"><span class="sec-num">10</span>Placement and routing co-design: keeping the RDMA leg small</h2>
+
+<p>The networking and MoE-systems layers are not separable; the routing config determines the fabric load. The levers, in priority order for a 100k GB200 build:</p>
+
+<ul>
+  <li><strong>Node-limited (M=4) routing</strong> caps each token's internode fan-out so an expert group fits one NVL72 domain; the RDMA leg then carries only cross-group residue (<a href="https://arxiv.org/html/2412.19437v1">DeepSeek-V3</a>). On NVL72's 72-GPU domain you have more headroom than the 8-GPU HGX assumption, so co-locate whole expert groups (plus replicas) in-rack.</li>
+  <li><strong>Auxiliary-loss-free bias balancing</strong> keeps expert load even so the all-to-all incast stays bounded: a per-expert bias added to top-K selection scores only, nudged by <strong>±γ (γ=0.001 for the first 14.3T tokens, 0.0 for the final 500B in V3)</strong>. Without this, expert skew destroys the ~50–60% line-rate efficiency further. <strong>Watch DeepEP issue #427</strong>: LL dispatch can <em>silently corrupt</em> under heavily imbalanced load — exactly the early-training regime before the balancer converges (<a href="https://github.com/deepseek-ai/DeepEP/issues/427">DeepEP #427</a>).</li>
+  <li><strong>EPLB redundant-expert replication</strong> at deployment is essentially mandatory at 100k scale: replicate the hottest experts so incast spreads across replicas. The newer <strong>LPLB</strong> solves per-batch dynamic redistribution as an LP over the redundant-expert topology via a single-SM interior-point method in <strong>~100 µs/batch</strong>, fed by live DeepEP buffer stats (<a href="https://github.com/deepseek-ai/LPLB/blob/main/README.md">LPLB</a>) — the research-frontier online variant.</li>
+  <li><strong>Dropless ragged buffers</strong> sized at the <code>min(ep_degree, global_experts/top_k)</code> worst-case bound — never worse than <strong>256/8 = 32×</strong> for a V3-style config — or <code>ragged_buffer_factor≈3</code> as the near-dropless memory-bounded compromise (<a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/layers/moe.py">MaxText moe.py</a>). In MaxText this rides <span class="k k-comms">jax.lax.ragged_all_to_all</span> with offsets/sizes from <code>get_all_to_all_params</code>, dispatching the grouped GEMM through <code>ragged_dot</code> / megablox / tokamax.</li>
+</ul>
+
+<div class="callout warn"><div class="ct">Step-0 hazard — DeepEP #427 imbalance corruption</div>
+  <p>LL dispatch can <strong>silently corrupt</strong> activations under heavily imbalanced expert load — exactly the first few thousand steps before your auxiliary-loss-free bias balancer converges. Run the high-throughput path early, warm up the balancer aggressively, or use hash-routed early layers (immune to #427) as a clean warm-up.</p></div>
+
+<p>The MaxText EP all-to-all is the most legible open reference for the JAX path. The dispatch/combine is built not from a dense one-hot all-to-all but from <span class="k k-comms">jax.lax.ragged_all_to_all</span>, which moves only the valid (variable-length) per-expert token runs:</p>
+
+<div class="code-cap">jax — MaxText EP dispatch/combine (illustrative; grounds in src/maxtext/layers/moe.py)</div>
+<pre class="code"><code># per-shard group sizes -> ragged all-to-all offset/size metadata
+def get_all_to_all_params(group_sizes, shard_id, ep_degree):
+    base = group_sizes.reshape(ep_degree, -1)
+    send_sizes = base[shard_id]            # rows we ship out
+    recv_sizes = base[:, shard_id]         # rows we receive
+    in_off  = jnp.concatenate([z, jnp.cumsum(send_sizes)[:-1]])
+    out_off = jnp.concatenate([z, jnp.cumsum(recv_sizes)[:-1]])
+    return in_off, send_sizes, out_off, recv_sizes
+
+# dispatch leg: move only valid per-expert runs (no dense BSEC mask)
+x_sorted, sort_idx, group_sizes = permute(x, top_k_indices)     # custom-VJP sort
+p = get_all_to_all_params(group_sizes, shard_id, ep_degree)
+x_disp = jax.lax.ragged_all_to_all(x_sorted, buffer, *p)        # NVLink + RDMA legs
+y_local = gmm(local_permute(x_disp), w_experts, local_group_sizes)  # grouped GEMM
+y_disp  = jax.lax.ragged_all_to_all(y_local, buffer, *p_rev)    # combine leg
+y = unpermute(y_disp, sort_idx, combine_weights)               # apply un-biased gate
+</code></pre>
+
+<p>The unifying principle: <strong>every routing decision is a fabric-load decision.</strong> The network team and the model team must co-design, because a routing change that doubles internode fan-out doubles the RDMA leg, and a 50% line-rate fabric has no headroom to absorb that.</p>
+
+<h2 id="recommendation"><span class="sec-num">11</span>Quantified recommendation for the 10T / 200B / 100k-GB200 run</h2>
+
+<p>Putting it together for the target system:</p>
+
+<div class="tcards">
+  <div class="tcard" data-fam="comms"><div class="tn">scale-up</div><div class="ts">NVL72 / NVLink5</div><div class="tm">1.8 TB/s/GPU, 130 TB/s/rack all-to-all. Confine TP + intra-group EP in-rack; NVLink-SHARP (7.2 TB/s) for in-rack gradient reduction.</div></div>
+  <div class="tcard" data-fam="comms"><div class="tn">scale-out</div><div class="ts">MRC over Spectrum-X / Tomahawk-5</div><div class="tm">~770 Gb/s/NIC, 57.6 Tb/s/rack, disjoint Acceleron-style multi-plane. Not single-plane InfiniBand.</div></div>
+  <div class="tcard" data-fam="compute"><div class="tn">collectives</div><div class="ts">DeepEP-V2 / hybrid-ep + MegaMoE</div><div class="tm">Fused dispatch-GEMM-combine, riding NCCL 2.28 GIN for elasticity; SHARP for in-rack allreduce.</div></div>
+</div>
+
+<figure class="fig" data-fig="meshlayout">
+  <figcaption class="figcap"><b>Figure 6 — The 100k-GB200 mesh factorization.</b> TP and intra-expert-group EP are kept <em>inside</em> the 72-GPU NVL72 NVLink domain so the dominant all-to-all rides copper; PP×DP spans the cluster over the slower 800G MRC plane. EP×TP = 8×8 = 64 ≤ 72.
+    <span class="meta"><span>Regime · <b>10T/200B on 100k GB200</b></span><span>Evidence · <b>NVL72 domain + V3-shaped plan</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "deviceTotal":100000,
+    "axes":[
+      {"id":"EP","name":"expert (in-NVL72)","size":8,"fam":"moe"},
+      {"id":"TP","name":"tensor (in-NVL72)","size":8,"fam":"compute"},
+      {"id":"PP","name":"pipeline (MRC)","size":16,"fam":"data"},
+      {"id":"DP","name":"data (MRC)","size":98,"fam":"mem"}
+    ],
+    "note":"EP×TP = 64 ≤ 72 → kept inside one NVL72 NVLink domain; PP×DP spans the cluster over 800G MRC" }</script>
+</figure>
+
+<ul>
+  <li><strong>Scale-up:</strong> NVL72 / NVLink5, 1.8 TB/s/GPU, 130 TB/s/rack aggregate all-to-all. Confine TP and intra-expert-group EP entirely inside the rack. Use NVLink-SHARP (7.2 TB/s in-domain allreduce) for in-rack gradient reduction.</li>
+  <li><strong>Scale-out:</strong> 800G spray fabric — <strong>MRC over Spectrum-X / Tomahawk-5 on disjoint Acceleron-style multi-plane fabric</strong>, ~770 Gb/s/NIC achievable, 57.6 Tb/s/rack scale-out. Not single-plane InfiniBand. Two-tier multi-plane Clos, 3-switch longest path, scales past your 100k requirement toward the 131,072-GPU envelope.</li>
+  <li><strong>Bandwidth budget:</strong> ~1.4 GB cross-fabric per layer per rank for a V3-class config at 8,192 tokens/rank; effective ~90–110 GB/s/GPU on the RDMA leg (~50–60% of 800G); <strong>the fraction of line rate, not the absolute, is the planning number</strong> — provision for incast and skew, not for line rate.</li>
+  <li><strong>Collectives:</strong> DeepEP-V2 / <code>hybrid-ep</code> + DeepGEMM MegaMoE for the fused dispatch-GEMM-combine path, riding NCCL 2.28 GIN for elasticity and fault tolerance. SHARP for allreduce offload in-rack.</li>
+  <li><strong>Overlap target:</strong> hit <strong>≥6,144 FLOPs/Byte</strong> so the all-to-all hides fully; size experts wide enough that the expert GEMM dominates the dispatch/combine cost. The V4 fused mega-kernel's wave-level interleave (1.5–1.96× over non-fused) is the mechanism.</li>
+  <li><strong>Reliability:</strong> MRC's microsecond EV-failover is the load-bearing property — at 100k GPUs you are buying p99.9 tail suppression, not peak bandwidth. Provision disjoint planes so plane-level failures also fail over instantly.</li>
+  <li><strong>Forward bet:</strong> architect collective abstractions so a future photonic scale-up domain (PCCL-style per-collective-round reconfiguration, 7.5× all-to-all) drops in. That, not MRC, is where the all-to-all-vs-allreduce topology conflict ultimately dissolves.</li>
+</ul>
+
+<div class="callout key"><div class="ct">The summary judgment</div>
+  <p><strong>MRC makes the packet fabric survivable; DeepEP/GIN/MegaMoE make the all-to-all invisible; NVL72 keeps the high-fanout hop on copper at 18× the scale-out bandwidth; and the routing config keeps the RDMA leg small enough that ~50% line-rate efficiency is still enough.</strong> None of these individually solves the all-to-all problem — collectively, they make a synchronous 200B-active MoE step across 100,000 GPUs run without stalling. The root-cause solution to the topology conflict is photonic and still a generation away.</p></div>
+
+<div class="sources"><h3>Sources</h3><ul>
+  <li>OpenAI MRC + SRv6 paper (arXiv 2605.04333): <a href="https://arxiv.org/abs/2605.04333">arxiv.org/abs/2605.04333</a></li>
+  <li>OCP MRC 1.0 spec: <a href="https://www.opencompute.org/documents/ocp-mrc-1-0-pdf">opencompute.org/documents/ocp-mrc-1-0-pdf</a></li>
+  <li>NVIDIA GB200 NVL72 (dense vs sparse peak, NVLink5, scale-out bandwidth): <a href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">nvidia.com/en-us/data-center/gb200-nvl72</a></li>
+  <li>NCCL 2.28 GPU-Initiated Networking (GIN), arXiv 2511.15076: <a href="https://arxiv.org/abs/2511.15076">arxiv.org/abs/2511.15076</a></li>
+  <li>DeepEP legacy performance docs (V1 LL/HT bandwidth curves): <a href="https://github.com/deepseek-ai/DeepEP/blob/main/docs/legacy.md">DeepEP/docs/legacy.md</a></li>
+  <li>DeepEP README (V2, ElasticBuffer, NCCL Gin, SM100): <a href="https://github.com/deepseek-ai/DeepEP/blob/main/README.md">github.com/deepseek-ai/DeepEP</a></li>
+  <li>DeepEP issue #427 (LL imbalance correctness): <a href="https://github.com/deepseek-ai/DeepEP/issues/427">DeepEP#427</a></li>
+  <li>DeepEP hybrid-ep branch (NVIDIA, TMA + warp pipelining, NIXL/UCX): <a href="https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep">DeepEP/tree/hybrid-ep</a></li>
+  <li>PCCL: Photonic circuit-switched collectives (arXiv 2509.15450): <a href="https://arxiv.org/abs/2509.15450">arxiv.org/abs/2509.15450</a></li>
+  <li>Oracle Acceleron Multiplanar Networking: <a href="https://blogs.oracle.com/cloud-infrastructure/first-principles-acceleron-multiplanar-networking">blogs.oracle.com/cloud-infrastructure/acceleron-multiplanar-networking</a></li>
+  <li>OCP Optical Circuit Switching white paper (April 2026): <a href="https://www.opencompute.org/documents/ocp-ocs-white-paper-april-2026-final-pdf">opencompute.org/documents/ocp-ocs-white-paper-april-2026</a></li>
+  <li>NVIDIA SHARP in-network computing: <a href="https://developer.nvidia.com/blog/advancing-performance-with-nvidia-sharp-in-network-computing/">developer.nvidia.com/blog/nvidia-sharp-in-network-computing</a></li>
+  <li>UEC 1.0 specifications: <a href="https://ultraethernet.org/uec-progresses-towards-v1-0-set-of-specifications/">ultraethernet.org/uec-progresses-towards-v1-0</a></li>
+  <li>Tom Herbert, UET 1.0 review: <a href="https://medium.com/@tom_84912/a-mostly-unbiased-review-of-the-ultra-ethernet-specification-10d816227839">medium.com/@tom_84912 — UET review</a></li>
+  <li>DeepSeek-V3 paper (arXiv 2412.19437): <a href="https://arxiv.org/pdf/2412.19437">arxiv.org/pdf/2412.19437</a></li>
+  <li>DeepSeek-V4 paper (arXiv 2606.19348): <a href="https://arxiv.org/html/2606.19348v1">arxiv.org/html/2606.19348v1</a></li>
+  <li>DeepGEMM MegaMoE kernel internals (warp roles, TMEM, SymmBuffer, scheduler): <a href="https://deepwiki.com/deepseek-ai/DeepGEMM/4.4-mega-moe-kernel-implementation">deepwiki.com/deepseek-ai/DeepGEMM</a></li>
+  <li>DeepSeek LPLB (online LP load balancer): <a href="https://github.com/deepseek-ai/LPLB/blob/main/README.md">github.com/deepseek-ai/LPLB</a></li>
+  <li>MaxText moe.py (sparse_matmul, ragged_all_to_all, get_all_to_all_params): <a href="https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/layers/moe.py">maxtext/src/maxtext/layers/moe.py</a></li>
+</ul></div>
+
+<nav class="chnav"><a class="prev" href="ch02.html"><span class="dir">← Previous</span><span class="t">The 100k-GPU machine</span></a><a class="next" href="ch04.html"><span class="dir">Next →</span><span class="t">Parallelism strategy</span></a></nav>
+</main>
+<script src="book.js"></script>
+</body>
+</html>

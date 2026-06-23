@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="robots" content="noindex, nofollow" />
+<title>Appendix A · Cheat-sheet · The Frontier Pretraining Atlas</title>
+<meta name="description" content="Appendix A · Cheat-sheet — a field manual for the 10-trillion-parameter MoE." />
+<meta name="color-scheme" content="light dark" />
+<meta name="theme-color" content="#f4f2ec" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232f6fba'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' fill='white' text-anchor='middle' font-weight='bold'%3EFP%3C/text%3E%3C/svg%3E" />
+<link rel="stylesheet" href="book.css" />
+</head>
+<body>
+<nav class="nav">
+  <a class="home" href="index.html">The Frontier Pretraining Atlas <small>· a field manual for the 10-trillion-parameter MoE</small></a>
+  <span class="spacer"></span>
+  <div class="chrail"><a href="index.html">Contents</a><a href="ch01.html" data-rail="ch01">01</a><a href="ch02.html" data-rail="ch02">02</a><a href="ch03.html" data-rail="ch03">03</a><a href="ch04.html" data-rail="ch04">04</a><a href="ch05.html" data-rail="ch05">05</a><a href="ch06.html" data-rail="ch06">06</a><a href="ch07.html" data-rail="ch07">07</a><a href="ch08.html" data-rail="ch08">08</a><a href="ch09.html" data-rail="ch09">09</a><a href="ch10.html" data-rail="ch10">10</a><a href="ch11.html" data-rail="ch11">11</a><a href="ch12.html" data-rail="ch12">12</a><a href="ch13.html" data-rail="ch13">13</a><a href="ch14.html" data-rail="ch14">14</a><a href="ch15.html" data-rail="ch15">15</a><a href="ch16.html" data-rail="ch16">16</a><a href="ch17.html" data-rail="ch17">17</a><a href="ch18.html" data-rail="ch18">18</a><a href="ch19.html" data-rail="ch19">19</a><a href="ch20.html" data-rail="ch20">20</a><a href="apxA.html" data-rail="apxA" class="cur">·A</a><a href="apxB.html" data-rail="apxB">·B</a><a href="apxC.html" data-rail="apxC">·C</a><a href="apxD.html" data-rail="apxD">·D</a></div>
+  <div class="progress-wrap"><div class="progress"></div></div>
+  <button class="theme-btn" aria-label="Toggle dark mode">◑ theme</button>
+</nav>
+<main class="wrap page">
+<p class="eyebrow">Appendix A · The scaling cheat-sheet</p>
+<h1>Every formula you need, in one place</h1>
+<p class="lede">This is the dense reference card for the whole book: the roofline, the matmul critical batch, transformer FLOPs, the memory ledger, collective costs, per-strategy comms volume, and the inference rooflines — re-instantiated for the 10T-total / 200B-active run on 100,000 GB200 GPUs. Symbolic results are hardware-agnostic; you plug in your own <span class="k k-compute">C</span> (peak FLOPs/s) and <span class="k k-comms">W</span> (bandwidth).</p>
+<p class="byline"><span>~24 min read</span><span class="dot">2 figures</span><span class="dot">grounded in JAX <em>How To Scale Your Model</em></span></p>
+<hr />
+
+<p>This is a dense reference, not prose. Every formula below is drawn from the JAX <em>How To Scale Your Model</em> book (<a href="https://jax-ml.github.io/scaling-book/">landing</a>) and its referenced papers. Hardware-specific constants default to <strong>GB200/Blackwell</strong> where the book gives a Blackwell number; TPU v5e/v5p values are retained where they are the only anchor, since the book's symbolic results are hardware-agnostic and you re-instantiate the constants <span class="k k-compute">C</span> (peak FLOPs/s) and <span class="k k-comms">W</span> (bandwidth) for your silicon.</p>
+
+<div class="pull">Runtime is bounded by max(compute, comms, memory). A 20% benchmark win is worthless at a 20% roofline-efficiency cost — every formula here exists to tell you which of the three terms you are paying.</div>
+
+<div class="callout note"><div class="ct">Notation convention (used throughout)</div>
+  <p><code>B</code>=batch in <em>tokens</em> (not sequences), <code>T</code>=query seq len, <code>S</code>=key/value seq len, <code>D</code>=d_model, <code>F</code>=d_ff, <code>L</code>=layers, <code>N</code>=query heads, <code>K</code>=KV heads, <code>H</code>=head dim, <code>G</code>=N/K (GQA group size), <code>V</code>=vocab, <code>E</code>=experts, <code>k</code>=experts/token, <code>C</code>=accelerator peak FLOPs/s, <code>W</code>=<em>bidirectional</em> link bandwidth (bytes/s), <code>X/Y/Z</code>=devices on a mesh axis, <code>M_X/M_Y</code>=number of mesh axes a strategy uses.</p></div>
+
+<h2 id="constants"><span class="sec-num">01</span>Hardware constants you plug in</h2>
+
+<p>These are the numbers you substitute into every symbolic result below. Where the book gives a Blackwell figure it is the default; the TPU columns are kept because the book's derivations were authored against them and the symbolic forms are identical.</p>
+
+<div class="stats">
+  <div class="stat" data-fam="compute"><div class="v">2.25<span class="u">PF/s</span></div><div class="l">B200 peak bf16 FLOP/s (C)</div></div>
+  <div class="stat" data-fam="mem"><div class="v">8.0<span class="u">TB/s</span></div><div class="l">B200 HBM bandwidth (W_hbm)</div></div>
+  <div class="stat" data-fam="comms"><div class="v">900<span class="u">GB/s</span></div><div class="l">NVLink5 bidi per GPU</div></div>
+  <div class="stat" data-fam="data"><div class="v">72<span class="u">GPU</span></div><div class="l">NVL72 NVLink domain size</div></div>
+</div>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Constant</th><th class="num">GB200 / B200</th><th class="num">H100</th><th class="num">TPU v5p</th><th class="num">TPU v5e</th><th>One-line use</th></tr></thead>
+  <tbody>
+    <tr><td>Peak bf16 FLOP/s <code>C</code></td><td class="num">2.25e15</td><td class="num">9.89e14</td><td class="num">4.59e14</td><td class="num">1.97e14</td><td>numerator of every <code>T_math</code></td></tr>
+    <tr><td>Peak fp8 OP/s</td><td class="num">4.5e15</td><td class="num">2.0e15</td><td class="num">9.18e14</td><td class="num">3.94e14</td><td>doubles <code>B_crit</code> if FLOPs are low-precision</td></tr>
+    <tr><td>Peak fp4 OP/s</td><td class="num">9.0e15</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td>B200-only; quarters bf16 time</td></tr>
+    <tr><td>HBM capacity</td><td class="num">192 GB</td><td class="num">80 GB</td><td class="num">96 GB</td><td class="num">16 GB</td><td>memory ceiling per device</td></tr>
+    <tr><td>HBM bandwidth <code>W_hbm</code></td><td class="num">8.0e12</td><td class="num">3.35e12</td><td class="num">2.8e12</td><td class="num">8.2e11</td><td>denominator of <code>T_comms</code> (mem-bound)</td></tr>
+    <tr><td>Matmul critical intensity <code>C/W_hbm</code></td><td class="num">≈281</td><td class="num">≈295</td><td class="num">≈164</td><td class="num">≈240</td><td>ridge-point FLOPs/byte ≈ critical token batch</td></tr>
+    <tr><td>Practical MFU ceiling</td><td class="num">~80–85%</td><td class="num">~80–85%</td><td class="num">~95%</td><td class="num">~95%</td><td>derate roofline estimates by this</td></tr>
+    <tr><td>Intra-domain link <code>W</code> (bidi)</td><td class="num">900 GB/s/GPU</td><td class="num">450 GB/s/GPU</td><td class="num">1.8e11/axis</td><td class="num">9.0e10/axis</td><td>TP/EP all-gather bandwidth</td></tr>
+    <tr><td>Scale-out egress</td><td class="num">400 GB/s/node</td><td class="num">400 GB/s/node</td><td class="num">6.25e9/chip</td><td class="num">3.125e9/chip</td><td>cross-pod DP all-reduce bandwidth</td></tr>
+    <tr><td>NVLink domain size</td><td class="num">72 (NVL72)</td><td class="num">8</td><td class="num">8960 (ICI pod)</td><td class="num">256 (ICI pod)</td><td>how far TP/EP can spread cheaply</td></tr>
+  </tbody>
+  <caption>H100 peak bf16 is the <em>true</em> 9.89e14; the 1.979e15 figure is the 2× sparsity number. v5p/v5e fp8 entries are int8 OP/s.</caption>
+</table></div>
+
+<div class="callout key"><div class="ct">What GB200 NVL72 buys you</div>
+  <p>GB200 NVL72 raises the NVLink domain to <strong>72 GPUs</strong> at 900 GB/s/GPU intra-domain and gives <strong>4·18·400/8 = 3.6 TB/s</strong> per-node scale-out (9× H100). A GB200 = 2 B200 dies + 1 Grace CPU.</p></div>
+
+<h2 id="roofline"><span class="sec-num">02</span>The roofline (the master rule)</h2>
+
+<p>The roofline is the single most-used decision in the book: classify any op by its arithmetic intensity, compare against the accelerator's ridge point, and you know instantly whether you are compute- or bandwidth-bound.</p>
+
+<div class="formula"><span class="lbl">data</span>
+  <span class="eq">T = max(T<sub>math</sub>, T<sub>comms</sub>) &nbsp; where &nbsp; T<sub>math</sub> = FLOPs / C, &nbsp; T<sub>comms</sub> = Bytes / W</span>
+  <span class="note">Good kernels overlap, so runtime is the max of the two floors. The pessimistic no-overlap bound is the sum T<sub>math</sub> + T<sub>comms</sub>.</span></div>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Quantity</th><th>Formula</th><th>Use it when</th></tr></thead>
+  <tbody>
+    <tr><td>Compute time</td><td><code>T_math = FLOPs / C</code></td><td>always — the floor if perfectly compute-bound</td></tr>
+    <tr><td>Comms/mem time</td><td><code>T_comms = Bytes / W</code></td><td>always — the floor if perfectly bandwidth-bound</td></tr>
+    <tr><td>Runtime (overlap)</td><td><code>T = max(T_math, T_comms)</code></td><td>good kernels; the book's default estimate</td></tr>
+    <tr><td>Runtime (no overlap)</td><td><code>T = T_math + T_comms</code></td><td>pessimistic upper bound</td></tr>
+    <tr><td>Arithmetic intensity</td><td><code>I = FLOPs / Bytes</code></td><td>classify any op</td></tr>
+    <tr><td>Accelerator intensity</td><td><code>I_acc = C / W</code></td><td>the ridge point (240 v5e, 281 B200 HBM)</td></tr>
+    <tr><td><b>Compute-bound iff</b></td><td><code>I &gt; I_acc</code> &nbsp;⇔&nbsp; <code>T_math &gt; T_comms</code></td><td>the single most-used decision in the book</td></tr>
+    <tr><td>Achievable FLOP/s</td><td><code>total_FLOPs / max(T_math, T_comms)</code></td><td>for roofline plots / MFU</td></tr>
+  </tbody>
+  <caption>Rule: runtime is bounded by <code>max(compute, comms, memory)</code>. A 20% benchmark win is worthless at a 20% roofline-efficiency cost.</caption>
+</table></div>
+
+<figure class="fig" data-fig="roofline">
+  <figcaption class="figcap"><b>Figure 1 — The B200 roofline and where MoE ops land.</b> The ridge point sits at <span class="f-compute">C/W_hbm ≈ 281 FLOPs/byte</span>; ops to its left are bandwidth-bound, to its right compute-bound. A dense MLP at batch ≫281 lives on the flat compute roof; the MoE all-to-all and decode-time attention sit deep in the memory-bound slope.
+    <span class="meta"><span>Regime · <b>B200, bf16 peak</b></span><span>Evidence · <b>JAX scaling book rooflines</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "peak":2.25e15,"bw":8.0e12,
+    "points":[
+      {"name":"dense MLP (B=4096)","ai":600,"perf":2.0e15,"fam":"compute"},
+      {"name":"MoE expert GEMM","ai":281,"perf":1.9e15,"fam":"moe"},
+      {"name":"weight-only int8","ai":120,"perf":1.0e15,"fam":"prec"},
+      {"name":"decode attention","ai":1,"perf":8.0e12,"fam":"attn"},
+      {"name":"all-to-all route","ai":2,"perf":1.6e13,"fam":"comms"}
+    ] }</script>
+</figure>
+
+<h2 id="matmul"><span class="sec-num">03</span>Matmul FLOPs, bytes, and the critical batch</h2>
+
+<p>For the canonical matmul <code>X[B,D] · Y[D,F] → Z[B,F]</code>, the arithmetic intensity collapses to roughly the token batch when <code>B ≪ D,F</code> — which is why "critical batch" and "critical intensity" are the same number.</p>
+
+<div class="formula"><span class="lbl">data</span>
+  <span class="eq">I = B·D·F / (B·D + D·F + B·F) ≈ B &nbsp; when &nbsp; B ≪ D, F</span>
+  <span class="note">Intensity ≈ token batch. Compute-bound iff B &gt; C/W_hbm ≈ 240 (v5e), 281 (B200), 295 (H100).</span></div>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Quantity</th><th>Formula</th><th>Note</th></tr></thead>
+  <tbody>
+    <tr><td>FLOPs</td><td><code>2·B·D·F</code></td><td>factor 2 = multiply + add</td></tr>
+    <tr><td>Bytes (bf16)</td><td><code>2BD + 2DF + 2BF</code></td><td>load both inputs + write output</td></tr>
+    <tr><td>Intensity</td><td><code>BDF/(BD+DF+BF) ≈ B</code></td><td>intensity ≈ token batch when <code>B ≪ D,F</code></td></tr>
+    <tr><td><b>Compute-bound</b></td><td><code>B &gt; C/W_hbm</code></td><td>≈240 (v5e), ≈281 (B200), ≈295 (H100)</td></tr>
+    <tr><td>Contraction FLOPs (general)</td><td><code>2 × (product of all input dims, batch &amp; contract counted once)</code></td><td>no factor 2 for pure elementwise</td></tr>
+    <tr><td>Tiled-from-VMEM intensity</td><td><code>bm·bn/(bm+bn)</code>; threshold ~10–20</td><td>VMEM/SMEM is ~22× HBM BW</td></tr>
+  </tbody>
+  <caption>The ridge-point batch is the threshold below which a matmul is memory-bound on HBM.</caption>
+</table></div>
+
+<p>The precision levers move the critical batch by changing the bits-per-param vs bits-per-activation ratio. The general form is <code>B_crit = (C/W_hbm) · (bits_per_param / bits_per_activation)</code>.</p>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Scheme</th><th class="num">B_crit (v5e)</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>bf16 weights + bf16 FLOPs</td><td class="num">240</td><td>baseline <code>C/W_hbm</code></td></tr>
+    <tr><td><span class="f-prec">int8/fp8</span> weights, bf16 FLOPs</td><td class="num"><b>120</b></td><td>half the weight bytes, same FLOPs</td></tr>
+    <tr><td>int8 weights + int8 FLOPs</td><td class="num">240</td><td>both peak ops/s and intensity double</td></tr>
+    <tr><td>per-example weight matrix (no reuse)</td><td class="num">≈2</td><td>intensity is constant — always comms-bound, avoid in hot paths</td></tr>
+  </tbody>
+  <caption>General: <code>B_crit = (C/W_hbm) · (bits_per_param / bits_per_activation)</code>.</caption>
+</table></div>
+
+<div class="callout warn"><div class="ct">Sharded matmuls are almost always comms-bound on the contracting dim</div>
+  <p>For a <strong>sharded 2-chip matmul</strong> that shards the contracting <code>D</code>, you are compute-bound iff <code>D/(2X) &gt; C/W</code>. For large models (<code>D ≈ 8k</code>) this needs <code>X &lt; 2</code>, i.e. you are <em>essentially always comms-bound</em> on the contracting dim — prefer the all-reduce strategy. See <a href="https://jax-ml.github.io/scaling-book/roofline/">Rooflines</a>, <a href="https://jax-ml.github.io/scaling-book/sharding/">Sharding</a>.</p></div>
+
+<div class="code-cap">jax — classify any matmul against the B200 ridge point</div>
+<pre class="code"><code>import jax.numpy as jnp
+
+C       = 2.25e15            # B200 peak bf16 FLOP/s
+W_hbm   = 8.0e12            # B200 HBM bytes/s
+I_acc   = C / W_hbm         # ridge point ~= 281 FLOPs/byte
+
+def is_compute_bound(B, D, F, dtype_bytes=2):
+    flops  = 2 * B * D * F
+    bytes_ = dtype_bytes * (B*D + D*F + B*F)
+    I      = flops / bytes_                 # arithmetic intensity ~= B
+    return I > I_acc, I, max(flops / C, bytes_ / W_hbm)
+
+# e.g. B=4096, D=8192, F=32768 -> compute-bound (I ~= 4096 >> 281)
+</code></pre>
+
+<h2 id="xformer-flops"><span class="sec-num">04</span>Transformer FLOPs (training &amp; inference)</h2>
+
+<p>The master rule, from <a href="https://jax-ml.github.io/scaling-book/transformers/">Transformers</a>, is the back-of-envelope you reach for constantly:</p>
+
+<div class="formula"><span class="lbl">data</span>
+  <span class="eq">Training FLOPs ≈ 6 · num_params · num_tokens &nbsp;·&nbsp; Inference ≈ 2 · num_params · num_tokens</span>
+  <span class="note">6 = 2 fwd + 4 bwd per matmul; inference is the 2 forward FLOPs only.</span></div>
+
+<p>Per-layer FLOPs tell you which component dominates the budget (training figures are ×6 of the forward, inference ×2):</p>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Component</th><th>FLOPs (training)</th><th class="num">Params</th><th>Use it when</th></tr></thead>
+  <tbody>
+    <tr><td>MLP (gated/SwiGLU)</td><td><code>18·B·T·D·F</code></td><td class="num"><code>3DF</code></td><td>dominates while <code>T &lt; 8D</code></td></tr>
+    <tr><td>MLP (non-gated)</td><td><code>12·B·T·D·F</code></td><td class="num"><code>2DF</code></td><td>single <code>W_in</code></td></tr>
+    <tr><td>Attn QKVO proj</td><td><code>12·B·T·D·(N+K)·H</code></td><td class="num"><code>2D(N+K)H</code></td><td>GQA shrinks K-side</td></tr>
+    <tr><td>Dot-product attn</td><td><code>12·B·T·S·N·H ≈ 12BT²NH</code></td><td class="num">0</td><td>matters only at long ctx</td></tr>
+    <tr><td>Unembedding</td><td><code>6·B·T·D·V</code></td><td class="num"><code>DV</code></td><td>not per-layer</td></tr>
+    <tr><td>LayerNorm</td><td><code>O(BTD)</code></td><td class="num"><code>D</code></td><td>negligible</td></tr>
+  </tbody>
+  <caption>~¼ of params live in attention, ¾ in MLP.</caption>
+</table></div>
+
+<div class="callout note"><div class="ct">Attention fraction ≈ T/(8D)</div>
+  <p>With <code>F=4D</code>, <code>D=NH</code>, <code>N=K</code>, the attention fraction is <strong>≈ T/(8D)</strong>. Dot-product attention dominates training FLOPs only once <code>T &gt; 8D</code> (~64K tokens at D=8k; ~37k at D=4608). Self-attn FLOPs = QKVO FLOPs at <code>T = 2D</code>. Causal masking halves useful attention FLOPs (needs a real kernel). SwiGLU's 3-matrix FFN keeps params/FLOPs fixed by setting <code>d_ff = (2/3)·</code> the ungated width (<a href="https://arxiv.org/abs/2002.05202">GLU Variants</a>).</p></div>
+
+<div class="formula"><span class="lbl">moe</span>
+  <span class="eq">MoE compute-bound batch: &nbsp; B &gt; 120 · E/k &nbsp;→&nbsp; (E=256, k=8) ⇒ B &gt; 3840</span>
+  <span class="note">Params scale ×O(E), activated params/token ×k, sparsity E/k (8–64). Two all-to-alls (route + un-route) when expert-sharded, each ¼ of a single-axis all-gather.</span></div>
+
+<h2 id="memory"><span class="sec-num">05</span>Memory: parameters, optimizer, KV cache, activations</h2>
+
+<p>The memory ledger has four entries: weights, optimizer state, KV cache, and activations. The first two set the training memory ceiling; the KV cache dominates inference; activations are rarely the bound at scale once you remat.</p>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>State</th><th class="num">Bytes/param</th><th>Use it when</th></tr></thead>
+  <tbody>
+    <tr><td>bf16 weights</td><td class="num">2</td><td>inference / fwd</td></tr>
+    <tr><td>fp32 Adam (master + m + v)</td><td class="num">8 → <b>10 total</b></td><td>training memory ceiling (w/ bf16 params)</td></tr>
+    <tr><td><span class="f-optim">Muon</span> (momentum only)</td><td class="num">~4 → <b>~6 total</b></td><td>~40% less optimizer state than Adam</td></tr>
+  </tbody>
+  <caption><span class="f-optim">Muon</span> replaces the second-moment buffer with an orthogonalized update, dropping one fp32 buffer/param.</caption>
+</table></div>
+
+<div class="callout key"><div class="ct">The max-model-per-device rule of thumb</div>
+  <p>Max model under pure DP+Adam = <strong><code>HBM_per_device / 10</code></strong> (≈9B on v5p; ≈19B on a 192 GB B200). Under <span class="f-optim">Muon</span> (~6 B/param) the same device holds <strong>~1.6× more parameters</strong>.</p></div>
+
+<p>The KV cache is the memory term that scales with batch and sequence — it dominates inference memory (<a href="https://jax-ml.github.io/scaling-book/transformers/">Transformers</a>, <a href="https://jax-ml.github.io/scaling-book/inference/">Inference</a>):</p>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Quantity</th><th>Formula</th><th>Note</th></tr></thead>
+  <tbody>
+    <tr><td>Per token (precision p)</td><td><code>2 · L · K · H · p</code></td><td>2 = keys+values; GQA uses K not N</td></tr>
+    <tr><td>Full cache</td><td><code>2 · S · L · K · H · p</code></td><td>scales with batch — dominates inference memory</td></tr>
+    <tr><td>MHA per token (int8)</td><td><code>2·L·N·H</code></td><td>e.g. 512 kB/token at D=4096, L=64</td></tr>
+    <tr><td>GQA reduction</td><td><code>× H/G</code> vs MHA</td><td>LLaMA-3: N=64, K=8 → 8× smaller</td></tr>
+    <tr><td><span class="f-attn">MLA</span> (DeepSeek-V3)</td><td>cache latent <code>d_c=512</code> + RoPE key <code>d_h^R=64</code> only</td><td>drastic further cut (<a href="https://arxiv.org/abs/2412.19437">DeepSeek-V3</a>)</td></tr>
+  </tbody>
+  <caption>Standard inference per-token footprint = <code>2 · hidden · num_layers · bytes_per_param</code> (vLLM accounting).</caption>
+</table></div>
+
+<div class="callout note"><div class="ct">Paged KV cache kills fragmentation</div>
+  <p>OPT-13B FP16 = 800 kB/token, 1.6 GB at 2048 ctx (<a href="https://arxiv.org/abs/2309.06180">vLLM/PagedAttention</a>). Block size 16 tokens; paging cuts the 62–80% fragmentation waste of Orca/FasterTransformer to ~0.</p></div>
+
+<p>Activation memory depends entirely on your rematerialization scheme (<a href="https://jax-ml.github.io/scaling-book/transformers/">Transformers</a>):</p>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Scheme</th><th>Bytes (bf16)</th><th class="num">FLOP cost</th></tr></thead>
+  <tbody>
+    <tr><td>No remat</td><td><code>≈ 2 · 20 · B · T · D · L</code> (~20 nodes/layer)</td><td class="num">6×</td></tr>
+    <tr><td>Block remat (1 ckpt/layer)</td><td><code>2 · B · T · D · L</code></td><td class="num"><b>~8×</b></td></tr>
+    <tr><td>Big-matmuls-only (~7 nodes/layer)</td><td><code>2 · 7 · B · T · D · L</code></td><td class="num">between</td></tr>
+    <tr><td>Checkpointed (3 big matmuls)</td><td><code>2·L·B·(D + 2F)</code></td><td class="num">rarely the bound</td></tr>
+  </tbody>
+  <caption>Example: B·T=4M, L=64, D=8192 → <strong>84 TB no-remat; 4.2 TB block remat</strong>.</caption>
+</table></div>
+
+<p>The memory toggle below shows how the four ledger entries trade off as you drop weight precision from BF16 to FP4 — the parameter and gradient bars shrink while optimizer state (fp32, dtype-independent) and activations stay fixed.</p>
+
+<figure class="fig" data-fig="membar">
+  <figcaption class="figcap"><b>Figure 2 — The training memory ledger, by weight dtype.</b> For a 200B-active slice, weights and grads scale with the chosen dtype while fp32 Adam state (8 B/param) and activations are fixed — which is why low-precision weights help footprint but optimizer state is the stubborn ceiling. Toggle BF16 / FP8 / FP4.
+    <span class="meta"><span>Regime · <b>200B active, Adam</b></span><span>Evidence · <b>scaling-book memory ledger</b></span></span></figcaption>
+  <script type="application/json" class="spec">{ "paramsB":200,"activGB":200,"optBytes":8,
+    "dtypes":[
+      {"id":"bf16","w":2,"label":"BF16"},
+      {"id":"fp8","w":1,"label":"FP8"},
+      {"id":"fp4","w":0.5,"label":"FP4"}
+    ],
+    "parts":[
+      {"label":"Weights","perParam":"w","fam":"compute"},
+      {"label":"Adam m+v+master","perParam":"opt","fam":"optim"},
+      {"label":"Grads","perParam":"grad","fam":"comms"},
+      {"label":"Activations","perParam":"act","fam":"mem"}
+    ] }</script>
+</figure>
+
+<div class="callout note"><div class="ct">FlashAttention makes attention scratch O(N), not O(N²)</div>
+  <p>FlashAttention gives <code>Θ(N²d²/M)</code> HBM accesses (M=SRAM), block sizes <code>B_c=⌈M/4d⌉</code>, <code>B_r=min(⌈M/4d⌉,d)</code> (<a href="https://arxiv.org/abs/2205.14135">FlashAttention</a>). It does <em>more</em> GFLOPs (75.2 vs 66.6) but 9× fewer HBM bytes (4.4 vs 40.3 GB) → <strong>5.7× faster</strong>. Rabe-Staats lazy-softmax gives O(log n) / O(√n) memory on TPU (<a href="https://arxiv.org/abs/2112.05682">arXiv:2112.05682</a>).</p></div>
+
+<h2 id="collectives"><span class="sec-num">06</span>Collective costs — bytes on the wire and lower-bound time</h2>
+
+<p>Here <code>V</code> = total array bytes, <code>W</code> = bidirectional link bandwidth, <code>|X|</code> = shards on the axis, <code>num_axes</code> = mesh axes the collective spans. <strong>All ring costs are independent of device count</strong> (<a href="https://jax-ml.github.io/scaling-book/sharding/">Sharding</a>).</p>
+
+<div class="formula"><span class="lbl">comms</span>
+  <span class="eq">AllToAll (¼) &lt; AllGather = ReduceScatter (1) &lt; AllReduce (2)</span>
+  <span class="note">The cost hierarchy. AllGather and ReduceScatter are transposes: a fwd all-gather becomes a bwd reduce-scatter. AllReduce = RS + AG, hence 2×.</span></div>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Collective</th><th>Time (bandwidth-bound)</th><th class="num">Relative</th><th>Use it when</th></tr></thead>
+  <tbody>
+    <tr><td><span class="f-comms">AllGather</span></td><td><code>V / (W · num_axes)</code></td><td class="num">1</td><td>replicate a sharded array</td></tr>
+    <tr><td><span class="f-comms">ReduceScatter</span></td><td><code>V / (W · num_axes)</code></td><td class="num">1</td><td>sum + re-shard (= AG transpose)</td></tr>
+    <tr><td><span class="f-comms">AllReduce</span></td><td><code>2V / (W · num_axes)</code></td><td class="num">2</td><td>= RS + AG; sum to replicated</td></tr>
+    <tr><td><span class="f-comms">AllToAll</span> (1D ring)</td><td><code>V / (4W)</code></td><td class="num">¼</td><td>reshard / MoE routing — cheap!</td></tr>
+    <tr><td><span class="f-comms">AllToAll</span> (ND mesh)</td><td><code>V·max(axes) / (4·N·W)</code></td><td class="num">—</td><td>N = total devices</td></tr>
+  </tbody>
+  <caption>Per-hop: <code>T_hop = 2V/(|X|·W)</code>, ~<code>|X|/2</code> hops → <code>V/W</code>. Incomplete rings lose bidirectionality (~2× slower; a 4-device edge axis = 3 hops).</caption>
+</table></div>
+
+<div class="callout warn"><div class="ct">The latency floor — small buffers are latency-bound, not bandwidth-bound</div>
+  <p><code>T = max(T_min·|X|/2, V/W)</code> with <code>T_min ≈ 1 µs/hop</code>. A buffer is latency-bound below <code>W_unidir·T_min</code> per device = <strong>45 kB/device on v5e</strong>. AllGather hits ~95% of peak only at ~10 MB (~625 kB/device 16-way).</p></div>
+
+<p>The GPU collective formulas differ from the TPU ring forms and are what you actually plan against on GB200 (<a href="https://jax-ml.github.io/scaling-book/gpus/">GPUs</a>):</p>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Collective</th><th>GPU formula</th><th>Note</th></tr></thead>
+  <tbody>
+    <tr><td>Intra-node AG/RS</td><td><code>bytes·(N−1)/(N·W_egress) ≈ bytes/W_egress</code></td><td>≈ bytes/900e9 on B200</td></tr>
+    <tr><td>Intra-node AllToAll (dense)</td><td><code>B·(N−1)/(W·N²) ≈ B/(W·N)</code></td><td><b>2× faster than TPU ring</b> (B/4W vs B/8W)</td></tr>
+    <tr><td>Ragged AllToAll (k of N experts)</td><td><code>× min(k/N, 1)</code></td><td>the <span class="f-moe">MoE</span> win</td></tr>
+    <tr><td>AllReduce w/o SHARP</td><td><code>2 × AllGather</code></td><td>RS+AG</td></tr>
+    <tr><td>AllReduce w/ SHARP (in-NVSwitch)</td><td><code>bytes / W_egress</code></td><td>theory 2×, <b>~30% measured</b></td></tr>
+    <tr><td>Cross-node AG/RS (tree)</td><td><code>bytes · max_i[(D_i−1)/(D_i·W_link,i)]</code></td><td>H100 SuperPod ≈ 413 GB/s effective</td></tr>
+    <tr><td>Cross-node AllToAll</td><td><code>B·(M−1)/(M²·W_node) ≈ B/(M·W_node)</code></td><td>~50 vs 400 GB/s intra — <b>&gt;4× degradation</b></td></tr>
+  </tbody>
+  <caption>M = nodes. CollectiveEinsum (Wang et al.) overlaps the ring with the local matmul: 311 µs (blocking AG) → 244 µs (overlapped) → 224 µs (unsharded baseline) on v5e-8.</caption>
+</table></div>
+
+<h2 id="strategy-comms"><span class="sec-num">07</span>Per-parallelism-strategy comms volume &amp; the bandwidth-bound condition</h2>
+
+<p>For a transformer MLP block, with <code>α = C/W</code> (the network's "operational intensity," ≈2550 on a single v5p ICI axis) (<a href="https://jax-ml.github.io/scaling-book/training/">Training</a>, <a href="https://jax-ml.github.io/scaling-book/gpus/">GPUs</a>):</p>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Strategy</th><th>Comms/layer (bytes)</th><th>Compute-bound condition</th><th>Typical limit</th></tr></thead>
+  <tbody>
+    <tr><td><b>Data Parallel</b></td><td>2 AllReduce of grads = <code>8DF</code></td><td><code>B/X &gt; C/W</code></td><td>≥2500 tok/GPU (B200: ~5625; v5p 1-axis ~2550)</td></tr>
+    <tr><td><b>FSDP / ZeRO-3</b></td><td>AG weights <code>4DF</code> fwd + RS grads <code>8DF</code> bwd</td><td><code>B/X &gt; C/W</code></td><td>as DP but shards memory; can't exceed #sequences</td></tr>
+    <tr><td><b><span class="f-compute">Tensor</span> (Megatron)</b></td><td>AG+RS acts <code>4BD</code> fwd &amp; bwd</td><td><code>Y &lt; F·W/C</code> i.e. <code>Y &lt; M_Y·F/2550</code></td><td><b>~8-way</b> (≤16); precision-independent</td></tr>
+    <tr><td><b>Pipeline</b></td><td>adjacent-stage acts, <code>≈1.5·2BD/(W·L)</code></td><td>~always (single-hop)</td><td>bubble, not bandwidth; needs zero-bubble schedule</td></tr>
+    <tr><td><b><span class="f-moe">Expert</span> (EP)</b></td><td>2 AllToAll; <code>4BD·(Z−8)/(WZ)·min(8k/Z,1)</code></td><td><code>F &gt; 8·C/W_node</code> (multi-node)</td><td>keep within node/few nodes; prefer over TP</td></tr>
+    <tr><td><b>Context/Seq</b></td><td>= DP for MLP; attn needs KV gather / ring-attn</td><td><code>B/X &gt; C/W</code></td><td>extends DP past #sequences</td></tr>
+  </tbody>
+  <caption>"Tokens are tokens" — context/sequence parallelism is DP-equivalent for the MLP.</caption>
+</table></div>
+
+<p><strong>FSDP + TP combined</strong> is the workhorse at 100k-GPU scale, and the combination is what lets you stay compute-bound at a far smaller per-GPU batch:</p>
+
+<div class="formula"><span class="lbl">data</span>
+  <span class="eq">Compute-bound iff &nbsp; B/N &gt; α² / (M_X·M_Y·F) = 2550² / (2F) ≈ 100 tok/chip &nbsp;(F=32768)</span>
+  <span class="note">This ~8× reduction (850 → ~100 tok/chip) vs pure FSDP is the reason to combine. Total comms time = max(12DF/(Y·W·M_X), 12BD/(X·W·M_Y)); optimal FSDP degree X_opt = √((B/F)·(M_X/M_Y)·N) = √(2BN/F).</span></div>
+
+<div class="callout do"><div class="ct">Span nodes with model parallelism to divide the DP all-reduce</div>
+  <p>Model parallelism that spans nodes (PP/EP/TP) divides the DP all-reduce cost, letting you stay compute-bound at smaller per-GPU batch. Cross-pod/DCN: <code>T_comms = 8DF/(M·W_dcn)</code>, M = chips/slice; compute-bound iff <strong>per-pod batch &gt; C/W_dcn</strong> (= 73,440 tok/pod on v5p) (<a href="https://jax-ml.github.io/scaling-book/training/">Training</a>).</p></div>
+
+<div class="callout note"><div class="ct">The DeepSeek-V3 mesh, for calibration</div>
+  <p>DeepSeek-V3 used <strong>16-way PP × 64-way EP (8 nodes) × 2-way DP, no TP</strong>, at ~30k tok/GPU, NVLink ~160 GB/s / IB ~50 GB/s, all-to-all on 20 of 132 SMs, DualPipe hiding comms (<a href="https://arxiv.org/abs/2412.19437">DeepSeek-V3</a>). 2D weight-stationary FFN sharding (Pope et al.): <code>T_comm = 8BLE/(√n·BW)</code>, beats 1D when <code>√n_chips &gt; d_ff/d_model</code> i.e. n_chips &gt; 16 (<a href="https://arxiv.org/abs/2211.05102">ESTI</a>).</p></div>
+
+<h2 id="inference"><span class="sec-num">08</span>Inference rooflines</h2>
+
+<p>Prefill is essentially always compute-bound (maximize MFU); generation MLP switches at <code>B_crit</code>; generation attention is <em>never</em> compute-bound because the KV-cache reuse factor is small.</p>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Quantity</th><th>Formula</th><th>Use it when</th></tr></thead>
+  <tbody>
+    <tr><td>Linear <code>T_math</code></td><td><code>2BDF / C</code></td><td>prefill / MLP</td></tr>
+    <tr><td>Linear <code>T_comms</code></td><td><code>(2BD+2FD+2BF)/W_hbm</code></td><td>small batch</td></tr>
+    <tr><td>Compute-bound</td><td><code>B ≥ B_crit = C/W_hbm</code></td><td>240 v5e, ~280 B200/H100</td></tr>
+    <tr><td>Attn intensity (MHA)</td><td><code>ST/(S+T)</code></td><td>prefill <code>=T/2</code>; gen <code>≈1</code> (always BW-bound)</td></tr>
+    <tr><td><b>Step time (general)</b></td><td><code>B·KV/W_hbm + max(2B·P/C, P_bytes/W_hbm)</code></td><td>P=params; 1st term attn, 2nd MLP</td></tr>
+    <tr><td>Min step time</td><td><code>(B·KV + P_bytes)/W_hbm</code></td><td>decode latency floor</td></tr>
+    <tr><td>Max tokens/s</td><td><code>B·W_hbm / (B·KV + P_bytes)</code></td><td>throughput ceiling</td></tr>
+    <tr><td>Gen model-parallel crossover</td><td>ICI-bound when <code>Y &gt; F/(B·β)</code>, <code>β ≈ 8</code></td><td>shard further when memory-bound</td></tr>
+    <tr><td>2D weight-stationary</td><td><code>T = 2BD/(X·W) + 4BF/(YZ·W)</code></td><td>large-N decode (beats 1D when N &gt; ~72 chips)</td></tr>
+    <tr><td>Latency-bound collective</td><td>shard buffer <code>&lt; 45 kB · n_shards</code></td><td>sub-µs/shard</td></tr>
+  </tbody>
+  <caption>Multi-query/GQA decode intensity ratio <code>Θ(1/d + n/(d·h) + 1/b)</code> — the <code>n/d</code> term is cut by <code>h</code> (<a href="https://arxiv.org/abs/1911.02150">MQA</a>, <a href="https://arxiv.org/abs/2305.13245">GQA</a>). MQA-XXL ran 5.4× faster than MHA-XXL at equal quality; 8 groups is the GQA sweet spot.</caption>
+</table></div>
+
+<div class="callout do"><div class="ct">Disaggregate prefill from decode, ~3:1</div>
+  <p>Balance prefill:generate servers via <code>P/prefill_lat = B·G/(gen_lat·median_decode)</code> → <strong>~3:1 for 8k prefill / 512 decode</strong>. Tokens evicted/step = <code>B·(P+G)/G</code>. For throughput, use the largest per-chip batch that fits.</p></div>
+
+<div class="callout note"><div class="ct">Speculative decoding wins whenever α &gt; c</div>
+  <p>Expected tokens/step <code>(1−α^(γ+1))/(1−α)</code>; walltime speedup <code>(1−α^(γ+1))/((1−α)(γc+1))</code>; wins whenever <strong>α &gt; c</strong> (<a href="https://arxiv.org/abs/2211.17192">Leviathan et al.</a>). Cuts HBM reads (memory-bound win), raises FLOPs/concurrency. Measured 2–3×; empirical acceptance ~3–4 tokens (NL), more for code.</p></div>
+
+<h2 id="batch-heuristics"><span class="sec-num">09</span>Batch-size &amp; critical-batch heuristics</h2>
+
+<p>A consolidated table of every threshold — pin this one to the wall. Each is a "below this → bound by X" rule.</p>
+
+<div class="tablewrap"><table class="data">
+  <thead><tr><th>Threshold</th><th class="num">Value</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td>Matmul compute-bound (per-replica tokens)</td><td class="num"><b>240</b> v5e / <b>281</b> B200 / 295 H100</td><td>below → memory-bound</td></tr>
+    <tr><td>Weight-only int8/fp8</td><td class="num"><b>120</b></td><td>halved</td></tr>
+    <tr><td>DP/FSDP min batch/device</td><td class="num"><code>C/W</code> ≈ 2550 (v5p), <b>~5625 (B200)</b></td><td>below → comms-bound</td></tr>
+    <tr><td>FSDP+TP min batch/chip</td><td class="num"><code>2550²/(2F)</code> ≈ <b>100</b></td><td>the combined floor</td></tr>
+    <tr><td>TP max degree</td><td class="num"><code>Y &lt; F·W/C</code> → <b>~8-way</b></td><td>beyond → NVLink/ICI-bound</td></tr>
+    <tr><td>Cross-pod min batch/pod</td><td class="num"><code>C/W_dcn</code> (73,440 on v5p)</td><td>below → DCN-bound</td></tr>
+    <tr><td><span class="f-moe">MoE</span> generation batch</td><td class="num"><code>120·E/k</code> (3840 for E=256,k=8)</td><td>to keep experts compute-bound</td></tr>
+    <tr><td>Generation throughput</td><td class="num">largest per-chip batch up to <code>B_crit</code></td><td>KV memory permitting</td></tr>
+  </tbody>
+  <caption>The single sheet of "below this number, you are bound by X" rules.</caption>
+</table></div>
+
+<div class="callout note"><div class="ct">Critical batch is statistical, not roofline — ramp it</div>
+  <p>DeepSeek-V3 ramped global batch <strong>3072 → 15360 over the first 469B tokens</strong>, peak LR 2.2e-4 (2k-step warmup) → 2.2e-5 cosine (<a href="https://arxiv.org/abs/2412.19437">DeepSeek-V3</a>). LR–width coupling (Vaswani): <code>lrate = d_model^(−0.5)·min(step^(−0.5), step·warmup^(−1.5))</code>, warmup 4000.</p></div>
+
+<h2 id="templates"><span class="sec-num">10</span>Worked back-of-envelope templates</h2>
+
+<p>Instantiate these for your run — they chain the formulas above into the three questions you actually ask: how long, how many chips to fit, how many to serve.</p>
+
+<div class="formula"><span class="lbl">data</span>
+  <span class="eq">Training time: &nbsp; T = 6 · P · tokens / (n_chips · C · MFU)</span>
+  <span class="note">LLaMA-3 70B: 6·70e9·15e12 = 6.3e24 FLOPs; 8960-chip v5p pod @ 40% MFU → 44 days. On 4096 H100 @ 45% → ~40 days.</span></div>
+
+<div class="codecard">
+  <div class="src-meta"><span class="file">scaling_cheatsheet.py</span><span class="tag">back-of-envelope templates</span><span class="tag">illustrative</span></div>
+  <div class="annot-grid">
+<pre class="code"><code>def training_days(P, tokens, n_chips, C, mfu):          # [1]
+    flops = 6 * P * tokens                              # 6 = 2 fwd + 4 bwd
+    return flops / (n_chips * C * mfu) / 86400
+
+def min_chips_to_fit(P, hbm, opt_bytes=8, ckpt_bytes=0):  # [2]
+    # weights(2) + optimizer(8 Adam / ~4 Muon) + checkpoints
+    return ((2 + opt_bytes) * P + ckpt_bytes) / hbm
+
+def serve_step_ms(P, kv_per_tok, B, S, W_hbm):         # [3]
+    bytes_moved = P * 1 + kv_per_tok * S * B           # int8 weights
+    return bytes_moved / W_hbm * 1e3                   # min step = load once
+
+# LLaMA-3 70B @ 8960 v5p, 40% MFU, 15T tok:
+training_days(70e9, 15e12, 8960, 4.59e14, 0.40)        # ~= 44 days  [4]
+</code></pre>
+    <div class="annot-list">
+      <div class="annot"><p><span class="badge">1</span><span class="anh">6·P·tokens is the whole budget.</span> Divide by aggregate FLOP/s × MFU; <code>/86400</code> converts seconds to days.</p></div>
+      <div class="annot"><p><span class="badge">2</span><span class="anh">Memory floor, not the real cluster.</span> <span class="f-optim">Muon</span> drops <code>opt_bytes</code> 8→~4 (one fewer fp32 buffer). LLaMA-3 70B 4M-batch = 140 GB params + 560 GB optimizer + 20.9 TB checkpoints = 21.6 TB → ≥225 v5p.</p></div>
+      <div class="annot"><p><span class="badge">3</span><span class="anh">Decode is bandwidth-bound.</span> Min step time = load weights + KV once: <code>(B·KV + P_bytes)/W_hbm</code>. LLaMA-3 70B int8 serve: 70 GB params + 41.9 GB KV (B=32, 8k) = 112 GB → 7 v5e → <code>112e9/(8·8.2e11)</code> = 17 ms → 1882 tok/s.</p></div>
+      <div class="annot"><p><span class="badge">4</span><span class="anh">Use big clusters for FLOPs, not memory.</span> The min-chips-to-fit figure is a floor; you provision far more for throughput. On 4096 H100 @ 45% the same run is ~40 days.</p></div>
+    </div>
+  </div>
+</div>
+
+<div class="callout key"><div class="ct">The 10T / 200B on 100k GB200 instantiation</div>
+  <p>Sparsity <code>E/k</code> sets activated-param FLOPs <code>= 6·200e9·tokens</code>; total params 10T sets memory <code>= 10e12·(2 + optimizer)/sharding</code>. With <span class="f-optim">Muon</span> (~6 B/param) the parameter+optimizer footprint is <strong>~60 TB</strong>, spread by <span class="f-moe">EP</span>×FSDP across the 100k-GPU / ~1389-node NVL72 fabric. Keep <span class="f-moe">EP</span> within an NVL72 domain (72 GPUs) where AllToAll is 900 GB/s, since cross-node AllToAll degrades &gt;4×; stay compute-bound by holding per-GPU batch above <code>C/W ≈ 5625</code> for DP/FSDP and <code>2250e12/900e9 = 2500</code> for <span class="f-compute">TP</span>, capping TP at ~8-way and pushing the rest into PP+EP. <span class="f-moe">MoE</span> generation batch must exceed <code>120·E/k</code> to keep experts compute-bound.</p></div>
+
+<div class="sources"><h3>Sources</h3><ul>
+  <li>JAX <em>How To Scale Your Model</em> (landing): <a href="https://jax-ml.github.io/scaling-book/">jax-ml.github.io/scaling-book</a></li>
+  <li>Rooflines: <a href="https://jax-ml.github.io/scaling-book/roofline/">scaling-book/roofline</a></li>
+  <li>Sharding (collective costs): <a href="https://jax-ml.github.io/scaling-book/sharding/">scaling-book/sharding</a></li>
+  <li>Transformers (FLOPs, KV cache, activations): <a href="https://jax-ml.github.io/scaling-book/transformers/">scaling-book/transformers</a></li>
+  <li>Training (per-strategy comms, FSDP+TP, DCN): <a href="https://jax-ml.github.io/scaling-book/training/">scaling-book/training</a></li>
+  <li>Inference (rooflines, step time, disaggregation): <a href="https://jax-ml.github.io/scaling-book/inference/">scaling-book/inference</a></li>
+  <li>GPUs (GPU collective formulas): <a href="https://jax-ml.github.io/scaling-book/gpus/">scaling-book/gpus</a></li>
+  <li>GLU Variants (SwiGLU d_ff = 2/3 rule): <a href="https://arxiv.org/abs/2002.05202">arxiv.org/abs/2002.05202</a></li>
+  <li>DeepSeek-V3 (MLA, batch ramp, mesh, DualPipe): <a href="https://arxiv.org/abs/2412.19437">arxiv.org/abs/2412.19437</a></li>
+  <li>vLLM / PagedAttention (KV paging, fragmentation): <a href="https://arxiv.org/abs/2309.06180">arxiv.org/abs/2309.06180</a></li>
+  <li>FlashAttention (O(N) attention scratch): <a href="https://arxiv.org/abs/2205.14135">arxiv.org/abs/2205.14135</a></li>
+  <li>Rabe-Staats lazy-softmax (O(√n) memory): <a href="https://arxiv.org/abs/2112.05682">arxiv.org/abs/2112.05682</a></li>
+  <li>ESTI / 2D weight-stationary FFN sharding (Pope et al.): <a href="https://arxiv.org/abs/2211.05102">arxiv.org/abs/2211.05102</a></li>
+  <li>MQA (multi-query attention): <a href="https://arxiv.org/abs/1911.02150">arxiv.org/abs/1911.02150</a></li>
+  <li>GQA (grouped-query attention): <a href="https://arxiv.org/abs/2305.13245">arxiv.org/abs/2305.13245</a></li>
+  <li>Speculative decoding (Leviathan et al.): <a href="https://arxiv.org/abs/2211.17192">arxiv.org/abs/2211.17192</a></li>
+</ul></div>
+
+<nav class="chnav"><a class="prev" href="ch20.html"><span class="dir">← Previous</span><span class="t">The punch-list</span></a><a class="next" href="apxB.html"><span class="dir">Next →</span><span class="t">Appendix B · Operational reality</span></a></nav>
+</main>
+<script src="book.js"></script>
+</body>
+</html>
