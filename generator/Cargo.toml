@@ -1,0 +1,10 @@
+[package]
+name = "atlasgen"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pulldown-cmark = "0.13"
+
+[profile.release]
+opt-level = 2
