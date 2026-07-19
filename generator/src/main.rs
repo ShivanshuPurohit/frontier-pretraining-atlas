@@ -1,5 +1,5 @@
 // atlasgen — static site generator for The Frontier Pretraining Atlas.
-// Reads content/*.md (front matter, 23 chapters, appendix), emits plain
+// Reads content/*.md (front matter, 25 chapters, appendix), emits plain
 // HTML + one stylesheet at the repo root. No JavaScript anywhere.
 
 use pulldown_cmark::{html, Options, Parser};
@@ -17,11 +17,11 @@ const SNAPSHOT: &str = "July 13, 2026 snapshot";
 
 const PARTS: &[(u32, u32, &str, &str)] = &[
     (1, 4, "Part I", "The Evidence Base"),
-    (5, 9, "Part II", "The Model"),
-    (10, 13, "Part III", "The Data"),
-    (14, 18, "Part IV", "The Machine"),
-    (19, 21, "Part V", "The Run"),
-    (22, 23, "Part VI", "The Ledger"),
+    (5, 11, "Part II", "The Model"),
+    (12, 15, "Part III", "The Data"),
+    (16, 20, "Part IV", "The Machine"),
+    (21, 23, "Part V", "The Run"),
+    (24, 25, "Part VI", "The Ledger"),
 ];
 
 const PROVENANCE_TAGS: &[&str] = &[
@@ -135,8 +135,8 @@ fn main() {
         title: book_title.clone(),
         subtitle: Some(book_subtitle.clone()),
         body_md: fm_body.clone(),
-        blurb: "What this book is, how it was built, the provenance-tier legend, three reading \
-                paths, the executive summary, and the ten-decision shortlist."
+        blurb: "The question the book answers, how to read it, three reading paths, and the \
+                executive summary."
             .into(),
         pos: "Front matter".into(),
         anchor: "front-matter".into(),
@@ -170,7 +170,7 @@ fn main() {
             subtitle: None,
             body_md: body,
             blurb: blurb_for(num),
-            pos: format!("{} / 23", num),
+            pos: format!("{} / 25", num),
             anchor: format!("ch-{}", num),
             chp: num.to_string(),
         });
@@ -187,7 +187,7 @@ fn main() {
         body_md: trim_rules(&apx_raw[apx_raw.find('\n').unwrap() + 1..]),
         blurb: "Every load-bearing number in the book — silicon, networking, MFU, cost, \
                 reliability, data — in one master table, each row carrying its provenance \
-                tag and source."
+                grade and source."
             .into(),
         pos: "Appendix A".into(),
         anchor: "appendix".into(),
@@ -282,7 +282,7 @@ fn main() {
     idx.push_str(
         "<div class=\"byline\">\n\
          <div><span class=\"bl\">Author</span>Shivanshu Purohit</div>\n\
-         <div><span class=\"bl\">Research &amp; drafting</span>Claude, a multi-agent fleet</div>\n\
+         <div><span class=\"bl\">Research &amp; drafting</span>Claude</div>\n\
          <div><span class=\"bl\">Snapshot</span>July 13, 2026</div>\n\
          </div>\n",
     );
@@ -290,9 +290,10 @@ fn main() {
         "<table class=\"spec\">\n\
          <tr><th>Model frame</th><td>10T total · 200B active · MoE</td></tr>\n\
          <tr><th>Fleet frame</th><td>100,000 GB200 NVL72</td></tr>\n\
-         <tr><th>Scope</th><td>23 chapters · front matter · appendix</td></tr>\n\
+         <tr><th>Scope</th><td>25 chapters · front matter · appendix</td></tr>\n\
          <tr><th>Length</th><td>{}</td></tr>\n\
-         <tr><th>Sources</th><td>250+, every claim provenance-tagged</td></tr>\n\
+         <tr><th>Sources</th><td>250+ · every claim carries its source inline</td></tr>\n\
+         <tr><th>Edition</th><td>v2.3 — expanded to 25 chapters, prose rewritten (July 19, 2026)</td></tr>\n\
          </table>\n",
         words_disp
     ));

@@ -8,7 +8,7 @@
 <meta name="theme-color" media="(prefers-color-scheme: light)" content="#ffffff">
 <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#101312">
 <title>Master Hard-Numbers Table · The Frontier Pretraining Atlas</title>
-<meta name="description" content="Every load-bearing number in the book — silicon, networking, MFU, cost, reliability, data — in one master table, each row carrying its provenance tag and source.">
+<meta name="description" content="Every load-bearing number in the book — silicon, networking, MFU, cost, reliability, data — in one master table, each row carrying its provenance grade and source.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23245f4f'/%3E%3Cg fill='%23f6f4ec'%3E%3Ccircle cx='16' cy='16' r='5' opacity='.32'/%3E%3Ccircle cx='32' cy='16' r='5'/%3E%3Ccircle cx='48' cy='16' r='5' opacity='.32'/%3E%3Ccircle cx='16' cy='32' r='5' opacity='.32'/%3E%3Ccircle cx='32' cy='32' r='5' opacity='.32'/%3E%3Ccircle cx='48' cy='32' r='5' opacity='.32'/%3E%3Ccircle cx='16' cy='48' r='5'/%3E%3Ccircle cx='32' cy='48' r='5' opacity='.32'/%3E%3Ccircle cx='48' cy='48' r='5' opacity='.32'/%3E%3C/g%3E%3C/svg%3E">
 <link rel="stylesheet" href="style.css?v=781c36ad">
 </head>
@@ -25,25 +25,27 @@
 <a class="cell" href="ch-02-what-the-labs-let-slip.html" title="2. What the Closed Labs Let Slip">2</a>
 <a class="cell" href="ch-03-chinese-open-frontier.html" title="3. The Open Frontier">3</a>
 <a class="cell" href="ch-04-deepseek-reference-stack.html" title="4. DeepSeek">4</a>
-<a class="cell" href="ch-05-moe-design-space.html" title="5. The MoE Design Space and a 10T/200B Strawman">5</a>
-<a class="cell" href="ch-06-scaling-laws-in-practice.html" title="6. Scaling Laws as Practiced on Proprietary Data">6</a>
-<a class="cell" href="ch-07-optimizers-and-stability.html" title="7. Optimizers and Stability at 10T Parameters">7</a>
-<a class="cell" href="ch-08-precision-numerics.html" title="8. Precision">8</a>
-<a class="cell" href="ch-09-multimodal-native.html" title="9. Multimodal-Native Pretraining as the 2026 Default">9</a>
-<a class="cell" href="ch-10-data-supply-chain.html" title="10. The Data Supply Chain">10</a>
-<a class="cell" href="ch-11-curation-beyond-essential-web.html" title="11. Curation SOTA and What Lies Beyond Essential-Web">11</a>
-<a class="cell" href="ch-12-midtraining-curriculum.html" title="12. Midtraining, Mixtures, and the Endgame Curriculum">12</a>
-<a class="cell" href="ch-13-input-pipeline.html" title="13. The Input Pipeline">13</a>
-<a class="cell" href="ch-14-hardware-ground-truth.html" title="14. GB200 NVL72 Ground Truth and the Alternative Silicon Question">14</a>
-<a class="cell" href="ch-15-kernels-blackwell.html" title="15. Kernels for Blackwell">15</a>
-<a class="cell" href="ch-16-parallelism-math.html" title="16. The Parallelism Math for 10T/200B on 100k GB200">16</a>
-<a class="cell" href="ch-17-frameworks.html" title="17. Frameworks">17</a>
-<a class="cell" href="ch-18-networking-100k.html" title="18. Networking at 100k">18</a>
-<a class="cell" href="ch-19-fault-tolerance-goodput.html" title="19. Fault Tolerance, Checkpointing, and Goodput">19</a>
-<a class="cell" href="ch-20-operations-doctrine.html" title="20. Operations">20</a>
-<a class="cell" href="ch-21-benchmarks-money-math.html" title="21. Benchmarks and the Money Math">21</a>
-<a class="cell" href="ch-22-the-gap-list.html" title="22. The Gap List">22</a>
-<a class="cell" href="ch-23-source-atlas.html" title="23. The Source Atlas">23</a>
+<a class="cell" href="ch-05-anatomy-frontier-model.html" title="5. Anatomy of a 2026 Frontier Model">5</a>
+<a class="cell" href="ch-06-attention-zoo.html" title="6. The Attention Zoo">6</a>
+<a class="cell" href="ch-07-moe-design-space.html" title="7. The MoE Design Space and a 10T/200B Strawman">7</a>
+<a class="cell" href="ch-08-scaling-laws-in-practice.html" title="8. Scaling Laws as Practiced on Proprietary Data">8</a>
+<a class="cell" href="ch-09-optimizers-and-stability.html" title="9. Optimizers and Stability at 10T Parameters">9</a>
+<a class="cell" href="ch-10-precision-numerics.html" title="10. Precision">10</a>
+<a class="cell" href="ch-11-multimodal-native.html" title="11. Multimodal-Native Pretraining as the 2026 Default">11</a>
+<a class="cell" href="ch-12-data-supply-chain.html" title="12. The Data Supply Chain">12</a>
+<a class="cell" href="ch-13-curation-beyond-essential-web.html" title="13. Curation SOTA and What Lies Beyond Essential-Web">13</a>
+<a class="cell" href="ch-14-midtraining-curriculum.html" title="14. Midtraining, Mixtures, and the Endgame Curriculum">14</a>
+<a class="cell" href="ch-15-input-pipeline.html" title="15. The Input Pipeline">15</a>
+<a class="cell" href="ch-16-hardware-ground-truth.html" title="16. GB200 NVL72 Ground Truth and the Alternative Silicon Question">16</a>
+<a class="cell" href="ch-17-kernels-blackwell.html" title="17. Kernels for Blackwell">17</a>
+<a class="cell" href="ch-18-parallelism-math.html" title="18. The Parallelism Math for 10T/200B on 100k GB200">18</a>
+<a class="cell" href="ch-19-frameworks.html" title="19. Frameworks">19</a>
+<a class="cell" href="ch-20-networking-100k.html" title="20. Networking at 100k">20</a>
+<a class="cell" href="ch-21-fault-tolerance-goodput.html" title="21. Fault Tolerance, Checkpointing, and Goodput">21</a>
+<a class="cell" href="ch-22-operations-doctrine.html" title="22. Operations">22</a>
+<a class="cell" href="ch-23-benchmarks-money-math.html" title="23. Benchmarks and the Money Math">23</a>
+<a class="cell" href="ch-24-the-gap-list.html" title="24. The Gap List">24</a>
+<a class="cell" href="ch-25-source-atlas.html" title="25. The Source Atlas">25</a>
 <a class="cell on" href="appendix.html" title="Appendix A — Master Hard-Numbers Table">A</a>
 </nav>
 <nav class="rail-links">
@@ -60,7 +62,7 @@
 <header class="chapter-head">
 <p class="eyebrow">Appendix A</p>
 <h1 class="chapter-title">Master Hard-Numbers Table</h1>
-<p class="vitals">8 sections · 42 tables · ≈15.1k words</p>
+<p class="vitals">8 sections · 42 tables · ≈15.3k words</p>
 </header>
 <details class="contents"><summary>Contents</summary><ol>
 <li><a href="#a-1-silicon-amp-systems">A.1 Silicon &amp; Systems</a></li>
@@ -72,9 +74,9 @@
 <li><a href="#a-7-model-configs-2025-2026-corpus-coverage">A.7 Model Configs (2025–2026 corpus coverage)</a></li>
 <li><a href="#a-8-costs">A.8 Costs</a></li>
 </ol></details>
-<p>Compiled from the “Hard numbers” sections of all 42 research-note files in <code>pretraining-2026-research/notes/</code> (01–53). Each row carries: the value, its context, the citing source, a provenance tag (how confident/primary the sourcing is), and a date. Where the same fact appears in multiple notes, the best-sourced instance is kept and duplicates are dropped silently. Where notes genuinely disagree — different numbers for what should be the same quantity — both rows are kept and marked <strong><span class="cite loud">[CONFLICT]</span></strong>.</p>
-<p><strong>Silicon note:</strong> <code>notes/30-gb200-nvl72-peak-flops-reconciliation.md</code> is treated as authoritative for all GB200 NVL72 / HGX B200 per-GPU peak-FLOPS figures; it reconciles the NVIDIA Blackwell datasheet against every other note’s derived numbers and finds them consistent to rounding except where flagged. Downstream MFU calculations elsewhere in the corpus that used a slightly-off denominator (e.g., 4,500 vs. the correct 5,000 TFLOPS/GPU dense FP8 for GB200 NVL72) are noted where material.</p>
-<p><strong>Provenance tags:</strong> PAPER (arXiv/peer-reviewed), OFFICIAL (vendor/lab blog, docs, product page, statement), CODE (repo/README/benchmark script), BENCHMARK (independent measured benchmark), DERIVED (calculated by a note’s author from other primary numbers), HEARSAY (secondary press/aggregation/paywalled analysis), SPOKEN (podcast/interview claim, unverified), LOGBOOK (primary training chronicle), THESIS, UNVERIFIED (explicitly flagged unconfirmed by the sourcing note).</p>
+<p>The hard numbers behind Chapters 1–24, collected into one master table. Each row carries: the value, its context, the citing source, a provenance grade (how confident/primary the sourcing is), and a date. Where the same fact appears in several chapters, the best-sourced instance is kept and duplicates are dropped silently. Where sources genuinely disagree — different numbers for what should be the same quantity — both rows are kept and marked <strong><span class="cite loud">[CONFLICT]</span></strong>.</p>
+<p><strong>Silicon note:</strong> Ch16’s GB200 reconciliation is authoritative for all GB200 NVL72 / HGX B200 per-GPU peak-FLOPS figures; it reconciles the NVIDIA Blackwell datasheet against every derived number here and finds them consistent to rounding except where flagged. Downstream MFU calculations that used a slightly-off denominator (e.g., 4,500 vs. the correct 5,000 TFLOPS/GPU dense FP8 for GB200 NVL72) are noted where material.</p>
+<p><strong>Provenance grades</strong> (matching Ch1’s source-type ordering): PAPER (arXiv/peer-reviewed), OFFICIAL (vendor/lab blog, docs, product page, statement), CODE (repo/README/benchmark script), BENCHMARK (independent measured benchmark), DERIVED (our own arithmetic from other primary numbers), HEARSAY (secondary press/aggregation/paywalled analysis), SPOKEN (podcast/interview claim, unverified), LOGBOOK (primary training chronicle), THESIS, UNVERIFIED (explicitly unconfirmed).</p>
 <hr />
 <h2 id="a-1-silicon-amp-systems">A.1 Silicon &amp; Systems</h2>
 <h3 id="a-1-1-nvidia-hopper-pre-blackwell">A.1.1 NVIDIA Hopper / pre-Blackwell</h3>
@@ -112,7 +114,7 @@
 <tr><td>80% unidirectional / 38% duplex efficiency of 450/900 GB/s spec</td><td>GB200 NVLink-C2C measured (<code>nvbandwidth</code>, DGX Station, half GB300 module)</td><td>Stas repo</td><td>BENCHMARK</td><td>2026-07</td></tr>
 <tr><td>96.3%/96.0%/96.2%/96.3%/98.2% of peak</td><td>B200 measured tensor-core efficiency at realistic tile shape, FP8/FP6/FP4/BF16/INT8</td><td>arXiv:2512.02189v2</td><td>BENCHMARK</td><td>2025-12</td></tr>
 <tr><td>3,850.6/5,134.4/7,700.2/1,926.4 TFLOPS; 3,928.5 TOPS</td><td>B200 measured (not peak-spec) at m64n8k16 tile, FP8/FP6/FP4/BF16/INT8</td><td>arXiv:2512.02189v2</td><td>BENCHMARK</td><td>2025-12</td></tr>
-<tr><td>Implied theoretical peak ≈4,000 TFLOPS FP8 (from 3,850.6/96.3%)</td><td>Below even HGX B200’s 4,500 dense spec — internal inconsistency flagged in the paper’s own baseline</td><td>arXiv:2512.02189v2, cross-checked by notes/30</td><td><strong>[CONFLICT — likely erroneous 3rd-party benchmark baseline]</strong></td><td>2025-12</td></tr>
+<tr><td>Implied theoretical peak ≈4,000 TFLOPS FP8 (from 3,850.6/96.3%)</td><td>Below even HGX B200’s 4,500 dense spec — internal inconsistency flagged in the paper’s own baseline</td><td>arXiv:2512.02189v2, cross-checked in Ch16</td><td><strong>[CONFLICT — likely erroneous 3rd-party benchmark baseline]</strong></td><td>2025-12</td></tr>
 <tr><td>~1.27×</td><td>B200 vs. H200 speedup, consistent across precisions at raw tensor-core level</td><td>arXiv:2512.02189v2</td><td>BENCHMARK</td><td>2025-12</td></tr>
 <tr><td>148 total SMs (74/die active of 80 physical, 6 disabled/die)</td><td>B200 two-die chiplet</td><td>Chips and Cheese teardown</td><td>HEARSAY</td><td>2025</td></tr>
 <tr><td>21 TB/s same-partition vs. 16.8 TB/s cross-partition L2 (126 MB total)</td><td>B200 L2 cache</td><td>Chips and Cheese teardown</td><td>HEARSAY</td><td>2025</td></tr>
@@ -125,7 +127,7 @@
 </tbody></table></div></figure>
 <h3 id="a-1-3-nvidia-rubin-pre-launch-specs">A.1.3 NVIDIA Rubin (pre-launch specs)</h3>
 <figure class="table" id="table-a-3"><figcaption class="table-no">Table A.3</figcaption><div class="scroll"><table><thead><tr><th>Value</th><th>Context</th><th>Source</th><th>Provenance</th><th>Date</th></tr></thead><tbody>
-<tr><td>4,000 BF16 / 17,500 FP8 / 35,000 FP4-NVFP4 TFLOPS dense</td><td>Rubin SXM pre-launch spec</td><td>Stas repo</td><td>OFFICIAL</td><td>2026-07</td></tr>
+<tr><td>4,000 BF16 / 17,500 FP8 / 35,000 FP4-NVFP4 TFLOPS dense</td><td>Rubin SXM pre-launch spec — <strong><span class="cite loud">[CHECK]</span></strong>: implies FP8:BF16 = 4.375×, breaking the exact 2× ratio every generation since Hopper has held; verify against launch datasheet before reuse</td><td>Stas repo</td><td>OFFICIAL</td><td>2026-07</td></tr>
 <tr><td>35 PFLOPS dense FP4 / 50 PFLOPS “compressed”</td><td>Rubin GPU</td><td>SemiAnalysis</td><td>HEARSAY</td><td>2026-02</td></tr>
 <tr><td>22 TB/s target / ~20 TB/s realistic</td><td>Rubin HBM4 bandwidth</td><td>SemiAnalysis</td><td>HEARSAY</td><td>2026-02</td></tr>
 <tr><td>2,300 W (Max-P) / 1,800 W (Max-Q)</td><td>Rubin GPU TDP</td><td>SemiAnalysis</td><td>HEARSAY</td><td>2026-02</td></tr>
@@ -166,8 +168,8 @@
 <tr><td>91 exaFLOPS</td><td>Single TPU v6e cluster peak (4× largest v5p cluster)</td><td>Google Cloud Blog</td><td>OFFICIAL</td><td>2024</td></tr>
 <tr><td>9,216 chips/pod, 1,200 GB/s/chip bidirectional ICI</td><td>TPU7x (Ironwood) pod ceiling</td><td>docs.cloud.google.com/tpu/tpu7x</td><td>OFFICIAL</td><td>GA 2025-11</td></tr>
 <tr><td>8,960 chips/pod, 4,800 Gbps/chip ICI</td><td>TPU v5p pod ceiling</td><td>Google Cloud Docs</td><td>OFFICIAL</td><td>—</td></tr>
-<tr><td>4,096 chips/SuperPod</td><td>Gemini TPUv4 SuperPod unit</td><td>Gemini 1.5 Technical Report</td><td>PAPER</td><td>2024-03</td></tr>
-<tr><td>~10 seconds</td><td>OCS reconfiguration time, 4×4×4 cube → arbitrary 3D torus</td><td>Gemini 1.5 report</td><td>PAPER</td><td>2024-03</td></tr>
+<tr><td>4,096 chips/SuperPod</td><td>Gemini TPUv4 SuperPod unit</td><td>Gemini 1.0 Technical Report (arXiv:2312.11805; routinely misattributed to 1.5)</td><td>PAPER</td><td>2023-12</td></tr>
+<tr><td>~10 seconds</td><td>OCS reconfiguration time, 4×4×4 cube → arbitrary 3D torus</td><td>Gemini 1.0 report (arXiv:2312.11805)</td><td>PAPER</td><td>2023-12</td></tr>
 </tbody></table></div></figure>
 <h3 id="a-1-5-aws-trainium">A.1.5 AWS Trainium</h3>
 <figure class="table" id="table-a-5"><figcaption class="table-no">Table A.5</figcaption><div class="scroll"><table><thead><tr><th>Value</th><th>Context</th><th>Source</th><th>Provenance</th><th>Date</th></tr></thead><tbody>
@@ -249,8 +251,8 @@
 <tr><td>Up to 9×</td><td>NCCL 2.27 symmetric-memory latency reduction, small messages</td><td>NVIDIA official blog</td><td>OFFICIAL</td><td>2025</td></tr>
 <tr><td>16→6 SMs (2.7×) reduction</td><td>NCCL 2.27 SHARP AllGather/ReduceScatter SM usage</td><td>NVIDIA official blog</td><td>OFFICIAL</td><td>2025</td></tr>
 <tr><td>~1–2% gap</td><td>NCCL 2.28 GIN vs. NVSHMEM device-initiated performance</td><td>arXiv:2606.05951</td><td>PAPER</td><td>2026-06</td></tr>
-<tr><td>Up to 12% per-step latency reduction (Llama4); up to 11× cluster-init speedup @96K GPU; 15–80% inference decode-latency gain</td><td>NCCLX (Meta)</td><td>arXiv:2510.20171</td><td>PAPER</td><td>2026-01</td></tr>
-<tr><td>7× / 15× / 30×</td><td>NCCLX latency multiplier: same-rack → cross-AI-Zone → cross-DC-building</td><td>arXiv:2510.20171</td><td>PAPER</td><td>2026-01</td></tr>
+<tr><td>Up to 12% per-step latency reduction (Llama4); up to 11× cluster-init speedup @96K GPU; 15–80% inference decode-latency gain</td><td>NCCLX (Meta)</td><td>arXiv:2510.20171</td><td>PAPER</td><td>2025-10</td></tr>
+<tr><td>7× / 15× / 30×</td><td>NCCLX latency multiplier: same-rack → cross-AI-Zone → cross-DC-building</td><td>arXiv:2510.20171</td><td>PAPER</td><td>2025-10</td></tr>
 <tr><td>Up to 3.8× / 15%</td><td>MSCCL++ speedup vs. NCCL (collectives / real inference workloads)</td><td>arXiv:2504.09014</td><td>PAPER</td><td>2026-03</td></tr>
 <tr><td>200 Gbps, 120 Mops/s</td><td>Google Falcon first hardware implementation</td><td>Google SIGCOMM’25</td><td>PAPER</td><td>2025</td></tr>
 <tr><td>Up to 8× lower completion time, 65% higher goodput vs. CX-7 RoCE under congestion</td><td>Falcon vs. standard RoCE</td><td>Google SIGCOMM’25</td><td>PAPER</td><td>2025</td></tr>
@@ -331,7 +333,7 @@
 <tr><td>GB300 1.26 min vs. GB200 1.598 min vs. 64×B200 2.019 min</td><td>Llama-2-70B-LoRA, v5.1</td><td>Lambda blog</td><td>OFFICIAL</td><td>2025-11</td></tr>
 <tr><td>MI300X 27.95 min → MI325X 21.05 min → MI355X 10.18 min</td><td>AMD Llama-2-70B-LoRA generational progression</td><td>AMD/ROCm blogs</td><td>OFFICIAL</td><td>2025</td></tr>
 <tr><td>MI355X within 3–6% of B200/B300</td><td>Llama-2-70B-LoRA and Llama-3.1-8B, v5.1</td><td>ROCm blog</td><td>OFFICIAL</td><td>2025-11</td></tr>
-<tr><td>DeepSeek-V3-671B: GB300 NVL72, 8,192 GPUs, 2.02 min to target quality; GB300 1.6× faster than GB200 at same scale; 1,298→1,648 TFLOPS/GPU in 3 months</td><td>MLPerf v6.0, first audited large-MoE benchmark, zero non-NVIDIA submissions</td><td>MLCommons/NVIDIA/CoreWeave</td><td>OFFICIAL</td><td>2026-06-16</td></tr>
+<tr><td>DeepSeek-V3-671B: GB300 NVL72, 8,192 GPUs, 2.02 min to target quality; GB300 1.6× faster than GB200 at same scale; 1,298→1,648 TFLOPS/GPU across NeMo containers 25.11→26.06 (~3 months; container-to-container, not round-over-round)</td><td>MLPerf v6.0, first audited large-MoE benchmark, zero non-NVIDIA submissions</td><td>MLCommons/NVIDIA/CoreWeave</td><td>OFFICIAL</td><td>2026-06-16</td></tr>
 <tr><td>95 systems, 24 orgs, 13 accelerator types, 60% multi-node</td><td>MLPerf Training v6.0 overall round</td><td>MLCommons</td><td>OFFICIAL</td><td>2026-06-16</td></tr>
 <tr><td>Llama-3.1-405B: GB200 NVL72, 8,192 GPUs, 7.07 min; GB300 ~1.5× faster</td><td>MLPerf v6.0 companion dense benchmark</td><td>NVIDIA/MLCommons</td><td>OFFICIAL</td><td>2026-06</td></tr>
 <tr><td>MI355X within ~5–6% of B200 on Llama3.1-8B pretrain / Llama2-70B LoRA (first Primus-based submission)</td><td>MLPerf v6.0</td><td>AMD/ROCm blogs</td><td>OFFICIAL</td><td>2026-06</td></tr>
@@ -369,14 +371,14 @@
 <tr><td>385.8 TFLOPS/GPU avg (recompute) / 424.3 TFLOPS/GPU (3rd-party profiler)</td><td>DeepSeek-V3 achieved compute, two independent reconstructions</td><td>DeepSeek paper Table 2 recompute vs. Medium/dlrover</td><td>DERIVED / HEARSAY</td><td>2026-07 / ~2025</td></tr>
 <tr><td>~19.5–21.4% FP8-MFU (peak 1,979 TFLOPS) / ~39.0–42.9% BF16-MFU (peak 989.5 TFLOPS)</td><td>DeepSeek-V3, two normalizations of the same achieved-compute figure</td><td>Derived from arXiv:2412.19437</td><td>DERIVED</td><td>2026-07</td></tr>
 <tr><td>~23% independent MFU estimate</td><td>DeepSeek-V3</td><td>SemiAnalysis</td><td>HEARSAY</td><td>2025-01</td></tr>
-<tr><td>17.3% (SXM H800 peak) vs. “~23%” (alt. PCIe H800 peak assumption)</td><td>Same DeepSeek-V3 run, MFU differs by choice of H800 SKU peak (1.5 vs. 1.979 PFLOPS)</td><td>Notes’ own calc vs. secondary analyses</td><td><strong>[CONFLICT — methodological, not factual]</strong></td><td>2026-07 / 2025</td></tr>
+<tr><td>17.3% (SXM H800 peak) vs. “~23%” (alt. PCIe H800 peak assumption)</td><td>Same DeepSeek-V3 run, MFU differs by choice of H800 SKU peak (1.5 vs. 1.979 PFLOPS)</td><td>Our own calc vs. secondary analyses</td><td><strong>[CONFLICT — methodological, not factual]</strong></td><td>2026-07 / 2025</td></tr>
 <tr><td>17.1% (H100) / 13.1% (B200) / 18.0% (GB200)</td><td>DeepSeek-V3 MoE MFU per NVIDIA’s own published TFLOP/GPU tables ÷ dense-FP8 peak</td><td>NVIDIA docs + calc</td><td>DERIVED</td><td>accessed 2026-07</td></tr>
 <tr><td>16.6% BF16 MFU (H100)</td><td>DeepSeek-670B MoE (vs. 54.5% dense Llama3-405B)</td><td>SemiAnalysis</td><td>HEARSAY</td><td>2025-08</td></tr>
 <tr><td>1.3×→2.5×→4.7× (proj.) tok/s/GPU</td><td>GB200 vs. H100, DeepSeek-670B, May→Jul→Dec-2025</td><td>SemiAnalysis</td><td>HEARSAY</td><td>2025-08</td></tr>
 <tr><td>18× faster</td><td>64-GPU all-to-all, GB200 NVL72 domain vs. H100</td><td>SemiAnalysis</td><td>HEARSAY</td><td>2025-08</td></tr>
-<tr><td>Beat-12 GB200 MFU (Megatron-Core, DeepSeek-V3-685B, 1,048 TFLOPS/GPU measured): 46.6% (naive) → <strong>41.9%</strong> corrected BF16 denominator (2,500 not 2,250)</td><td>Correction using notes/30’s authoritative GB200 dense-BF16 peak</td><td>Notes/30 self-correction of notes/16</td><td>DERIVED</td><td>2026-07</td></tr>
-<tr><td>21.0% (if FP8, 1,048/5,000) vs. naive 23.3% (1,048/4,500)</td><td>Same measured figure, corrected FP8 denominator</td><td>Notes/30</td><td>DERIVED</td><td>2026-07</td></tr>
-<tr><td>“38–46% sustained FP8 training MFU on NVL72”</td><td>Cited elsewhere as NVIDIA official; <strong>could not be independently verified</strong> against local SemiAnalysis PDF, NVIDIA dev blog, or a fresh web source</td><td>Notes/30’s own audit</td><td><strong>[UNVERIFIED]</strong></td><td>n.d.</td></tr>
+<tr><td>GB200 MFU correction (Megatron-Core, DeepSeek-V3-685B, 1,048 TFLOPS/GPU measured): 46.6% (naive) → <strong>21.0%</strong> (measurement is MXFP8 per the report’s own Table 11; denominator = 5,000 FP8/MXFP8 dense peak; the intermediate 41.9% “BF16-corrected” reading is superseded)</td><td>Correction per Ch16/Ch17 + Table 11 Dtype resolution</td><td>DERIVED, audit-resolved</td><td>2026-07</td><td></td></tr>
+<tr><td>21.0% (if FP8, 1,048/5,000) vs. naive 23.3% (1,048/4,500)</td><td>Same measured figure, corrected FP8 denominator</td><td>Ch16</td><td>DERIVED</td><td>2026-07</td></tr>
+<tr><td>“38–46% sustained FP8 training MFU on NVL72”</td><td>Cited elsewhere as NVIDIA official; <strong>could not be independently verified</strong> against local SemiAnalysis PDF, NVIDIA dev blog, or a fresh web source</td><td>Our own audit (Ch16)</td><td><strong>[UNVERIFIED]</strong></td><td>n.d.</td></tr>
 <tr><td>651→859 tok/s (DeepEP, +32%) → 918 tok/s (DeepEP+MXFP8, +41%)</td><td>DeepSeek-V3-671B, 256×B200 (TP2/PP2/EP32)</td><td>PyTorch official blog</td><td>OFFICIAL</td><td>2026-03 (upd. 2026-05)</td></tr>
 <tr><td>20 of 132 SMs</td><td>Cross-node all-to-all comm budget, H800</td><td>arXiv:2412.19437 §3.2.2</td><td>PAPER</td><td>2024-12</td></tr>
 <tr><td>160 GB/s NVLink vs. 50 GB/s IB (3.2:1)</td><td>H800 intra- vs. inter-node bandwidth</td><td>arXiv:2412.19437</td><td>PAPER</td><td>2024-12</td></tr>
@@ -406,7 +408,7 @@
 <tr><td>Mixtral 8x22B: 36.2% MFU, 1,326 tok/s/dev</td><td>Trillium v6e-256, BF16, SL=4096</td><td>MaxText tiering docs</td><td>OFFICIAL</td><td>2026-06</td></tr>
 <tr><td>Gemini 2.5: 93% goodput</td><td>Sync data-parallel across multiple 8,960-chip v5p pods, multi-datacenter</td><td>Gemini 2.5 report, cited in arXiv:2606.15870</td><td>PAPER</td><td>2026-06 (citing 2025)</td></tr>
 <tr><td>Gemini 1.0: 97% goodput</td><td>Smaller scale, TPU v4</td><td>Gemini23 report</td><td>PAPER</td><td>2023</td></tr>
-<tr><td>Gemini 1.5: 85%→97% goodput</td><td>Largest-scale training job</td><td>arXiv:2403.05530</td><td>PAPER</td><td>2024-03</td></tr>
+<tr><td>Gemini 1.0: 85%→97% goodput</td><td>Largest-scale training job</td><td>arXiv:2312.11805</td><td>PAPER</td><td>2023-12</td></tr>
 <tr><td>~97% throughput retained</td><td>Gemini 2.5, slice-granularity elasticity during localized TPU failure</td><td>Gemini 2.5 report</td><td>PAPER</td><td>2025</td></tr>
 </tbody></table></div></figure>
 <h3 id="a-3-6-chinese-lab-bytedance-measured">A.3.6 Chinese-lab / ByteDance measured</h3>
@@ -473,11 +475,11 @@
 <tr><td>FP8: &lt;1% PPL deviation (safe) or crash (binary); BF16/FP16: up to 400–600% PPL deviation, silent</td><td>Numeric-format SDC resilience</td><td>arXiv:2604.10390</td><td>PAPER</td><td>2026</td></tr>
 <tr><td>Nullification 50.68%, non-special bit-flip 48.31%, NaN/Inf only 1.01%</td><td>GPU fault-injection corruption breakdown, 3M+ sim-hours</td><td>arXiv:2605.04213</td><td>PAPER</td><td>2026</td></tr>
 <tr><td>~once/week</td><td>SDC loss-spike frequency traced to a single faulty GPU</td><td>ZAYA1 cluster, arXiv:2511.17127</td><td>PAPER</td><td>2025-12</td></tr>
-<tr><td>“Every week or two”</td><td>Expected SDC frequency at Gemini Ultra scale</td><td>Gemini 1.5 Technical Report</td><td>PAPER</td><td>2024-03</td></tr>
+<tr><td>“Every week or two”</td><td>Expected SDC frequency at Gemini Ultra scale</td><td>Gemini 1.0 Technical Report (arXiv:2312.11805)</td><td>PAPER</td><td>2023-12</td></tr>
 </tbody></table></div></figure>
 <h3 id="a-4-3-fault-tolerance-systems-measured-gains">A.4.3 Fault-tolerance systems: measured gains</h3>
 <figure class="table" id="table-a-22"><figcaption class="table-no">Table A.22</figcaption><div class="scroll"><table><thead><tr><th>Value</th><th>Context</th><th>Source</th><th>Provenance</th><th>Date</th></tr></thead><tbody>
-<tr><td>99.11–99.71% vs. 39.84–43.07% MFU</td><td>ByteRobust in-memory checkpointing vs. sync-to-remote-FS</td><td>arXiv:2509.16293</td><td>PAPER</td><td>2025-09</td></tr>
+<tr><td>99.11–99.71% vs. 39.84–43.07% <strong>relative</strong> MFU (vs. no-checkpointing baseline; per-iteration checkpointing stress test, Table 8 — not absolute cluster MFU)</td><td>ByteRobust in-memory checkpointing vs. sync-to-remote-FS</td><td>arXiv:2509.16293, Table 8</td><td>PAPER</td><td>2025-09</td></tr>
 <tr><td>80–93% recovery-time reduction; up to 95% goodput</td><td>AWS checkpointless training (peer-to-peer, EFA) vs. traditional restore</td><td>AWS official blog</td><td>OFFICIAL</td><td>2025-12</td></tr>
 <tr><td>1min45s vs. 15min recovery; 5% memory overhead</td><td>AWS checkpointless training</td><td>SemiAnalysis</td><td>HEARSAY</td><td>2026-04</td></tr>
 <tr><td>82.3% step-commit @60s MTBF; 30.2% @~15s MTBF; &lt;1s replica recovery (Gloo)</td><td>torchft/Crusoe fault-tolerance demo, 300 L40S GPUs</td><td>PyTorch official blog</td><td>OFFICIAL</td><td>mid-2025</td></tr>
@@ -669,7 +671,7 @@
 <tr><td>6,585.8B tokens total (3,359.8B English-CC core)</td><td>Nemotron-CC v2</td><td>NVIDIA/HF dataset card</td><td>OFFICIAL</td><td>2025</td></tr>
 <tr><td>6.6T tokens collection total</td><td>Nemotron-Pretraining-Dataset-v1</td><td>NVIDIA/HF</td><td>OFFICIAL</td><td>2025</td></tr>
 <tr><td>133B tokens (Lynx+LLM pipeline)</td><td>Nemotron-CC-Math-v1</td><td>HF dataset card</td><td>OFFICIAL</td><td>2025</td></tr>
-<tr><td>133B tokens (title figure; 52B cited in some secondary summaries, unresolved)</td><td>Nemotron-CC-Math</td><td>arXiv:2508.15096</td><td><strong>[CONFLICT — flagged “needs verification” by the sourcing note]</strong></td><td>2025-08</td></tr>
+<tr><td>133B tokens (Math-3+ tier) / 52B (stricter Math-4+ subset) — both figures are correct and name different quality tiers, per the paper’s own abstract</td><td>Nemotron-CC-Math</td><td>arXiv:2508.15096</td><td>PAPER, conflict resolved</td><td>2025-08</td></tr>
 <tr><td>175.1B synthetic + 747.4B permissive-license</td><td>Nemotron-Pretraining-Code</td><td>HF dataset card</td><td>OFFICIAL</td><td>2025</td></tr>
 <tr><td>ClimbLab 1.2T tok (20 clusters); ClimbMix 400B tok</td><td>CLIMB dataset releases</td><td>arXiv:2504.13161</td><td>PAPER</td><td>2025-04</td></tr>
 <tr><td>~5T unique tokens; 15T+ upsampled</td><td>TxT360</td><td>LLM360, COLM 2025</td><td>PAPER</td><td>2025</td></tr>
@@ -712,6 +714,9 @@
 <tr><td>1,000+ Ascend 910C chips, 1,500+ iterations, zero interruptions (post-training only)</td><td>DeepSeek-V4-Pro Chinese-domestic post-training milestone</td><td>Tom’s Hardware/Gigazine</td><td>HEARSAY</td><td>2026-06</td></tr>
 <tr><td>1.04T total/32.6B active, 384 experts top-8, 15.5T tokens, 61 layers, hidden 7168, 64 attn heads, MLA, vocab 160K</td><td>Kimi K2</td><td>arXiv:2507.20534</td><td>PAPER</td><td>2025-07</td></tr>
 <tr><td>48B total/3B active, 3:1 KDA:MLA, 5.7T tokens</td><td>Kimi Linear</td><td>arXiv:2510.26692</td><td>PAPER</td><td>2025-10</td></tr>
+<tr><td>1.04T/32.6B K2 backbone + ~15T continual mixed visual+text tokens (~30.5T cumulative), 256K context, native INT4, MuonClip retained</td><td>Kimi K2.5 (natively multimodal retrofit)</td><td>HF model card + arXiv:2602.02276</td><td>PAPER</td><td>2026-01/02</td></tr>
+<tr><td>Adam→MuonClip (τ=100), softmax→3:1 KDA hybrid (5-6× decode at 128K-1M), residuals→Attention Residuals; all open-sourced</td><td>Kimi K2.5 three-pillars framing, GTC 2026 keynote (Yang Zhilin)</td><td>biggo GTC coverage</td><td>TALK via SECONDARY</td><td>2026-03</td></tr>
+<tr><td>2.8T total, 16-of-896 experts (~1.8%), KDA+Gated MLA, 1M context, AttnRes (~25% train-eff claim), MXFP4-w/MXFP8-a serving, claimed 2.5× scaling efficiency vs. K2</td><td>Kimi K3 — <strong>post-snapshot (Jul 16), all values pending technical report</strong></td><td>VentureBeat/MarkTechPost</td><td>SECONDARY</td><td>2026-07</td></tr>
 <tr><td>235B total/22B active, 94 layers, 128 experts top-8, 36T tokens (3-stage: 30T+5T+long-ctx), vocab 151,669</td><td>Qwen3 flagship</td><td>arXiv:2505.09388</td><td>PAPER</td><td>2025-05</td></tr>
 <tr><td>80B total/~3B active, 512 experts (10 routed+1 shared), 3:1 Gated DeltaNet:Gated Attention, 15T tokens (of 36T corpus)</td><td>Qwen3-Next-80B-A3B</td><td>Alibaba Cloud blog</td><td>OFFICIAL</td><td>2025-09</td></tr>
 <tr><td>397B-A17B</td><td>Qwen3.5 flagship MoE</td><td>Secondary coverage</td><td>HEARSAY</td><td>2026-02</td></tr>
@@ -720,6 +725,7 @@
 <tr><td>256+1 experts, 744B/40B active, 80 layers, DeepSeek Sparse Attention</td><td>GLM-5</td><td>arXiv:2602.15763</td><td>PAPER</td><td>2026</td></tr>
 <tr><td>456B total/45.9B active, 1 softmax block per 7 lightning blocks, 7.5T continual-pretrain tokens</td><td>MiniMax-M1</td><td>arXiv:2506.13585</td><td>PAPER</td><td>2025-06</td></tr>
 <tr><td>229.9B total/9.8B active, 62 layers, full attention (reversal from M1’s hybrid), 29.2T tokens, 192K native context, 48Q/8KV heads, d_model 3072, vocab 200,064</td><td>MiniMax-M2</td><td>arXiv:2605.26494</td><td>PAPER</td><td>~2026</td></tr>
+<tr><td>Two-branch block-sparse on GQA: index branch picks KV blocks, main branch exact softmax; 28.4× attention-compute cut at 1M ctx, GQA-parity quality; validated 109B MoE/3T tokens; 9.7× prefill / 15.6× decode vs. prior gen</td><td>MiniMax MSA (M3’s attention; completes linear→full→sparse trajectory)</td><td>arXiv:2606.13392</td><td>PAPER</td><td>2026-06</td></tr>
 <tr><td>321B total (316B LLM+5B vision)/38B active, 61 layers</td><td>Step-3</td><td>arXiv:2507.19427</td><td>PAPER</td><td>2025-07</td></tr>
 <tr><td>1T total/51B active, 80 layers, 256 experts top-8+1 shared, 20T+ tokens</td><td>Ant Ling-1T</td><td>arXiv:2510.22115</td><td>PAPER</td><td>2025-10</td></tr>
 <tr><td>256 experts top-8+1 shared, ~3.5% activation, &gt;7× efficiency leverage vs. dense</td><td>Ant Ling 2.0 config</td><td>arXiv:2510.22115</td><td>PAPER</td><td>2025-10</td></tr>
@@ -804,8 +810,8 @@
 <tr><td>$1.95/M tokens, $29.1M total</td><td>Llama3-405B, 15T-token BF16 pretrain, 2,304×H100</td><td>SemiAnalysis</td><td>HEARSAY</td><td>2025-08</td></tr>
 <tr><td>72¢→54.2¢/M tokens ($218k→$162k total)</td><td>GPT-3-175B 300B-token pretrain cost, FP8, Jan→Dec 2024</td><td>SemiAnalysis</td><td>HEARSAY</td><td>2025-08</td></tr>
 <tr><td>$4.5M → $2.5M (proj.)</td><td>DeepSeek-670B 14.8T-token full pretrain cost, GB200, Jul→Dec-2025</td><td>SemiAnalysis</td><td>HEARSAY</td><td>2025-08</td></tr>
-<tr><td>100k GB200 @15% MFU, 50T tokens: 9.41 pure-compute days, $56.5–113M</td><td>Money-table synthesis</td><td>Notes’ own calculation</td><td>DERIVED</td><td>2026-07</td></tr>
-<tr><td>100k GB200 @35% MFU, 25T tokens: 2.02 pure-compute days, $12.1–24.2M</td><td>Money-table synthesis</td><td>Notes’ own calculation</td><td>DERIVED</td><td>2026-07</td></tr>
+<tr><td>100k GB200 @15% MFU, 50T tokens: 9.41 pure-compute days, $56.5–113M</td><td>Money-table synthesis</td><td>Our own calculation (Ch23)</td><td>DERIVED</td><td>2026-07</td></tr>
+<tr><td>100k GB200 @35% MFU, 25T tokens: 2.02 pure-compute days, $12.1–24.2M</td><td>Money-table synthesis</td><td>Our own calculation (Ch23)</td><td>DERIVED</td><td>2026-07</td></tr>
 <tr><td>~$0.5B</td><td>Estimated compute cost of a 6-month Orion/GPT-4.5-class run</td><td>WSJ via Fortune</td><td>HEARSAY</td><td>2025-02</td></tr>
 <tr><td>~$1B</td><td>Estimated cloud compute cost for a “GPT-5-scale” run (excl. datacenter capex)</td><td>WSJ via Fortune</td><td>HEARSAY</td><td>2025-02</td></tr>
 <tr><td>&gt;$2B</td><td>Estimated compute cost of OpenAI “Spud” (shipped as GPT-5.5) pretraining run</td><td>Aggregated tracker sites</td><td>HEARSAY</td><td>2026</td></tr>
@@ -823,7 +829,7 @@
 <tr><td>3.5 GW</td><td>Anthropic–Google–Broadcom follow-on capacity, starting 2027</td><td>TechCrunch</td><td>HEARSAY</td><td>2026-04-07</td></tr>
 <tr><td>Up to $40B / 5GW / up to 1M Ironwood chips</td><td>Bloomberg’s cumulative framing of the Anthropic-Google relationship (doesn’t match any single official figure)</td><td>Bloomberg</td><td><strong>[CONFLICT with above rows — different aggregations of the same relationship]</strong></td><td>2026-05-18</td></tr>
 <tr><td>$100B over 10 years, up to 5 GW</td><td>Anthropic’s AWS spend commitment</td><td>Anthropic official blog</td><td>OFFICIAL</td><td>~2025</td></tr>
-<tr><td>~500,000 → &gt;1,000,000 Trainium2/3 chips (target, training+inference), end-2026</td><td>Anthropic Project Rainier / AWS footprint</td><td>AWS official; Anthropic/Amazon official (updated figure supersedes earlier “~500K”)</td><td>OFFICIAL</td><td>2025-10 → 2026-04-20</td></tr>
+<tr><td>~500,000 → &gt;1,000,000 Trainium2/3 chips (training+inference; 1M target originally set for end-2025, reported surpassed present-tense by 2026-04-20)</td><td>Anthropic Project Rainier / AWS footprint</td><td>AWS official; Anthropic/Amazon official (updated figure supersedes earlier “~500K”)</td><td>OFFICIAL</td><td>2025-10 → 2026-04-20</td></tr>
 <tr><td>$8B</td><td>Amazon’s cumulative equity investment in Anthropic since 2023</td><td>Yahoo Finance/Amazon</td><td>HEARSAY</td><td>2025-10</td></tr>
 <tr><td>$30B run-rate revenue (up from ~$9B end-2025)</td><td>Anthropic</td><td>TechCrunch, citing Anthropic</td><td>HEARSAY</td><td>2026-04-07</td></tr>
 <tr><td>$380B valuation (off $30B Series G)</td><td>Anthropic</td><td>TechCrunch</td><td>HEARSAY</td><td>2026-04-07</td></tr>
@@ -860,7 +866,7 @@
 
 </article>
 <nav class="pager">
-<div class="prev"><span class="label">Previous</span><a href="ch-23-source-atlas.html">23. The Source Atlas</a></div>
+<div class="prev"><span class="label">Previous</span><a href="ch-25-source-atlas.html">25. The Source Atlas</a></div>
 <div class="up"><a href="index.html">Contents</a></div>
 <div class="next"></div>
 </nav>

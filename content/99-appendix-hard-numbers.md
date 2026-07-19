@@ -1,10 +1,10 @@
 # Appendix A: Master Hard-Numbers Table
 
-Compiled from the "Hard numbers" sections of all 42 research-note files in `pretraining-2026-research/notes/` (01–53). Each row carries: the value, its context, the citing source, a provenance tag (how confident/primary the sourcing is), and a date. Where the same fact appears in multiple notes, the best-sourced instance is kept and duplicates are dropped silently. Where notes genuinely disagree — different numbers for what should be the same quantity — both rows are kept and marked **[CONFLICT]**.
+The hard numbers behind Chapters 1–24, collected into one master table. Each row carries: the value, its context, the citing source, a provenance grade (how confident/primary the sourcing is), and a date. Where the same fact appears in several chapters, the best-sourced instance is kept and duplicates are dropped silently. Where sources genuinely disagree — different numbers for what should be the same quantity — both rows are kept and marked **[CONFLICT]**.
 
-**Silicon note:** `notes/30-gb200-nvl72-peak-flops-reconciliation.md` is treated as authoritative for all GB200 NVL72 / HGX B200 per-GPU peak-FLOPS figures; it reconciles the NVIDIA Blackwell datasheet against every other note's derived numbers and finds them consistent to rounding except where flagged. Downstream MFU calculations elsewhere in the corpus that used a slightly-off denominator (e.g., 4,500 vs. the correct 5,000 TFLOPS/GPU dense FP8 for GB200 NVL72) are noted where material.
+**Silicon note:** Ch16's GB200 reconciliation is authoritative for all GB200 NVL72 / HGX B200 per-GPU peak-FLOPS figures; it reconciles the NVIDIA Blackwell datasheet against every derived number here and finds them consistent to rounding except where flagged. Downstream MFU calculations that used a slightly-off denominator (e.g., 4,500 vs. the correct 5,000 TFLOPS/GPU dense FP8 for GB200 NVL72) are noted where material.
 
-**Provenance tags:** PAPER (arXiv/peer-reviewed), OFFICIAL (vendor/lab blog, docs, product page, statement), CODE (repo/README/benchmark script), BENCHMARK (independent measured benchmark), DERIVED (calculated by a note's author from other primary numbers), HEARSAY (secondary press/aggregation/paywalled analysis), SPOKEN (podcast/interview claim, unverified), LOGBOOK (primary training chronicle), THESIS, UNVERIFIED (explicitly flagged unconfirmed by the sourcing note).
+**Provenance grades** (matching Ch1's source-type ordering): PAPER (arXiv/peer-reviewed), OFFICIAL (vendor/lab blog, docs, product page, statement), CODE (repo/README/benchmark script), BENCHMARK (independent measured benchmark), DERIVED (our own arithmetic from other primary numbers), HEARSAY (secondary press/aggregation/paywalled analysis), SPOKEN (podcast/interview claim, unverified), LOGBOOK (primary training chronicle), THESIS, UNVERIFIED (explicitly unconfirmed).
 
 ---
 
@@ -49,7 +49,7 @@ Compiled from the "Hard numbers" sections of all 42 research-note files in `pret
 | 80% unidirectional / 38% duplex efficiency of 450/900 GB/s spec | GB200 NVLink-C2C measured (`nvbandwidth`, DGX Station, half GB300 module) | Stas repo | BENCHMARK | 2026-07 |
 | 96.3%/96.0%/96.2%/96.3%/98.2% of peak | B200 measured tensor-core efficiency at realistic tile shape, FP8/FP6/FP4/BF16/INT8 | arXiv:2512.02189v2 | BENCHMARK | 2025-12 |
 | 3,850.6/5,134.4/7,700.2/1,926.4 TFLOPS; 3,928.5 TOPS | B200 measured (not peak-spec) at m64n8k16 tile, FP8/FP6/FP4/BF16/INT8 | arXiv:2512.02189v2 | BENCHMARK | 2025-12 |
-| Implied theoretical peak ≈4,000 TFLOPS FP8 (from 3,850.6/96.3%) | Below even HGX B200's 4,500 dense spec — internal inconsistency flagged in the paper's own baseline | arXiv:2512.02189v2, cross-checked by notes/30 | **[CONFLICT — likely erroneous 3rd-party benchmark baseline]** | 2025-12 |
+| Implied theoretical peak ≈4,000 TFLOPS FP8 (from 3,850.6/96.3%) | Below even HGX B200's 4,500 dense spec — internal inconsistency flagged in the paper's own baseline | arXiv:2512.02189v2, cross-checked in Ch16 | **[CONFLICT — likely erroneous 3rd-party benchmark baseline]** | 2025-12 |
 | ~1.27× | B200 vs. H200 speedup, consistent across precisions at raw tensor-core level | arXiv:2512.02189v2 | BENCHMARK | 2025-12 |
 | 148 total SMs (74/die active of 80 physical, 6 disabled/die) | B200 two-die chiplet | Chips and Cheese teardown | HEARSAY | 2025 |
 | 21 TB/s same-partition vs. 16.8 TB/s cross-partition L2 (126 MB total) | B200 L2 cache | Chips and Cheese teardown | HEARSAY | 2025 |
@@ -64,7 +64,7 @@ Compiled from the "Hard numbers" sections of all 42 research-note files in `pret
 
 | Value | Context | Source | Provenance | Date |
 |---|---|---|---|---|
-| 4,000 BF16 / 17,500 FP8 / 35,000 FP4-NVFP4 TFLOPS dense | Rubin SXM pre-launch spec | Stas repo | OFFICIAL | 2026-07 |
+| 4,000 BF16 / 17,500 FP8 / 35,000 FP4-NVFP4 TFLOPS dense | Rubin SXM pre-launch spec — **[CHECK]**: implies FP8:BF16 = 4.375×, breaking the exact 2× ratio every generation since Hopper has held; verify against launch datasheet before reuse | Stas repo | OFFICIAL | 2026-07 |
 | 35 PFLOPS dense FP4 / 50 PFLOPS "compressed" | Rubin GPU | SemiAnalysis | HEARSAY | 2026-02 |
 | 22 TB/s target / ~20 TB/s realistic | Rubin HBM4 bandwidth | SemiAnalysis | HEARSAY | 2026-02 |
 | 2,300 W (Max-P) / 1,800 W (Max-Q) | Rubin GPU TDP | SemiAnalysis | HEARSAY | 2026-02 |
@@ -107,8 +107,8 @@ Compiled from the "Hard numbers" sections of all 42 research-note files in `pret
 | 91 exaFLOPS | Single TPU v6e cluster peak (4× largest v5p cluster) | Google Cloud Blog | OFFICIAL | 2024 |
 | 9,216 chips/pod, 1,200 GB/s/chip bidirectional ICI | TPU7x (Ironwood) pod ceiling | docs.cloud.google.com/tpu/tpu7x | OFFICIAL | GA 2025-11 |
 | 8,960 chips/pod, 4,800 Gbps/chip ICI | TPU v5p pod ceiling | Google Cloud Docs | OFFICIAL | — |
-| 4,096 chips/SuperPod | Gemini TPUv4 SuperPod unit | Gemini 1.5 Technical Report | PAPER | 2024-03 |
-| ~10 seconds | OCS reconfiguration time, 4×4×4 cube → arbitrary 3D torus | Gemini 1.5 report | PAPER | 2024-03 |
+| 4,096 chips/SuperPod | Gemini TPUv4 SuperPod unit | Gemini 1.0 Technical Report (arXiv:2312.11805; routinely misattributed to 1.5) | PAPER | 2023-12 |
+| ~10 seconds | OCS reconfiguration time, 4×4×4 cube → arbitrary 3D torus | Gemini 1.0 report (arXiv:2312.11805) | PAPER | 2023-12 |
 
 ### A.1.5 AWS Trainium
 
@@ -202,8 +202,8 @@ Compiled from the "Hard numbers" sections of all 42 research-note files in `pret
 | Up to 9× | NCCL 2.27 symmetric-memory latency reduction, small messages | NVIDIA official blog | OFFICIAL | 2025 |
 | 16→6 SMs (2.7×) reduction | NCCL 2.27 SHARP AllGather/ReduceScatter SM usage | NVIDIA official blog | OFFICIAL | 2025 |
 | ~1–2% gap | NCCL 2.28 GIN vs. NVSHMEM device-initiated performance | arXiv:2606.05951 | PAPER | 2026-06 |
-| Up to 12% per-step latency reduction (Llama4); up to 11× cluster-init speedup @96K GPU; 15–80% inference decode-latency gain | NCCLX (Meta) | arXiv:2510.20171 | PAPER | 2026-01 |
-| 7× / 15× / 30× | NCCLX latency multiplier: same-rack → cross-AI-Zone → cross-DC-building | arXiv:2510.20171 | PAPER | 2026-01 |
+| Up to 12% per-step latency reduction (Llama4); up to 11× cluster-init speedup @96K GPU; 15–80% inference decode-latency gain | NCCLX (Meta) | arXiv:2510.20171 | PAPER | 2025-10 |
+| 7× / 15× / 30× | NCCLX latency multiplier: same-rack → cross-AI-Zone → cross-DC-building | arXiv:2510.20171 | PAPER | 2025-10 |
 | Up to 3.8× / 15% | MSCCL++ speedup vs. NCCL (collectives / real inference workloads) | arXiv:2504.09014 | PAPER | 2026-03 |
 | 200 Gbps, 120 Mops/s | Google Falcon first hardware implementation | Google SIGCOMM'25 | PAPER | 2025 |
 | Up to 8× lower completion time, 65% higher goodput vs. CX-7 RoCE under congestion | Falcon vs. standard RoCE | Google SIGCOMM'25 | PAPER | 2025 |
@@ -294,7 +294,7 @@ Compiled from the "Hard numbers" sections of all 42 research-note files in `pret
 | GB300 1.26 min vs. GB200 1.598 min vs. 64×B200 2.019 min | Llama-2-70B-LoRA, v5.1 | Lambda blog | OFFICIAL | 2025-11 |
 | MI300X 27.95 min → MI325X 21.05 min → MI355X 10.18 min | AMD Llama-2-70B-LoRA generational progression | AMD/ROCm blogs | OFFICIAL | 2025 |
 | MI355X within 3–6% of B200/B300 | Llama-2-70B-LoRA and Llama-3.1-8B, v5.1 | ROCm blog | OFFICIAL | 2025-11 |
-| DeepSeek-V3-671B: GB300 NVL72, 8,192 GPUs, 2.02 min to target quality; GB300 1.6× faster than GB200 at same scale; 1,298→1,648 TFLOPS/GPU in 3 months | MLPerf v6.0, first audited large-MoE benchmark, zero non-NVIDIA submissions | MLCommons/NVIDIA/CoreWeave | OFFICIAL | 2026-06-16 |
+| DeepSeek-V3-671B: GB300 NVL72, 8,192 GPUs, 2.02 min to target quality; GB300 1.6× faster than GB200 at same scale; 1,298→1,648 TFLOPS/GPU across NeMo containers 25.11→26.06 (~3 months; container-to-container, not round-over-round) | MLPerf v6.0, first audited large-MoE benchmark, zero non-NVIDIA submissions | MLCommons/NVIDIA/CoreWeave | OFFICIAL | 2026-06-16 |
 | 95 systems, 24 orgs, 13 accelerator types, 60% multi-node | MLPerf Training v6.0 overall round | MLCommons | OFFICIAL | 2026-06-16 |
 | Llama-3.1-405B: GB200 NVL72, 8,192 GPUs, 7.07 min; GB300 ~1.5× faster | MLPerf v6.0 companion dense benchmark | NVIDIA/MLCommons | OFFICIAL | 2026-06 |
 | MI355X within ~5–6% of B200 on Llama3.1-8B pretrain / Llama2-70B LoRA (first Primus-based submission) | MLPerf v6.0 | AMD/ROCm blogs | OFFICIAL | 2026-06 |
@@ -336,14 +336,14 @@ Compiled from the "Hard numbers" sections of all 42 research-note files in `pret
 | 385.8 TFLOPS/GPU avg (recompute) / 424.3 TFLOPS/GPU (3rd-party profiler) | DeepSeek-V3 achieved compute, two independent reconstructions | DeepSeek paper Table 2 recompute vs. Medium/dlrover | DERIVED / HEARSAY | 2026-07 / ~2025 |
 | ~19.5–21.4% FP8-MFU (peak 1,979 TFLOPS) / ~39.0–42.9% BF16-MFU (peak 989.5 TFLOPS) | DeepSeek-V3, two normalizations of the same achieved-compute figure | Derived from arXiv:2412.19437 | DERIVED | 2026-07 |
 | ~23% independent MFU estimate | DeepSeek-V3 | SemiAnalysis | HEARSAY | 2025-01 |
-| 17.3% (SXM H800 peak) vs. "~23%" (alt. PCIe H800 peak assumption) | Same DeepSeek-V3 run, MFU differs by choice of H800 SKU peak (1.5 vs. 1.979 PFLOPS) | Notes' own calc vs. secondary analyses | **[CONFLICT — methodological, not factual]** | 2026-07 / 2025 |
+| 17.3% (SXM H800 peak) vs. "~23%" (alt. PCIe H800 peak assumption) | Same DeepSeek-V3 run, MFU differs by choice of H800 SKU peak (1.5 vs. 1.979 PFLOPS) | Our own calc vs. secondary analyses | **[CONFLICT — methodological, not factual]** | 2026-07 / 2025 |
 | 17.1% (H100) / 13.1% (B200) / 18.0% (GB200) | DeepSeek-V3 MoE MFU per NVIDIA's own published TFLOP/GPU tables ÷ dense-FP8 peak | NVIDIA docs + calc | DERIVED | accessed 2026-07 |
 | 16.6% BF16 MFU (H100) | DeepSeek-670B MoE (vs. 54.5% dense Llama3-405B) | SemiAnalysis | HEARSAY | 2025-08 |
 | 1.3×→2.5×→4.7× (proj.) tok/s/GPU | GB200 vs. H100, DeepSeek-670B, May→Jul→Dec-2025 | SemiAnalysis | HEARSAY | 2025-08 |
 | 18× faster | 64-GPU all-to-all, GB200 NVL72 domain vs. H100 | SemiAnalysis | HEARSAY | 2025-08 |
-| Beat-12 GB200 MFU (Megatron-Core, DeepSeek-V3-685B, 1,048 TFLOPS/GPU measured): 46.6% (naive) → **41.9%** corrected BF16 denominator (2,500 not 2,250) | Correction using notes/30's authoritative GB200 dense-BF16 peak | Notes/30 self-correction of notes/16 | DERIVED | 2026-07 |
-| 21.0% (if FP8, 1,048/5,000) vs. naive 23.3% (1,048/4,500) | Same measured figure, corrected FP8 denominator | Notes/30 | DERIVED | 2026-07 |
-| "38–46% sustained FP8 training MFU on NVL72" | Cited elsewhere as NVIDIA official; **could not be independently verified** against local SemiAnalysis PDF, NVIDIA dev blog, or a fresh web source | Notes/30's own audit | **[UNVERIFIED]** | n.d. |
+| GB200 MFU correction (Megatron-Core, DeepSeek-V3-685B, 1,048 TFLOPS/GPU measured): 46.6% (naive) → **21.0%** (measurement is MXFP8 per the report's own Table 11; denominator = 5,000 FP8/MXFP8 dense peak; the intermediate 41.9% "BF16-corrected" reading is superseded) | Correction per Ch16/Ch17 + Table 11 Dtype resolution | DERIVED, audit-resolved | 2026-07 |
+| 21.0% (if FP8, 1,048/5,000) vs. naive 23.3% (1,048/4,500) | Same measured figure, corrected FP8 denominator | Ch16 | DERIVED | 2026-07 |
+| "38–46% sustained FP8 training MFU on NVL72" | Cited elsewhere as NVIDIA official; **could not be independently verified** against local SemiAnalysis PDF, NVIDIA dev blog, or a fresh web source | Our own audit (Ch16) | **[UNVERIFIED]** | n.d. |
 | 651→859 tok/s (DeepEP, +32%) → 918 tok/s (DeepEP+MXFP8, +41%) | DeepSeek-V3-671B, 256×B200 (TP2/PP2/EP32) | PyTorch official blog | OFFICIAL | 2026-03 (upd. 2026-05) |
 | 20 of 132 SMs | Cross-node all-to-all comm budget, H800 | arXiv:2412.19437 §3.2.2 | PAPER | 2024-12 |
 | 160 GB/s NVLink vs. 50 GB/s IB (3.2:1) | H800 intra- vs. inter-node bandwidth | arXiv:2412.19437 | PAPER | 2024-12 |
@@ -377,7 +377,7 @@ Compiled from the "Hard numbers" sections of all 42 research-note files in `pret
 | Mixtral 8x22B: 36.2% MFU, 1,326 tok/s/dev | Trillium v6e-256, BF16, SL=4096 | MaxText tiering docs | OFFICIAL | 2026-06 |
 | Gemini 2.5: 93% goodput | Sync data-parallel across multiple 8,960-chip v5p pods, multi-datacenter | Gemini 2.5 report, cited in arXiv:2606.15870 | PAPER | 2026-06 (citing 2025) |
 | Gemini 1.0: 97% goodput | Smaller scale, TPU v4 | Gemini23 report | PAPER | 2023 |
-| Gemini 1.5: 85%→97% goodput | Largest-scale training job | arXiv:2403.05530 | PAPER | 2024-03 |
+| Gemini 1.0: 85%→97% goodput | Largest-scale training job | arXiv:2312.11805 | PAPER | 2023-12 |
 | ~97% throughput retained | Gemini 2.5, slice-granularity elasticity during localized TPU failure | Gemini 2.5 report | PAPER | 2025 |
 
 ### A.3.6 Chinese-lab / ByteDance measured
@@ -454,13 +454,13 @@ Compiled from the "Hard numbers" sections of all 42 research-note files in `pret
 | FP8: <1% PPL deviation (safe) or crash (binary); BF16/FP16: up to 400–600% PPL deviation, silent | Numeric-format SDC resilience | arXiv:2604.10390 | PAPER | 2026 |
 | Nullification 50.68%, non-special bit-flip 48.31%, NaN/Inf only 1.01% | GPU fault-injection corruption breakdown, 3M+ sim-hours | arXiv:2605.04213 | PAPER | 2026 |
 | ~once/week | SDC loss-spike frequency traced to a single faulty GPU | ZAYA1 cluster, arXiv:2511.17127 | PAPER | 2025-12 |
-| "Every week or two" | Expected SDC frequency at Gemini Ultra scale | Gemini 1.5 Technical Report | PAPER | 2024-03 |
+| "Every week or two" | Expected SDC frequency at Gemini Ultra scale | Gemini 1.0 Technical Report (arXiv:2312.11805) | PAPER | 2023-12 |
 
 ### A.4.3 Fault-tolerance systems: measured gains
 
 | Value | Context | Source | Provenance | Date |
 |---|---|---|---|---|
-| 99.11–99.71% vs. 39.84–43.07% MFU | ByteRobust in-memory checkpointing vs. sync-to-remote-FS | arXiv:2509.16293 | PAPER | 2025-09 |
+| 99.11–99.71% vs. 39.84–43.07% **relative** MFU (vs. no-checkpointing baseline; per-iteration checkpointing stress test, Table 8 — not absolute cluster MFU) | ByteRobust in-memory checkpointing vs. sync-to-remote-FS | arXiv:2509.16293, Table 8 | PAPER | 2025-09 |
 | 80–93% recovery-time reduction; up to 95% goodput | AWS checkpointless training (peer-to-peer, EFA) vs. traditional restore | AWS official blog | OFFICIAL | 2025-12 |
 | 1min45s vs. 15min recovery; 5% memory overhead | AWS checkpointless training | SemiAnalysis | HEARSAY | 2026-04 |
 | 82.3% step-commit @60s MTBF; 30.2% @~15s MTBF; <1s replica recovery (Gloo) | torchft/Crusoe fault-tolerance demo, 300 L40S GPUs | PyTorch official blog | OFFICIAL | mid-2025 |
@@ -680,7 +680,7 @@ Compiled from the "Hard numbers" sections of all 42 research-note files in `pret
 | 6,585.8B tokens total (3,359.8B English-CC core) | Nemotron-CC v2 | NVIDIA/HF dataset card | OFFICIAL | 2025 |
 | 6.6T tokens collection total | Nemotron-Pretraining-Dataset-v1 | NVIDIA/HF | OFFICIAL | 2025 |
 | 133B tokens (Lynx+LLM pipeline) | Nemotron-CC-Math-v1 | HF dataset card | OFFICIAL | 2025 |
-| 133B tokens (title figure; 52B cited in some secondary summaries, unresolved) | Nemotron-CC-Math | arXiv:2508.15096 | **[CONFLICT — flagged "needs verification" by the sourcing note]** | 2025-08 |
+| 133B tokens (Math-3+ tier) / 52B (stricter Math-4+ subset) — both figures are correct and name different quality tiers, per the paper's own abstract | Nemotron-CC-Math | arXiv:2508.15096 | PAPER, conflict resolved | 2025-08 |
 | 175.1B synthetic + 747.4B permissive-license | Nemotron-Pretraining-Code | HF dataset card | OFFICIAL | 2025 |
 | ClimbLab 1.2T tok (20 clusters); ClimbMix 400B tok | CLIMB dataset releases | arXiv:2504.13161 | PAPER | 2025-04 |
 | ~5T unique tokens; 15T+ upsampled | TxT360 | LLM360, COLM 2025 | PAPER | 2025 |
@@ -729,6 +729,9 @@ Compiled from the "Hard numbers" sections of all 42 research-note files in `pret
 | 1,000+ Ascend 910C chips, 1,500+ iterations, zero interruptions (post-training only) | DeepSeek-V4-Pro Chinese-domestic post-training milestone | Tom's Hardware/Gigazine | HEARSAY | 2026-06 |
 | 1.04T total/32.6B active, 384 experts top-8, 15.5T tokens, 61 layers, hidden 7168, 64 attn heads, MLA, vocab 160K | Kimi K2 | arXiv:2507.20534 | PAPER | 2025-07 |
 | 48B total/3B active, 3:1 KDA:MLA, 5.7T tokens | Kimi Linear | arXiv:2510.26692 | PAPER | 2025-10 |
+| 1.04T/32.6B K2 backbone + ~15T continual mixed visual+text tokens (~30.5T cumulative), 256K context, native INT4, MuonClip retained | Kimi K2.5 (natively multimodal retrofit) | HF model card + arXiv:2602.02276 | PAPER | 2026-01/02 |
+| Adam→MuonClip (τ=100), softmax→3:1 KDA hybrid (5-6× decode at 128K-1M), residuals→Attention Residuals; all open-sourced | Kimi K2.5 three-pillars framing, GTC 2026 keynote (Yang Zhilin) | biggo GTC coverage | TALK via SECONDARY | 2026-03 |
+| 2.8T total, 16-of-896 experts (~1.8%), KDA+Gated MLA, 1M context, AttnRes (~25% train-eff claim), MXFP4-w/MXFP8-a serving, claimed 2.5× scaling efficiency vs. K2 | Kimi K3 — **post-snapshot (Jul 16), all values pending technical report** | VentureBeat/MarkTechPost | SECONDARY | 2026-07 |
 | 235B total/22B active, 94 layers, 128 experts top-8, 36T tokens (3-stage: 30T+5T+long-ctx), vocab 151,669 | Qwen3 flagship | arXiv:2505.09388 | PAPER | 2025-05 |
 | 80B total/~3B active, 512 experts (10 routed+1 shared), 3:1 Gated DeltaNet:Gated Attention, 15T tokens (of 36T corpus) | Qwen3-Next-80B-A3B | Alibaba Cloud blog | OFFICIAL | 2025-09 |
 | 397B-A17B | Qwen3.5 flagship MoE | Secondary coverage | HEARSAY | 2026-02 |
@@ -737,6 +740,7 @@ Compiled from the "Hard numbers" sections of all 42 research-note files in `pret
 | 256+1 experts, 744B/40B active, 80 layers, DeepSeek Sparse Attention | GLM-5 | arXiv:2602.15763 | PAPER | 2026 |
 | 456B total/45.9B active, 1 softmax block per 7 lightning blocks, 7.5T continual-pretrain tokens | MiniMax-M1 | arXiv:2506.13585 | PAPER | 2025-06 |
 | 229.9B total/9.8B active, 62 layers, full attention (reversal from M1's hybrid), 29.2T tokens, 192K native context, 48Q/8KV heads, d_model 3072, vocab 200,064 | MiniMax-M2 | arXiv:2605.26494 | PAPER | ~2026 |
+| Two-branch block-sparse on GQA: index branch picks KV blocks, main branch exact softmax; 28.4× attention-compute cut at 1M ctx, GQA-parity quality; validated 109B MoE/3T tokens; 9.7× prefill / 15.6× decode vs. prior gen | MiniMax MSA (M3's attention; completes linear→full→sparse trajectory) | arXiv:2606.13392 | PAPER | 2026-06 |
 | 321B total (316B LLM+5B vision)/38B active, 61 layers | Step-3 | arXiv:2507.19427 | PAPER | 2025-07 |
 | 1T total/51B active, 80 layers, 256 experts top-8+1 shared, 20T+ tokens | Ant Ling-1T | arXiv:2510.22115 | PAPER | 2025-10 |
 | 256 experts top-8+1 shared, ~3.5% activation, >7× efficiency leverage vs. dense | Ant Ling 2.0 config | arXiv:2510.22115 | PAPER | 2025-10 |
@@ -831,8 +835,8 @@ Compiled from the "Hard numbers" sections of all 42 research-note files in `pret
 | $1.95/M tokens, $29.1M total | Llama3-405B, 15T-token BF16 pretrain, 2,304×H100 | SemiAnalysis | HEARSAY | 2025-08 |
 | 72¢→54.2¢/M tokens ($218k→$162k total) | GPT-3-175B 300B-token pretrain cost, FP8, Jan→Dec 2024 | SemiAnalysis | HEARSAY | 2025-08 |
 | $4.5M → $2.5M (proj.) | DeepSeek-670B 14.8T-token full pretrain cost, GB200, Jul→Dec-2025 | SemiAnalysis | HEARSAY | 2025-08 |
-| 100k GB200 @15% MFU, 50T tokens: 9.41 pure-compute days, $56.5–113M | Money-table synthesis | Notes' own calculation | DERIVED | 2026-07 |
-| 100k GB200 @35% MFU, 25T tokens: 2.02 pure-compute days, $12.1–24.2M | Money-table synthesis | Notes' own calculation | DERIVED | 2026-07 |
+| 100k GB200 @15% MFU, 50T tokens: 9.41 pure-compute days, $56.5–113M | Money-table synthesis | Our own calculation (Ch23) | DERIVED | 2026-07 |
+| 100k GB200 @35% MFU, 25T tokens: 2.02 pure-compute days, $12.1–24.2M | Money-table synthesis | Our own calculation (Ch23) | DERIVED | 2026-07 |
 | ~$0.5B | Estimated compute cost of a 6-month Orion/GPT-4.5-class run | WSJ via Fortune | HEARSAY | 2025-02 |
 | ~$1B | Estimated cloud compute cost for a "GPT-5-scale" run (excl. datacenter capex) | WSJ via Fortune | HEARSAY | 2025-02 |
 | >$2B | Estimated compute cost of OpenAI "Spud" (shipped as GPT-5.5) pretraining run | Aggregated tracker sites | HEARSAY | 2026 |
@@ -852,7 +856,7 @@ Compiled from the "Hard numbers" sections of all 42 research-note files in `pret
 | 3.5 GW | Anthropic–Google–Broadcom follow-on capacity, starting 2027 | TechCrunch | HEARSAY | 2026-04-07 |
 | Up to $40B / 5GW / up to 1M Ironwood chips | Bloomberg's cumulative framing of the Anthropic-Google relationship (doesn't match any single official figure) | Bloomberg | **[CONFLICT with above rows — different aggregations of the same relationship]** | 2026-05-18 |
 | $100B over 10 years, up to 5 GW | Anthropic's AWS spend commitment | Anthropic official blog | OFFICIAL | ~2025 |
-| ~500,000 → >1,000,000 Trainium2/3 chips (target, training+inference), end-2026 | Anthropic Project Rainier / AWS footprint | AWS official; Anthropic/Amazon official (updated figure supersedes earlier "~500K") | OFFICIAL | 2025-10 → 2026-04-20 |
+| ~500,000 → >1,000,000 Trainium2/3 chips (training+inference; 1M target originally set for end-2025, reported surpassed present-tense by 2026-04-20) | Anthropic Project Rainier / AWS footprint | AWS official; Anthropic/Amazon official (updated figure supersedes earlier "~500K") | OFFICIAL | 2025-10 → 2026-04-20 |
 | $8B | Amazon's cumulative equity investment in Anthropic since 2023 | Yahoo Finance/Amazon | HEARSAY | 2025-10 |
 | $30B run-rate revenue (up from ~$9B end-2025) | Anthropic | TechCrunch, citing Anthropic | HEARSAY | 2026-04-07 |
 | $380B valuation (off $30B Series G) | Anthropic | TechCrunch | HEARSAY | 2026-04-07 |
