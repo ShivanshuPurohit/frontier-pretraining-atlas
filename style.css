@@ -696,6 +696,87 @@ td strong { font-weight: 700; }
   .topbar { display: none; }
 }
 
+/* ---------- figures (hand-drawn SVG, numbered like tables) ---------- */
+
+figure.vz { margin: 2.2rem 0 2.5rem; }
+main > article > figure.vz.wide { max-width: none; }
+
+figure.vz .fig-no {
+  font-family: var(--mono);
+  font-size: 0.64rem;
+  font-weight: 500;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin: 0 0 0.7rem;
+}
+
+figure.vz .scroll { overflow-x: auto; }
+figure.vz svg { display: block; width: 100%; height: auto; }
+
+figure.vz .vz-cap {
+  font-size: 0.78rem;
+  line-height: 1.6;
+  color: var(--ink-2);
+  margin: 0.8rem 0 0;
+  max-width: var(--measure);
+}
+
+/* SVG voice: mono labels in theme inks; geometry colored only via tokens
+   so dark mode needs nothing extra */
+.vz text { font-family: var(--mono); font-size: 11px; fill: var(--ink-2); }
+.vz .t-ttl  { font-family: var(--sans); font-weight: 650; font-size: 12.5px; fill: var(--ink); }
+.vz .t-num  { fill: var(--ink); font-variant-numeric: tabular-nums; }
+.vz .t-mut  { fill: var(--mut); font-size: 10px; }
+.vz .t-acc  { fill: var(--accent); }
+.vz .t-loud { fill: var(--loud); }
+.vz .t-bg   { fill: var(--bg); }
+.vz .t-s9   { font-size: 9.5px; }
+
+.vz .s-ink  { stroke: var(--ink); }
+.vz .s-ink2 { stroke: var(--ink-2); }
+.vz .s-mut  { stroke: var(--mut); }
+.vz .s-line { stroke: var(--line); }
+.vz .s-hair { stroke: var(--hair); }
+.vz .s-acc  { stroke: var(--accent); }
+.vz .s-loud { stroke: var(--loud); }
+.vz .f-none { fill: none; }
+.vz .f-bg   { fill: var(--bg); }
+.vz .f-ink  { fill: var(--ink); }
+.vz .f-ink2 { fill: var(--ink-2); }
+.vz .f-mut  { fill: var(--mut); }
+.vz .f-line { fill: var(--line); }
+.vz .f-hair { fill: var(--hair); }
+.vz .f-acc  { fill: var(--accent); }
+.vz .f-loud { fill: var(--loud); }
+.vz .f-acc-10  { fill: color-mix(in srgb, var(--accent) 10%, transparent); }
+.vz .f-acc-22  { fill: color-mix(in srgb, var(--accent) 22%, transparent); }
+.vz .f-loud-12 { fill: color-mix(in srgb, var(--loud) 12%, transparent); }
+.vz .f-loud-25 { fill: color-mix(in srgb, var(--loud) 25%, transparent); }
+.vz .f-ink-06  { fill: color-mix(in srgb, var(--ink) 6%, transparent); }
+.vz .f-ink-12  { fill: color-mix(in srgb, var(--ink) 12%, transparent); }
+
+/* motion: flows march, builds stagger in, phases alternate. Every figure is
+   complete when still — animation only adds time, so reduced-motion and
+   print lose nothing */
+@keyframes vz-march { to { stroke-dashoffset: -22; } }
+.vz .flow      { stroke-dasharray: 5 6; animation: vz-march 1.4s linear infinite; }
+.vz .flow-slow { stroke-dasharray: 3 8; animation: vz-march 3.2s linear infinite; }
+@keyframes vz-build  { from { opacity: 0; } }
+@keyframes vz-build2 { from { opacity: 0; } }
+.vz .build { animation: vz-build 0.5s both; animation-delay: calc(var(--t, 0) * var(--step, 0.3s)); }
+figure.vz:hover .build { animation-name: vz-build2; } /* hovering replays the build */
+@keyframes vz-pulse { 50% { opacity: 0.3; } }
+.vz .pulse { animation: vz-pulse 2.2s ease-in-out infinite; }
+@keyframes vz-ph-a { 0%, 40% { opacity: 1; } 50%, 90% { opacity: 0.12; } 100% { opacity: 1; } }
+@keyframes vz-ph-b { 0%, 40% { opacity: 0.12; } 50%, 90% { opacity: 1; } 100% { opacity: 0.12; } }
+.vz .ph-a { animation: vz-ph-a 5.5s linear infinite; }
+.vz .ph-b { animation: vz-ph-b 5.5s linear infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .vz * { animation: none !important; }
+}
+
 /* ---------- print ---------- */
 
 @media print {
@@ -704,4 +785,5 @@ td strong { font-weight: 700; }
   html { background: white; }
   body { color: black; font-size: 10pt; }
   a { text-decoration: none; color: inherit; }
+  .vz * { animation: none !important; }
 }

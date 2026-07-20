@@ -10,7 +10,7 @@
 <title>The Parallelism Math for 10T/200B on 100k GB200 · The Frontier Pretraining Atlas</title>
 <meta name="description" content="Derives the parallelism math from first principles using the JAX Scaling Book's roofline algebra; works the MoE-specific formulas and shows why pure DP/FSDP is comms-bound while ZeRO-1-plus-EP escapes the same trap; closes with three fully-worked candidate layouts.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23245f4f'/%3E%3Cg fill='%23f6f4ec'%3E%3Ccircle cx='16' cy='16' r='5' opacity='.32'/%3E%3Ccircle cx='32' cy='16' r='5'/%3E%3Ccircle cx='48' cy='16' r='5' opacity='.32'/%3E%3Ccircle cx='16' cy='32' r='5' opacity='.32'/%3E%3Ccircle cx='32' cy='32' r='5' opacity='.32'/%3E%3Ccircle cx='48' cy='32' r='5' opacity='.32'/%3E%3Ccircle cx='16' cy='48' r='5'/%3E%3Ccircle cx='32' cy='48' r='5' opacity='.32'/%3E%3Ccircle cx='48' cy='48' r='5' opacity='.32'/%3E%3C/g%3E%3C/svg%3E">
-<link rel="stylesheet" href="style.css?v=781c36ad">
+<link rel="stylesheet" href="style.css?v=3592c610">
 </head>
 <body>
 <div class="frame">
@@ -62,7 +62,7 @@
 <header class="chapter-head">
 <p class="eyebrow">Chapter 18 · Part IV — The Machine</p>
 <h1 class="chapter-title">The Parallelism Math for 10T/200B on 100k GB200</h1>
-<p class="vitals">11 sections · 3 tables · ≈5.6k words</p>
+<p class="vitals">11 sections · 3 tables · 2 figures · ≈5.6k words</p>
 </header>
 <details class="contents"><summary>Contents</summary><ol>
 <li><a href="#the-roofline-algebra-restated-for-gpus">The roofline algebra, restated for GPUs</a></li>
@@ -123,7 +123,329 @@
 <h2 id="three-worked-candidate-layouts">Three worked candidate layouts</h2>
 <p><strong>Layout 1 — the anti-pattern, shown to make the “pure DP is dead” argument concrete.</strong> EP=8 (single H100-style node-equivalent, deliberately under-using the 72-GPU domain), DP≈12,288 to reach 100k GPUs, PP and TP minimal. At E/k=64 and any realistic per-domain bandwidth, the FSDP-style critical batch this configuration needs is in the millions-to-tens-of-millions of tokens <em>per GPU</em> — even the most permissive cross-domain figure derived above (3.2M tokens/GPU at ConnectX-8) times a DP degree in the thousands implies a global batch requirement several orders of magnitude beyond anything in the LLaMA-3-to-DeepSeek-V3 range. This configuration does not train at a usable MFU; it is included to show numerically why “just use more DP” fails, not as a real candidate.</p>
 <p><strong>Layout 2 — DeepSeek-style scaled up, the bulk-training (4-8K context) recommendation.</strong> EP=64 (fits inside one NVL72 domain, 8 of the strawman’s 512 experts per GPU, leaving 8-GPU hot-spare headroom), PP=8 physical stages with VPP=4 (Flexible Asymmetric VPP, 32 effective pipeline slots for ~96 layers ≈ 3 layers/slot), TP=1, DP=192 via ZeRO-1. Total: 64×8×192 = 98,304 GPUs (≈1,365 NVL72 domains), leaving headroom below the 100k budget for evaluation, checkpoint-coordination, and spare capacity. Interleaved-bubble check: keeping <code>r=(p-1)/(v·m)</code> under 10% with p=8, v=4 requires m≥18 microbatches per flush — comfortably achievable. ZeRO-1 compute-bound check on the DP axis: 50,000 tokens/GPU (ConnectX-8) is easily cleared by 18-24 microbatches of a few thousand tokens each. Predicted global batch, order of magnitude: 10-15M tokens, bracketed by LLaMA-3’s 16M and DeepSeek-V3’s 63M. <strong>Predicted MFU</strong>: the closest measured empirical anchor is Megatron-Core’s own DeepSeek-V3-685B benchmark on GB200 at PP4×VPP4×EP64/256 GPUs — 1,048 TFLOPS/GPU sustained MXFP8, which is 21.0% FP8 MFU against the corrected 5.0 PFLOPS denominator (857 TFLOPS/GPU BF16, 34.3% BF16 MFU against the corrected 2.5 PFLOPS denominator; Table 11, normalized against Ch16’s corrected peaks). The strawman’s narrower experts (d_expert≈1400 versus DeepSeek’s 2048, roughly 30% narrower) push arithmetic intensity down further, and 512 experts versus 256 adds routing/permutation overhead on top of the ~9% Megatron-Core already measures post-fusion; both effects push predicted MFU below the anchor. This is an extrapolation, not a measurement: a defensible planning range is <strong>15-19% FP8 MFU (≈30-38% BF16-equivalent)</strong>, with the DeepSeek-V3-on-GB200 figure as the optimistic bound and the activation-recomputation tax (20-40%, above) layered on separately as a further, not-yet-included, throughput cost.</p>
+<figure id="fig-18-1" class="vz"><figcaption class="fig-no">Figure 18.1</figcaption>
+<div class="scroll"><svg style="min-width:620px" viewBox="0 0 680 344" role="img" aria-label="How Layout 2 factors 98,304 GPUs: EP 64 inside one NVL72 domain, times 8 pipeline stages, times 192 data-parallel replicas">
+<g class="build" style="--t:0;--step:.5s">
+<text class="t-ttl" x="0" y="20">EP = 64</text>
+<text class="t-mut" x="0" y="38">inside one NVL72 domain</text>
+<rect class="f-acc-22" x="0" y="56" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="18" y="56" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="36" y="56" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="54" y="56" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="72" y="56" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="90" y="56" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="108" y="56" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="126" y="56" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="0" y="74" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="18" y="74" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="36" y="74" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="54" y="74" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="72" y="74" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="90" y="74" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="108" y="74" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="126" y="74" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="0" y="92" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="18" y="92" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="36" y="92" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="54" y="92" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="72" y="92" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="90" y="92" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="108" y="92" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="126" y="92" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="0" y="110" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="18" y="110" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="36" y="110" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="54" y="110" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="72" y="110" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="90" y="110" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="108" y="110" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="126" y="110" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="0" y="128" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="18" y="128" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="36" y="128" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="54" y="128" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="72" y="128" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="90" y="128" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="108" y="128" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="126" y="128" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="0" y="146" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="18" y="146" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="36" y="146" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="54" y="146" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="72" y="146" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="90" y="146" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="108" y="146" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="126" y="146" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="0" y="164" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="18" y="164" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="36" y="164" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="54" y="164" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="72" y="164" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="90" y="164" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="108" y="164" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="126" y="164" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="0" y="182" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="18" y="182" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="36" y="182" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="54" y="182" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="72" y="182" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="90" y="182" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="108" y="182" width="16" height="16" rx="2"/>
+<rect class="f-acc-22" x="126" y="182" width="16" height="16" rx="2"/>
+<rect class="f-none s-line" x="0" y="200" width="16" height="16" rx="2" stroke-width="1"/>
+<rect class="f-none s-line" x="18" y="200" width="16" height="16" rx="2" stroke-width="1"/>
+<rect class="f-none s-line" x="36" y="200" width="16" height="16" rx="2" stroke-width="1"/>
+<rect class="f-none s-line" x="54" y="200" width="16" height="16" rx="2" stroke-width="1"/>
+<rect class="f-none s-line" x="72" y="200" width="16" height="16" rx="2" stroke-width="1"/>
+<rect class="f-none s-line" x="90" y="200" width="16" height="16" rx="2" stroke-width="1"/>
+<rect class="f-none s-line" x="108" y="200" width="16" height="16" rx="2" stroke-width="1"/>
+<rect class="f-none s-line" x="126" y="200" width="16" height="16" rx="2" stroke-width="1"/>
+<text class="t-mut" x="0" y="240">8 experts per GPU &#183; 512 routed total</text>
+<text class="t-mut" x="0" y="255">8 held as hot spares</text>
+</g>
+<g class="build" style="--t:1;--step:.5s">
+<text class="t-ttl" x="228" y="20">&#215; PP 8</text>
+<text class="t-mut" x="228" y="38">stages, VPP=4 interleaved</text>
+<rect class="f-acc-10 s-acc" x="228" y="56" width="150" height="16" rx="2" stroke-width="1"/>
+<rect class="f-acc-10 s-acc" x="228" y="77" width="150" height="16" rx="2" stroke-width="1"/>
+<rect class="f-acc-10 s-acc" x="228" y="98" width="150" height="16" rx="2" stroke-width="1"/>
+<rect class="f-acc-10 s-acc" x="228" y="119" width="150" height="16" rx="2" stroke-width="1"/>
+<rect class="f-acc-10 s-acc" x="228" y="140" width="150" height="16" rx="2" stroke-width="1"/>
+<rect class="f-acc-10 s-acc" x="228" y="161" width="150" height="16" rx="2" stroke-width="1"/>
+<rect class="f-acc-10 s-acc" x="228" y="182" width="150" height="16" rx="2" stroke-width="1"/>
+<rect class="f-acc-10 s-acc" x="228" y="203" width="150" height="16" rx="2" stroke-width="1"/>
+<text class="t-s9" x="234" y="68">stage 0</text>
+<text class="t-s9" x="234" y="215">stage 7</text>
+<text class="t-mut" x="228" y="240">one model instance = 512 GPUs</text>
+<text class="t-mut" x="228" y="255">holding all 10T parameters</text>
+</g>
+<g class="build" style="--t:2;--step:.5s">
+<text class="t-ttl" x="462" y="20">&#215; DP 192</text>
+<text class="t-mut" x="462" y="38">ZeRO-1 replicas</text>
+<rect class="f-acc-22" x="462" y="56" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="475" y="56" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="488" y="56" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="501" y="56" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="514" y="56" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="527" y="56" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="540" y="56" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="553" y="56" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="566" y="56" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="579" y="56" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="592" y="56" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="605" y="56" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="618" y="56" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="631" y="56" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="644" y="56" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="657" y="56" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="462" y="69" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="475" y="69" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="488" y="69" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="501" y="69" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="514" y="69" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="527" y="69" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="540" y="69" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="553" y="69" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="566" y="69" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="579" y="69" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="592" y="69" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="605" y="69" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="618" y="69" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="631" y="69" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="644" y="69" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="657" y="69" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="462" y="82" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="475" y="82" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="488" y="82" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="501" y="82" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="514" y="82" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="527" y="82" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="540" y="82" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="553" y="82" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="566" y="82" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="579" y="82" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="592" y="82" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="605" y="82" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="618" y="82" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="631" y="82" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="644" y="82" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="657" y="82" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="462" y="95" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="475" y="95" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="488" y="95" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="501" y="95" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="514" y="95" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="527" y="95" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="540" y="95" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="553" y="95" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="566" y="95" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="579" y="95" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="592" y="95" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="605" y="95" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="618" y="95" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="631" y="95" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="644" y="95" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="657" y="95" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="462" y="108" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="475" y="108" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="488" y="108" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="501" y="108" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="514" y="108" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="527" y="108" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="540" y="108" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="553" y="108" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="566" y="108" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="579" y="108" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="592" y="108" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="605" y="108" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="618" y="108" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="631" y="108" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="644" y="108" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="657" y="108" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="462" y="121" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="475" y="121" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="488" y="121" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="501" y="121" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="514" y="121" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="527" y="121" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="540" y="121" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="553" y="121" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="566" y="121" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="579" y="121" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="592" y="121" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="605" y="121" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="618" y="121" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="631" y="121" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="644" y="121" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="657" y="121" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="462" y="134" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="475" y="134" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="488" y="134" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="501" y="134" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="514" y="134" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="527" y="134" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="540" y="134" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="553" y="134" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="566" y="134" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="579" y="134" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="592" y="134" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="605" y="134" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="618" y="134" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="631" y="134" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="644" y="134" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="657" y="134" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="462" y="147" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="475" y="147" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="488" y="147" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="501" y="147" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="514" y="147" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="527" y="147" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="540" y="147" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="553" y="147" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="566" y="147" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="579" y="147" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="592" y="147" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="605" y="147" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="618" y="147" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="631" y="147" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="644" y="147" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="657" y="147" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="462" y="160" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="475" y="160" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="488" y="160" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="501" y="160" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="514" y="160" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="527" y="160" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="540" y="160" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="553" y="160" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="566" y="160" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="579" y="160" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="592" y="160" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="605" y="160" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="618" y="160" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="631" y="160" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="644" y="160" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="657" y="160" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="462" y="173" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="475" y="173" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="488" y="173" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="501" y="173" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="514" y="173" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="527" y="173" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="540" y="173" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="553" y="173" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="566" y="173" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="579" y="173" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="592" y="173" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="605" y="173" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="618" y="173" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="631" y="173" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="644" y="173" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="657" y="173" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="462" y="186" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="475" y="186" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="488" y="186" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="501" y="186" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="514" y="186" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="527" y="186" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="540" y="186" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="553" y="186" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="566" y="186" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="579" y="186" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="592" y="186" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="605" y="186" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="618" y="186" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="631" y="186" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="644" y="186" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="657" y="186" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="462" y="199" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="475" y="199" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="488" y="199" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="501" y="199" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="514" y="199" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="527" y="199" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="540" y="199" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="553" y="199" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="566" y="199" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="579" y="199" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="592" y="199" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="605" y="199" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="618" y="199" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="631" y="199" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="644" y="199" width="11" height="11" rx="1"/>
+<rect class="f-acc-22" x="657" y="199" width="11" height="11" rx="1"/>
+<text class="t-mut" x="462" y="240">weights already sharded by EP&#215;PP;</text>
+<text class="t-mut" x="462" y="255">gradient AllReduce rides the fabric</text>
+</g>
+<g class="build" style="--t:3;--step:.5s">
+<text class="t-num" x="0" y="292">64 &#215; 8 &#215; 192 = 98,304 GPUs &#8776; 1,365 NVL72 domains, headroom below the 100k budget</text>
+<text class="t-mut" x="0" y="312">the long-context stage keeps the same total and swaps DP 192 &#8594; CP 4 &#215; DP 48 (Layout 3)</text>
+</g>
+</svg></div>
+<p class="vz-cap">Layout 2, drawn to structure. Expert parallelism fills one NVL72 domain per pipeline stage — 64 of 72 GPUs, sized to divide 512 experts evenly and leave the operational hot-spare margin — so the all-to-all crossbar never leaves NVLink. Eight pipeline stages make a 512-GPU model instance holding all 10T parameters; 192 ZeRO-1 replicas of that instance fill the fleet. Every axis is placed where its traffic is cheapest: EP inside the domain, PP and DP on the scale-out fabric (Ch20).</p>
+</figure>
 <p>Layout 2 also exposes a structural effect that, as far as we can tell, is stated nowhere in the parallelism literature — it belongs in the open rather than buried in a kernel footnote. (The derivation is ours.) Call it <strong>expert-batch starvation</strong>: the average per-expert grouped-GEMM batch is <code>M = B_global·k/(E·DP·m)</code> — global batch times routed fraction, divided across DP replicas and pipeline microbatches. DeepSeek-V3 never had to think about this term because its DP degree was 2: at a ~60M-token batch, EP64 and E=256, its per-expert M sat in the thousands-to-tens-of-thousands for any plausible microbatch count. Layout 2 divides a critical-batch-bounded 10-15M-token global batch by DP=192 <em>and</em> m≥18 (the microbatch count its own bubble math requires), leaving <strong>M ≈ 45-70 tokens per expert per GEMM call as the average case</strong> — squarely in the small-M regime where the one measured nearby datapoint (M=128 → 190 TFLOPS on H800, ~12% of the same library’s well-shaped peak, Ch10) says grouped-GEMM efficiency collapses, and where Ch17’s documented 10x naive-to-tuned Blackwell headroom is sampled at its bad end. The general law is worth stating because it does not appear in the Scaling Book, the Megatron papers, or the MoE-design literature, each of which owns only one factor of the denominator: <strong>at fixed global batch, per-expert GEMM efficiency degrades inversely with DP degree times microbatch count — so scaling a granular MoE to more GPUs makes every expert’s matmul thinner even when all the communication is perfectly hidden.</strong> The gradient-noise ceiling (Ch8) caps <code>B_global</code>; the bubble formula forces <code>m</code> up with pipeline depth; E/k is fixed by the architecture’s granularity bet (Ch7); DP is whatever is left after EP and PP saturate their domains. Every escape route is therefore a real design trade, not a tuning knob: raise the global batch toward (or past) the critical-batch ceiling — which is precisely the move Muon’s large-batch tolerance (Ch9) underwrites, and a better explanation than fashion for why 2026 frontier batches drift toward 60-100M tokens; shrink m and buy back the bubble with DualPipe-style dual injection rather than microbatch count; or coarsen the granularity bet itself, trading Ch7’s EL-law compounding for fatter GEMMs. A 100k-GPU MoE program that discovers this arithmetic <em>after</em> freezing E, k, and the optimizer has already spent its escape routes — this single interaction, more than any kernel gap in Ch17, is why architecture, optimizer, and parallelism (Ch7, Ch9, this chapter) are one decision, not three.</p>
+<figure id="fig-18-2" class="vz"><figcaption class="fig-no">Figure 18.2</figcaption>
+<div class="scroll"><svg style="min-width:620px" viewBox="0 0 748 258" role="img" aria-label="Expert-batch starvation: the global batch divided by routed fraction, data parallelism, and microbatch count leaves about 54 tokens per expert GEMM">
+<text class="t-ttl" x="0" y="16">M = B&#183;k / (E&#183;DP&#183;m) &#8212; where the tokens go</text>
+<text x="0" y="54">global batch B</text>
+<rect class="build f-acc-22" style="--t:0" x="118" y="40" width="496" height="18" rx="2"/>
+<text class="t-num build" style="--t:0" x="622" y="54">12M tokens/step</text>
+<text x="0" y="88">&#215; k/E = 8/512</text>
+<rect class="build f-acc-22" style="--t:1" x="118" y="74" width="369" height="18" rx="2"/>
+<text class="t-num build" style="--t:1" x="495" y="88">187.5k tokens per expert per step</text>
+<text x="0" y="122">&#247; DP = 192</text>
+<rect class="build f-acc-22" style="--t:2" x="118" y="108" width="209" height="18" rx="2"/>
+<text class="t-num build" style="--t:2" x="335" y="122">&#8776;976 per expert per replica</text>
+<text x="0" y="156">&#247; m = 18</text>
+<rect class="build f-loud-25 s-loud" style="--t:3" x="118" y="142" width="121" height="18" rx="2" stroke-width="1"/>
+<text class="t-num build" style="--t:3" x="247" y="156">&#8776;54 tokens per expert GEMM call</text>
+<line class="s-mut" x1="266" y1="36" x2="266" y2="178" stroke-width="1" stroke-dasharray="3 3"/>
+<text class="t-mut" x="272" y="192">M=128, the one nearby measurement: 190 TFLOPS on H800, &#8776;12% of peak (Ch10)</text>
+<text class="t-mut" x="118" y="220">bar length &#8733; log&#8321;&#8320; tokens &#8212; each division is invisible in a bandwidth budget, fatal in a GEMM shape</text>
+</svg></div>
+<p class="vz-cap">The starvation law, worked at Layout 2&#8217;s own numbers. A gradient-noise-bounded 12M-token global batch keeps only k/E = 8/512 of itself per expert, then divides across 192 replicas and 18 microbatches — leaving an average expert GEMM of ~45&#8211;70 tokens, at the bad end of the measured grouped-GEMM efficiency curve. Every factor is owned by a different chapter&#8217;s decision — B by the noise ceiling (Ch8), k/E by the granularity bet (Ch7), m by the bubble formula, DP by whatever is left — which is why this arithmetic must run before any of them freezes.</p>
+</figure>
 <p><strong>Layout 3 — long-context extension stage (32-128K tokens), Ch7’s curriculum tail.</strong> Starting from Layout 2’s EP64×PP8 unit, insert Ulysses-style context parallelism CP=4 and shrink DP correspondingly: EP64×PP8×CP4×DP48 = 98,304 GPUs (same total). At 128K context, the T&gt;8D crossover derived above means attention FLOPs are solidly dominant, making CP load-bearing rather than optional. Two countervailing effects on predicted MFU relative to Layout 2: Megatron-Core’s own long-context measurements (§6.5) show DeepSeek-V3-style (dense-attention-heavy) architectures losing MFU at 256K context (88% of short-context MFU on H100) while SDPA-kernel-efficient architectures like Qwen3-235B-A22B actually <em>gain</em> MFU at long context (129% of short-context). The strawman’s DSA-style trainable sparse attention (Ch7) — O(Lk) rather than O(L²) — argues for a milder version of the Qwen3 pattern rather than the DeepSeek-V3 pattern, since sparse attention’s cost doesn’t scale with L the way dense attention’s does. Net <strong>predicted MFU: roughly 85-95% of Layout 2’s figure</strong>, i.e., in the low-to-mid-teens percent FP8 — but this combines two extrapolations (Layout 2’s own uncertainty, plus the DSA-tempers-long-context-cost argument) and should be treated as the most speculative number in this chapter.</p>
 <p>Two placement facts about Layout 3 deserve to be stated because the layout table hides them. (Both are our own working-out of the layout geometry.) First, <strong>CP4 necessarily crosses NVL72 domains</strong>: each pipeline stage’s EP64 already fills a domain, so the four CP ranks sharing a sequence live in four <em>different</em> racks, and the Ulysses all-to-all rides the scale-out fabric, not NVLink. (The alternative — packing CP4×EP16 inside one domain — puts 32 experts ≈ 78B routed parameters on each GPU, which the memory audit above rules out at 186 GB.) The volume arithmetic makes this material rather than cosmetic: Ulysses moves roughly 4·tokens·d_model bytes per attention layer against dispatch-plus-combine’s 2k·tokens·d_model — about a quarter of the MoE volume at top-8 — but at one-ninth the bandwidth (100 vs 900 GB/s per GPU), so its <em>time</em> cost is roughly <strong>2x the entire intra-domain MoE dispatch per layer</strong> unless overlapped, partially tempered by MLA’s compressed KV shrinking the K/V share of the transfer (Ch6). Second, nobody has published how context parallelism composes with <em>trainable-sparse</em> attention at all: Ulysses and ring variants both assume every query can reach every key, but under DSA each query’s top-k selected tokens live on arbitrary CP ranks, so the natural implementation gathers the compressed/indexer representation globally and fetches only selected KV — a different communication pattern from either standard scheme, with volume scaling on k rather than sequence length. DeepSeek necessarily built this for V4’s 1M-token training (as Moonshot did for K3’s), but neither has documented it; a run adopting Ch7’s DSA-style attention should treat CP-composed-with-sparse-attention as a build item with no public reference implementation, not a solved configuration.</p>
 <figure class="table" id="table-18-3"><figcaption class="table-no">Table 18.3</figcaption><div class="scroll"><table><thead><tr><th>Layout</th><th>EP</th><th>PP (×VPP/CP)</th><th>TP</th><th>DP (ZeRO stage)</th><th>GPUs</th><th>Predicted FP8 MFU</th></tr></thead><tbody>

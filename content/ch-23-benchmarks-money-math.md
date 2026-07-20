@@ -136,6 +136,41 @@ cost    = days(MFU, tokens) × daily_$
 
 A cross-check the table's $2.40 lower bound deserves, because it determines whether that bound is a real economic floor or a promotional artifact (our own cross-check, from Ch16's capex figures): build the same number from ownership economics instead of rental pricing. At Ch16's ~$3.9M all-in per GB200 NVL72 rack, a 100,000-GPU fleet is ~1,389 racks ≈ **$5.4B of capex**; straight-line over a three-year useful life gives ~$4.95M/day of depreciation. Power adds surprisingly little: ~208 MW of IT load at ~150 kW/rack, ~260 MW at a 1.25 PUE, is ~$0.37M/day at $0.06/kWh. The owner's all-in daily cost, ~$5.3M/day, lands within ~8% of the $2.40/GPU-hr rental floor's $5.76M/day — meaning the 25th-percentile neocloud price is very close to bare cost-recovery at three-year depreciation, the table's lower bound is an economic floor rather than a loss-leader, and there is no dramatically cheaper number available to an owner-operator that the rental framing hides. Two corollaries worth stating: energy is only ~7% of the daily cost — this business is silicon amortization, not electricity, so a cheap-power site helps the *feasibility* of the interconnect (Ch16's oscillation envelope) far more than the budget; and the single most cost-sensitive assumption in the entire table is not the $/hr at all but the depreciation horizon — stretch three years to five and the owner's floor drops ~35%, which is exactly the bet embedded in every hyperscaler's accounting-lifetime extension announcements of 2024–2026.
 
+<figure class="vz">
+<div class="scroll"><svg style="min-width:620px" viewBox="0 0 748 268" role="img" aria-label="Daily cost of 100,000 GB200 GPUs: owner economics converge within 8 percent of the 25th-percentile rental floor">
+<text class="t-ttl" x="0" y="16">100,000 GPUs, per day</text>
+<text x="0" y="56">own, 3-yr straight-line</text>
+<rect class="build f-acc-22" style="--t:0" x="180" y="42" width="228" height="20" rx="2"/>
+<rect class="build f-loud-25" style="--t:0" x="408" y="42" width="17" height="20" rx="2"/>
+<text class="t-num build" style="--t:0" x="433" y="56">$5.3M</text>
+<text class="t-mut" x="180" y="80">depreciation $4.95M &#183; power $0.37M (260 MW at 1.25 PUE, $0.06/kWh)</text>
+<text x="0" y="118">rent at the $2.40/hr floor</text>
+<rect class="build f-ink-12" style="--t:1" x="180" y="104" width="265" height="20" rx="2"/>
+<text class="t-num build" style="--t:1" x="453" y="118">$5.76M &#8212; within 8% of owning</text>
+<text x="0" y="164">rent at $5.00/hr</text>
+<rect class="build f-hair s-line" style="--t:2" x="180" y="150" width="552" height="20" rx="2" stroke-width="1"/>
+<text class="t-num build" style="--t:2" x="186" y="164">$12.0M &#8212; the illustrative GB300-pricing ceiling</text>
+<line class="s-line" x1="180" y1="182" x2="180" y2="188" stroke-width="1"/>
+<text class="t-mut" x="174" y="202">0</text>
+<line class="s-line" x1="272" y1="182" x2="272" y2="188" stroke-width="1"/>
+<text class="t-mut" x="266" y="202">2</text>
+<line class="s-line" x1="364" y1="182" x2="364" y2="188" stroke-width="1"/>
+<text class="t-mut" x="358" y="202">4</text>
+<line class="s-line" x1="456" y1="182" x2="456" y2="188" stroke-width="1"/>
+<text class="t-mut" x="450" y="202">6</text>
+<line class="s-line" x1="548" y1="182" x2="548" y2="188" stroke-width="1"/>
+<text class="t-mut" x="542" y="202">8</text>
+<line class="s-line" x1="640" y1="182" x2="640" y2="188" stroke-width="1"/>
+<text class="t-mut" x="634" y="202">10</text>
+<line class="s-line" x1="732" y1="182" x2="732" y2="188" stroke-width="1"/>
+<text class="t-mut" x="726" y="202">12</text>
+<text class="t-mut" x="404" y="220">$M per day</text>
+<text class="t-mut" x="0" y="244">energy is ~7% of the owner&#8217;s day &#8212; the business is silicon amortization, not electricity;</text>
+<text class="t-mut" x="0" y="258">a 5-year depreciation bet drops the floor ~35%</text>
+</svg></div>
+<p class="vz-cap">The cross-check that makes the cost table&#8217;s lower bound trustworthy: build the owner&#8217;s number from Ch16&#8217;s capex instead of rental pricing. ~1,389 racks at ~$3.9M all-in is ~$5.4B; straight-line over three years is $4.95M/day, plus $0.37M of power — landing within 8% of what the 25th-percentile neocloud charges per day. The $2.40/hr floor is bare cost-recovery at three-year depreciation, not a loss-leader, and no dramatically cheaper number is available to an owner-operator. The most sensitive assumption in the whole money model is the depreciation horizon, not the hourly rate.</p>
+</figure>
+
 **Calendar-vs-compute adjustment.** These are pure-compute floors; the calendar schedule is longer once goodput is accounted for. Two independent goodput analyses give complementary views. SemiAnalysis's ClusterMAX "Goodput Expense" framework (based on a 5,184×GB300 NVL72 large-pretrain scenario — not identical scale/hardware to the 100k-GB200 target here, but the best available quantified real-world figure) gives Gold-tier 6.14%, Hyperscaler-tier 10.53%, Silver-tier 20.91% goodput expense — equivalently, multipliers of 1.065x, 1.118x, and 1.264x on pure-compute days:
 
 | Tier | Goodput expense | Calendar multiplier | 15%-MFU/50T case (9.44 pure-compute days) |

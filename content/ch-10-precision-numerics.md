@@ -113,6 +113,60 @@ That 96%+ efficiency is for isolated, well-shaped GEMM tiles. MoE training GEMM 
 
 Field MFU data teaches the same lesson from a different angle: on H100, FP8 MFU runs consistently *lower* than BF16 MFU as a percentage of each format's own peak — 39.5% versus 54% on GPT-3-175B across 128×H100, 35.5–38.1% versus 53.7–54.5% on Llama3-70B, ~43% versus ~54% on Llama3-405B (per SemiAnalysis's ["H100 vs GB200 NVL72 Training Benchmarks"](https://newsletter.semianalysis.com/p/h100-vs-gb200-nvl72-training-benchmarks), 2025, partially paywalled). This does not contradict FP8's value — it still wins on absolute tokens/s and $/token because its peak is roughly 2× higher — but it directly rebuts any planning heuristic that assumes FP8 achieves the same utilization *fraction* as BF16. The same source notes GB200-generation FP8 MFU improved from 29.5% to 39.5% "through software gains alone" over an unspecified maturation window — roughly a third of Blackwell's realized FP8 throughput gain over its early software state came from kernel and scheduling maturity, not hardware, a caution against reading any July-2026 MFU snapshot as a hardware ceiling. One figure to quarantine: the specific "38-46% sustained FP8 training MFU on NVL72" number sometimes attributed to NVIDIA could not be traced to any retrievable primary source — treat it as unconfirmed pending a located citation, not an official NVIDIA number.
 
+<figure class="vz">
+<div class="scroll"><svg style="min-width:600px" viewBox="0 0 680 416" role="img" aria-label="Training number formats drawn to scale, and the block-scaling granularity of each recipe">
+<text class="t-ttl" x="0" y="13">Element formats, to scale</text>
+<rect class="f-ink-12" x="420" y="4" width="10" height="10" rx="2"/><text class="t-mut" x="434" y="13">sign</text>
+<rect class="f-acc-22" x="470" y="4" width="10" height="10" rx="2"/><text class="t-mut" x="484" y="13">exponent</text>
+<rect class="f-loud-25" x="545" y="4" width="10" height="10" rx="2"/><text class="t-mut" x="559" y="13">mantissa</text>
+<text x="0" y="56">BF16</text>
+<rect class="f-ink-12" x="118" y="40" width="24" height="24" rx="2"/>
+<rect class="f-acc-22" x="143" y="40" width="24" height="24" rx="2"/><rect class="f-acc-22" x="168" y="40" width="24" height="24" rx="2"/><rect class="f-acc-22" x="193" y="40" width="24" height="24" rx="2"/><rect class="f-acc-22" x="218" y="40" width="24" height="24" rx="2"/><rect class="f-acc-22" x="243" y="40" width="24" height="24" rx="2"/><rect class="f-acc-22" x="268" y="40" width="24" height="24" rx="2"/><rect class="f-acc-22" x="293" y="40" width="24" height="24" rx="2"/><rect class="f-acc-22" x="318" y="40" width="24" height="24" rx="2"/>
+<rect class="f-loud-25" x="343" y="40" width="24" height="24" rx="2"/><rect class="f-loud-25" x="368" y="40" width="24" height="24" rx="2"/><rect class="f-loud-25" x="393" y="40" width="24" height="24" rx="2"/><rect class="f-loud-25" x="418" y="40" width="24" height="24" rx="2"/><rect class="f-loud-25" x="443" y="40" width="24" height="24" rx="2"/><rect class="f-loud-25" x="468" y="40" width="24" height="24" rx="2"/><rect class="f-loud-25" x="493" y="40" width="24" height="24" rx="2"/>
+<text class="t-num" x="530" y="56">1 · 8 · 7</text>
+<text x="0" y="90">FP8 E4M3</text>
+<rect class="f-ink-12" x="118" y="74" width="24" height="24" rx="2"/>
+<rect class="f-acc-22" x="143" y="74" width="24" height="24" rx="2"/><rect class="f-acc-22" x="168" y="74" width="24" height="24" rx="2"/><rect class="f-acc-22" x="193" y="74" width="24" height="24" rx="2"/><rect class="f-acc-22" x="218" y="74" width="24" height="24" rx="2"/>
+<rect class="f-loud-25" x="243" y="74" width="24" height="24" rx="2"/><rect class="f-loud-25" x="268" y="74" width="24" height="24" rx="2"/><rect class="f-loud-25" x="293" y="74" width="24" height="24" rx="2"/>
+<text class="t-num" x="330" y="90">1 · 4 · 3</text>
+<text class="t-mut" x="400" y="90">every DeepSeek-V3 GEMM</text>
+<text x="0" y="124">FP8 E5M2</text>
+<rect class="f-ink-12" x="118" y="108" width="24" height="24" rx="2"/>
+<rect class="f-acc-22" x="143" y="108" width="24" height="24" rx="2"/><rect class="f-acc-22" x="168" y="108" width="24" height="24" rx="2"/><rect class="f-acc-22" x="193" y="108" width="24" height="24" rx="2"/><rect class="f-acc-22" x="218" y="108" width="24" height="24" rx="2"/><rect class="f-acc-22" x="243" y="108" width="24" height="24" rx="2"/>
+<rect class="f-loud-25" x="268" y="108" width="24" height="24" rx="2"/><rect class="f-loud-25" x="293" y="108" width="24" height="24" rx="2"/>
+<text class="t-num" x="330" y="124">1 · 5 · 2</text>
+<text class="t-mut" x="400" y="124">Nemotron-H gradients</text>
+<text x="0" y="158">FP4 E2M1</text>
+<rect class="f-ink-12" x="118" y="142" width="24" height="24" rx="2"/>
+<rect class="f-acc-22" x="143" y="142" width="24" height="24" rx="2"/><rect class="f-acc-22" x="168" y="142" width="24" height="24" rx="2"/>
+<rect class="f-loud-25" x="193" y="142" width="24" height="24" rx="2"/>
+<text class="t-num" x="230" y="158">1 · 2 · 1</text>
+<text class="t-mut" x="300" y="158">the FP4 element, NVFP4 and MXFP4 alike</text>
+<text class="t-ttl" x="0" y="214">Where the dynamic range lives — elements per scale factor</text>
+<text x="0" y="244">NVFP4 1×16</text>
+<rect class="build f-acc-22" style="--t:0" x="118" y="232" width="96" height="16" rx="2"/>
+<text class="t-num" x="222" y="244">16</text>
+<text class="t-mut" x="250" y="244">E4M3 per block + FP32 per tensor</text>
+<text x="0" y="278">MXFP8 1×32</text>
+<rect class="build f-acc-22" style="--t:1" x="118" y="266" width="120" height="16" rx="2"/>
+<text class="t-num" x="246" y="278">32</text>
+<text class="t-mut" x="274" y="278">UE8M0 scale, power-of-two, rounded up</text>
+<text x="0" y="312">FP8 1×128</text>
+<rect class="build f-acc-22" style="--t:2" x="118" y="300" width="168" height="16" rx="2"/>
+<text class="t-num" x="294" y="312">128</text>
+<text class="t-mut" x="326" y="312">DeepSeek-V3 activations</text>
+<text x="0" y="346">FP8 128×128</text>
+<rect class="build f-acc-22" style="--t:3" x="118" y="334" width="336" height="16" rx="2"/>
+<text class="t-num" x="462" y="346">16,384</text>
+<text class="t-mut" x="520" y="346">DeepSeek-V3 weights</text>
+<text x="0" y="380">per-tensor</text>
+<rect class="build f-acc-10" style="--t:4" x="118" y="368" width="552" height="16" rx="2"/>
+<text class="t-mut" x="126" y="380">whole tensor, one FP32 scale — Nemotron-H recipe</text>
+<text class="t-mut" x="118" y="408">bar length ∝ log₂ of elements sharing one scale factor</text>
+</svg></div>
+<p class="vz-cap">Every format below BF16 moves dynamic range out of the element and into scale factors: the element loses bits (top, drawn to scale) while the scales get finer (bottom) — from one FP32 scale per tensor in Nemotron-H's recipe down to one E4M3 scale per 16 values plus an FP32 tensor-level backstop in NVFP4. That trade is why E4M3's extra mantissa bit beats E5M2's extra exponent bit once block scales absorb the range problem. Granularities per the DeepSeek-V3 report, NVIDIA's MXFP8 recipe (arXiv:2506.08027), and the NVFP4 recipe (arXiv:2509.25149); NVFP4 weights use 16×16 blocks, so their 2D scales each cover 256 elements.</p>
+</figure>
+
 ## The verdict: what to bet the run on in July 2026
 
 For a 10T-total/200B-active MoE on ~100,000 GB200 GPUs:

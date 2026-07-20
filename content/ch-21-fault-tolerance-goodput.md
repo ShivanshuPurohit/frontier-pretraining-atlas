@@ -38,6 +38,94 @@ Converting MTBI (GPU-days) to a fleet-level rate at N=100,000 GPUs by dividing M
 
 Three structurally independent methods converge on the same band. Llama 3's own observed rate, linearly scaled to 100,000 GPUs, gives 1.97 interruptions/hour (~47/day) — landing almost exactly on the H100 "worst-case" estimate, plausible since the Llama 3 cluster predates years of subsequent reliability hardening. (The extrapolation is ours.) FT-HSDP's directly measured "failure every 18 minutes" at 100K GPUs (3.33/hour) sits squarely inside the GB200 band — notable because that paper does not specify GPU generation, suggesting the 100K-GPU regime itself, independent of hardware, converges toward multiple interruptions per hour at that scale. The planning number to carry forward: **expect 1.5–4 unplanned interruptions per hour (35–100/day) on a 100,000-GB200 fleet**, strongly dependent on operator sophistication and whether the fleet has completed its first 3–6 months of tribal-knowledge accumulation.
 
+<figure class="vz">
+<div class="scroll"><svg style="min-width:620px" viewBox="0 0 680 272" role="img" aria-label="One hour at 100,000 GPUs: a failure every 18 minutes; naive synchronous restart yields 44 percent effective time, peer-replica recovery 80 percent">
+<text class="t-mut" x="148" y="14">one unplanned failure every 18 minutes at 100k GPUs &#8212; measured, FT-HSDP</text>
+<text class="t-loud" x="301" y="32">&#10007;</text>
+<line class="s-line" x1="305" y1="36" x2="305" y2="200" stroke-width="1" stroke-dasharray="2 4"/>
+<text class="t-loud" x="457" y="32">&#10007;</text>
+<line class="s-line" x1="461" y1="36" x2="461" y2="200" stroke-width="1" stroke-dasharray="2 4"/>
+<text class="t-loud" x="614" y="32">&#10007;</text>
+<line class="s-line" x1="618" y1="36" x2="618" y2="200" stroke-width="1" stroke-dasharray="2 4"/>
+<text x="0" y="58">naive sync</text>
+<text x="0" y="72">restart</text>
+<rect class="f-acc-22" x="148" y="44" width="70" height="20" rx="2"/>
+<rect class="f-loud-25" x="218" y="44" width="87" height="20" rx="2"/>
+<rect class="f-acc-22" x="305" y="44" width="69" height="20" rx="2"/>
+<rect class="f-loud-25" x="374" y="44" width="87" height="20" rx="2"/>
+<rect class="f-acc-22" x="461" y="44" width="70" height="20" rx="2"/>
+<rect class="f-loud-25" x="531" y="44" width="87" height="20" rx="2"/>
+<rect class="f-acc-22" x="618" y="44" width="52" height="20" rx="2"/>
+<text class="t-num" x="148" y="82">44% effective &#8212; 10 of every 18 minutes spent recovering</text>
+<text x="0" y="118">peer-replica</text>
+<text x="0" y="132">recovery</text>
+<rect class="f-acc-22" x="148" y="104" width="130" height="20" rx="2"/>
+<rect class="f-loud-25" x="278" y="104" width="27" height="20" rx="2"/>
+<rect class="f-acc-22" x="305" y="104" width="130" height="20" rx="2"/>
+<rect class="f-loud-25" x="435" y="104" width="26" height="20" rx="2"/>
+<rect class="f-acc-22" x="461" y="104" width="131" height="20" rx="2"/>
+<rect class="f-loud-25" x="592" y="104" width="26" height="20" rx="2"/>
+<rect class="f-acc-22" x="618" y="104" width="52" height="20" rx="2"/>
+<line class="s-mut" x1="148" y1="128" x2="148" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="160" y1="128" x2="160" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="171" y1="128" x2="171" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="183" y1="128" x2="183" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="194" y1="128" x2="194" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="206" y1="128" x2="206" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="218" y1="128" x2="218" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="229" y1="128" x2="229" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="241" y1="128" x2="241" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="252" y1="128" x2="252" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="264" y1="128" x2="264" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="276" y1="128" x2="276" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="287" y1="128" x2="287" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="299" y1="128" x2="299" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="310" y1="128" x2="310" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="322" y1="128" x2="322" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="334" y1="128" x2="334" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="345" y1="128" x2="345" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="357" y1="128" x2="357" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="368" y1="128" x2="368" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="380" y1="128" x2="380" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="392" y1="128" x2="392" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="403" y1="128" x2="403" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="415" y1="128" x2="415" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="426" y1="128" x2="426" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="438" y1="128" x2="438" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="450" y1="128" x2="450" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="461" y1="128" x2="461" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="473" y1="128" x2="473" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="484" y1="128" x2="484" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="496" y1="128" x2="496" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="508" y1="128" x2="508" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="519" y1="128" x2="519" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="531" y1="128" x2="531" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="542" y1="128" x2="542" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="554" y1="128" x2="554" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="566" y1="128" x2="566" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="577" y1="128" x2="577" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="589" y1="128" x2="589" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="600" y1="128" x2="600" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="612" y1="128" x2="612" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="624" y1="128" x2="624" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="635" y1="128" x2="635" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="647" y1="128" x2="647" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="658" y1="128" x2="658" y2="133" stroke-width="1"/>
+<line class="s-mut" x1="670" y1="128" x2="670" y2="133" stroke-width="1"/>
+<text class="t-num" x="148" y="150">80% effective &#8212; ~3 min stall: 60 s detect, &#60;5 s root-cause, peer-RAM restore</text>
+<text class="t-mut" x="148" y="166">ticks: async peer checkpoint every ~80 s &#8212; Young&#8217;s t* = &#8730;(2&#948;M), &#948;&#8776;1&#8211;5 s, M=18 min</text>
+<rect class="f-acc-10" x="148" y="182" width="522" height="16" rx="2"/>
+<text class="t-mut" x="156" y="194">TPU reference: Gemini goodput 97% single-pod, 93% cross-datacenter</text>
+<g class="sweep" style="--sw:522px;--swt:16s"><line class="s-ink" x1="148" y1="38" x2="148" y2="200" stroke-width="1" opacity="0.45"/></g>
+<text class="t-mut" x="140" y="220">0</text>
+<text class="t-mut" x="270" y="220">15</text>
+<text class="t-mut" x="401" y="220">30</text>
+<text class="t-mut" x="532" y="220">45</text>
+<text class="t-mut" x="634" y="220">60 min</text>
+</svg></div>
+<p class="vz-cap">One hour of the run, at the measured 100k-GPU failure rate. A naive synchronous restart — reschedule, reload, replay — burns 10 of every 18 minutes and caps effective training time at 44%; FT-HSDP&#8217;s peer-replica scheme (fetch optimizer state from a surviving replica&#8217;s CPU memory at ~60 ms/GB) cuts the stall to ~3 minutes and reaches 80% running 11-of-12 replicas. The checkpoint cadence that makes this work is set by Young&#8217;s formula, not taste: at an async-snapshot cost of seconds and an 18-minute MTBF, optimal spacing is ~80 seconds — the 1&#8211;2-minute cadence ByteRobust and FT-HSDP converged on independently. The durable object-store tier refreshes far slower, purely as a correlated-failure backstop.</p>
+</figure>
+
 ## Silent Data Corruption: From Ad Hoc Tooling to a Board-Level Problem
 
 Silent data corruption is qualitatively different from the crash-and-restart failure modes above, because nothing crashes. The lineage starts with Google's "Cores that don't count" (HotOS 2021), establishing that mercurial/defective cores produce silent corrupt execution errors at rates far above classical soft-error expectations, chip-specific rather than fleet-wide. Meta's July 2025 disclosure (engineering.fb.com) is the clearest statement of what is deployed today: **Fleetscanner** (targeted micro-benchmarks during maintenance, full-fleet coverage every 45–60 days), **Ripple** (lighter-weight tests alongside live workloads), and **Hardware Sentinel** (test-agnostic, inspecting application exceptions in kernel space, claimed 41% better detection than testing-based approaches). Meta states historical soft-error rates of ~1-per-million devices have been superseded by SDC rates of **~1-per-thousand devices** — ~1000x higher — with over 66% of training interruptions tracing to hardware failures in SRAM/HBM/processing-grid/network-switch components. Google states SDC events occur weekly-to-biweekly during Gemini training, while Meta attributed 6 of 419 unexpected Llama-3-405B interruptions (1.4%) to SDC.

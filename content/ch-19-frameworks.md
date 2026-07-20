@@ -12,6 +12,293 @@ Megatron-Core is the library a 10T/200B build will most likely fork, and as of J
 
 The communication numbers this zoo solves for are large: DeepSeek-V3's 58 MoE layers × 2 ops/layer gives 116 dispatch/combine operations per forward pass, doubling on backward (§2.2.1, §4.2.1). Table 7 is the sharpest available statement of why NVL72 topology matters for EP: at EP=64, GB200 HybridEP dispatch latency is 675µs versus 930µs for plain all-to-all, while the same comparison on H100 (crossing nodes) is 4,626µs versus 9,164µs — GB200 HybridEP stays flat across EP 8→64 because EP64 fits inside the NVL72 domain, while H100 all-to-all blows up 4-8x crossing node boundaries. Unoptimized, EP all-to-all consumes 20-60% of training time depending on whether EP stays intra-NVLink (~20% GB200) or crosses nodes (40-60% H100) (§4.2). Overlap is handled by a **1F1B all-to-all overlap scheme** — "conceptually a DualPipe-like bidirectional schedule built on top of standard 1F1B" — in `combined_1f1b.py`, via `--overlap-moe-expert-parallel-comm` (§4.2.3). Tellingly, a feature request for native DualPipeV support (issue #1524, closed Dec 2025) was resolved by pointing to this scheme rather than porting DeepSeek's DualPipeV verbatim, and an unresolved sub-thread asks whether the VPP-based approach needs more inter-node communication than true DualPipe at equal bubble rate — an open, unanswered doubt inside Megatron-Core's own community.
 
+<figure class="vz">
+<div class="scroll"><svg style="min-width:620px" viewBox="0 0 653.0 318" role="img" aria-label="Pipeline schedules: GPipe fill-and-drain versus 1F1B, four stages, eight microbatches">
+<g style="--step:.12s">
+<text class="t-ttl" x="0" y="20">Fill-and-drain (GPipe): all forwards, then all backwards</text>
+<text class="t-mut" x="0" y="44">stage 0</text>
+<rect class="f-hair" x="92" y="30" width="561.0" height="20" rx="2"/>
+<text class="t-mut" x="0" y="67">stage 1</text>
+<rect class="f-hair" x="92" y="53" width="561.0" height="20" rx="2"/>
+<text class="t-mut" x="0" y="90">stage 2</text>
+<rect class="f-hair" x="92" y="76" width="561.0" height="20" rx="2"/>
+<text class="t-mut" x="0" y="113">stage 3</text>
+<rect class="f-hair" x="92" y="99" width="561.0" height="20" rx="2"/>
+<rect class="build f-acc-22" style="--t:0" x="92" y="30" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:0" x="100" y="44" text-anchor="middle">0</text>
+<rect class="build f-acc-22" style="--t:1" x="109" y="30" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:1" x="117" y="44" text-anchor="middle">1</text>
+<rect class="build f-acc-22" style="--t:1" x="109" y="53" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:1" x="117" y="67" text-anchor="middle">0</text>
+<rect class="build f-acc-22" style="--t:2" x="126" y="30" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:2" x="134" y="44" text-anchor="middle">2</text>
+<rect class="build f-acc-22" style="--t:2" x="126" y="53" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:2" x="134" y="67" text-anchor="middle">1</text>
+<rect class="build f-acc-22" style="--t:2" x="126" y="76" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:2" x="134" y="90" text-anchor="middle">0</text>
+<rect class="build f-acc-22" style="--t:3" x="143" y="30" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:3" x="151" y="44" text-anchor="middle">3</text>
+<rect class="build f-acc-22" style="--t:3" x="143" y="53" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:3" x="151" y="67" text-anchor="middle">2</text>
+<rect class="build f-acc-22" style="--t:3" x="143" y="76" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:3" x="151" y="90" text-anchor="middle">1</text>
+<rect class="build f-acc-22" style="--t:3" x="143" y="99" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:3" x="151" y="113" text-anchor="middle">0</text>
+<rect class="build f-acc-22" style="--t:4" x="160" y="30" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:4" x="168" y="44" text-anchor="middle">4</text>
+<rect class="build f-acc-22" style="--t:4" x="160" y="53" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:4" x="168" y="67" text-anchor="middle">3</text>
+<rect class="build f-acc-22" style="--t:4" x="160" y="76" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:4" x="168" y="90" text-anchor="middle">2</text>
+<rect class="build f-acc-22" style="--t:4" x="160" y="99" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:4" x="168" y="113" text-anchor="middle">1</text>
+<rect class="build f-acc-22" style="--t:5" x="177" y="30" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:5" x="185" y="44" text-anchor="middle">5</text>
+<rect class="build f-acc-22" style="--t:5" x="177" y="53" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:5" x="185" y="67" text-anchor="middle">4</text>
+<rect class="build f-acc-22" style="--t:5" x="177" y="76" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:5" x="185" y="90" text-anchor="middle">3</text>
+<rect class="build f-acc-22" style="--t:5" x="177" y="99" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:5" x="185" y="113" text-anchor="middle">2</text>
+<rect class="build f-acc-22" style="--t:6" x="194" y="30" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:6" x="202" y="44" text-anchor="middle">6</text>
+<rect class="build f-acc-22" style="--t:6" x="194" y="53" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:6" x="202" y="67" text-anchor="middle">5</text>
+<rect class="build f-acc-22" style="--t:6" x="194" y="76" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:6" x="202" y="90" text-anchor="middle">4</text>
+<rect class="build f-acc-22" style="--t:6" x="194" y="99" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:6" x="202" y="113" text-anchor="middle">3</text>
+<rect class="build f-acc-22" style="--t:7" x="211" y="30" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:7" x="219" y="44" text-anchor="middle">7</text>
+<rect class="build f-acc-22" style="--t:7" x="211" y="53" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:7" x="219" y="67" text-anchor="middle">6</text>
+<rect class="build f-acc-22" style="--t:7" x="211" y="76" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:7" x="219" y="90" text-anchor="middle">5</text>
+<rect class="build f-acc-22" style="--t:7" x="211" y="99" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:7" x="219" y="113" text-anchor="middle">4</text>
+<rect class="build f-acc-22" style="--t:8" x="228" y="53" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:8" x="236" y="67" text-anchor="middle">7</text>
+<rect class="build f-acc-22" style="--t:8" x="228" y="76" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:8" x="236" y="90" text-anchor="middle">6</text>
+<rect class="build f-acc-22" style="--t:8" x="228" y="99" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:8" x="236" y="113" text-anchor="middle">5</text>
+<rect class="build f-acc-22" style="--t:9" x="245" y="76" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:9" x="253" y="90" text-anchor="middle">7</text>
+<rect class="build f-acc-22" style="--t:9" x="245" y="99" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:9" x="253" y="113" text-anchor="middle">6</text>
+<rect class="build f-acc-22" style="--t:10" x="262" y="99" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:10" x="270" y="113" text-anchor="middle">7</text>
+<rect class="build f-loud-25" style="--t:11" x="279" y="99" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:11" x="296" y="113" text-anchor="middle">0</text>
+<rect class="build f-loud-25" style="--t:13" x="313" y="99" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:13" x="330" y="113" text-anchor="middle">1</text>
+<rect class="build f-loud-25" style="--t:13" x="313" y="76" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:13" x="330" y="90" text-anchor="middle">0</text>
+<rect class="build f-loud-25" style="--t:15" x="347" y="99" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:15" x="364" y="113" text-anchor="middle">2</text>
+<rect class="build f-loud-25" style="--t:15" x="347" y="76" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:15" x="364" y="90" text-anchor="middle">1</text>
+<rect class="build f-loud-25" style="--t:15" x="347" y="53" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:15" x="364" y="67" text-anchor="middle">0</text>
+<rect class="build f-loud-25" style="--t:17" x="381" y="99" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:17" x="398" y="113" text-anchor="middle">3</text>
+<rect class="build f-loud-25" style="--t:17" x="381" y="76" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:17" x="398" y="90" text-anchor="middle">2</text>
+<rect class="build f-loud-25" style="--t:17" x="381" y="53" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:17" x="398" y="67" text-anchor="middle">1</text>
+<rect class="build f-loud-25" style="--t:17" x="381" y="30" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:17" x="398" y="44" text-anchor="middle">0</text>
+<rect class="build f-loud-25" style="--t:19" x="415" y="99" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:19" x="432" y="113" text-anchor="middle">4</text>
+<rect class="build f-loud-25" style="--t:19" x="415" y="76" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:19" x="432" y="90" text-anchor="middle">3</text>
+<rect class="build f-loud-25" style="--t:19" x="415" y="53" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:19" x="432" y="67" text-anchor="middle">2</text>
+<rect class="build f-loud-25" style="--t:19" x="415" y="30" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:19" x="432" y="44" text-anchor="middle">1</text>
+<rect class="build f-loud-25" style="--t:21" x="449" y="99" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:21" x="466" y="113" text-anchor="middle">5</text>
+<rect class="build f-loud-25" style="--t:21" x="449" y="76" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:21" x="466" y="90" text-anchor="middle">4</text>
+<rect class="build f-loud-25" style="--t:21" x="449" y="53" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:21" x="466" y="67" text-anchor="middle">3</text>
+<rect class="build f-loud-25" style="--t:21" x="449" y="30" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:21" x="466" y="44" text-anchor="middle">2</text>
+<rect class="build f-loud-25" style="--t:23" x="483" y="99" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:23" x="500" y="113" text-anchor="middle">6</text>
+<rect class="build f-loud-25" style="--t:23" x="483" y="76" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:23" x="500" y="90" text-anchor="middle">5</text>
+<rect class="build f-loud-25" style="--t:23" x="483" y="53" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:23" x="500" y="67" text-anchor="middle">4</text>
+<rect class="build f-loud-25" style="--t:23" x="483" y="30" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:23" x="500" y="44" text-anchor="middle">3</text>
+<rect class="build f-loud-25" style="--t:25" x="517" y="99" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:25" x="534" y="113" text-anchor="middle">7</text>
+<rect class="build f-loud-25" style="--t:25" x="517" y="76" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:25" x="534" y="90" text-anchor="middle">6</text>
+<rect class="build f-loud-25" style="--t:25" x="517" y="53" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:25" x="534" y="67" text-anchor="middle">5</text>
+<rect class="build f-loud-25" style="--t:25" x="517" y="30" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:25" x="534" y="44" text-anchor="middle">4</text>
+<rect class="build f-loud-25" style="--t:27" x="551" y="76" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:27" x="568" y="90" text-anchor="middle">7</text>
+<rect class="build f-loud-25" style="--t:27" x="551" y="53" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:27" x="568" y="67" text-anchor="middle">6</text>
+<rect class="build f-loud-25" style="--t:27" x="551" y="30" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:27" x="568" y="44" text-anchor="middle">5</text>
+<rect class="build f-loud-25" style="--t:29" x="585" y="53" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:29" x="602" y="67" text-anchor="middle">7</text>
+<rect class="build f-loud-25" style="--t:29" x="585" y="30" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:29" x="602" y="44" text-anchor="middle">6</text>
+<rect class="build f-loud-25" style="--t:31" x="619" y="30" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:31" x="636" y="44" text-anchor="middle">7</text>
+<text class="t-mut" x="92" y="136">peak activations in flight per stage: m = 8 microbatches</text>
+<text class="t-ttl" x="0" y="158">1F1B: same bubble, but at most p microbatches in flight</text>
+<text class="t-mut" x="0" y="182">stage 0</text>
+<rect class="f-hair" x="92" y="168" width="561.0" height="20" rx="2"/>
+<text class="t-mut" x="0" y="205">stage 1</text>
+<rect class="f-hair" x="92" y="191" width="561.0" height="20" rx="2"/>
+<text class="t-mut" x="0" y="228">stage 2</text>
+<rect class="f-hair" x="92" y="214" width="561.0" height="20" rx="2"/>
+<text class="t-mut" x="0" y="251">stage 3</text>
+<rect class="f-hair" x="92" y="237" width="561.0" height="20" rx="2"/>
+<rect class="build f-acc-22" style="--t:0" x="92" y="168" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:0" x="100" y="182" text-anchor="middle">0</text>
+<rect class="build f-acc-22" style="--t:1" x="109" y="168" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:1" x="117" y="182" text-anchor="middle">1</text>
+<rect class="build f-acc-22" style="--t:1" x="109" y="191" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:1" x="117" y="205" text-anchor="middle">0</text>
+<rect class="build f-acc-22" style="--t:2" x="126" y="168" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:2" x="134" y="182" text-anchor="middle">2</text>
+<rect class="build f-acc-22" style="--t:2" x="126" y="191" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:2" x="134" y="205" text-anchor="middle">1</text>
+<rect class="build f-acc-22" style="--t:2" x="126" y="214" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:2" x="134" y="228" text-anchor="middle">0</text>
+<rect class="build f-acc-22" style="--t:3" x="143" y="168" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:3" x="151" y="182" text-anchor="middle">3</text>
+<rect class="build f-acc-22" style="--t:3" x="143" y="191" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:3" x="151" y="205" text-anchor="middle">2</text>
+<rect class="build f-acc-22" style="--t:3" x="143" y="214" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:3" x="151" y="228" text-anchor="middle">1</text>
+<rect class="build f-acc-22" style="--t:3" x="143" y="237" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:3" x="151" y="251" text-anchor="middle">0</text>
+<rect class="build f-loud-25" style="--t:4" x="160" y="237" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:4" x="176" y="251" text-anchor="middle">0</text>
+<rect class="build f-acc-22" style="--t:6" x="194" y="237" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:6" x="202" y="251" text-anchor="middle">1</text>
+<rect class="build f-loud-25" style="--t:6" x="194" y="214" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:6" x="210" y="228" text-anchor="middle">0</text>
+<rect class="build f-loud-25" style="--t:7" x="211" y="237" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:7" x="228" y="251" text-anchor="middle">1</text>
+<rect class="build f-acc-22" style="--t:8" x="228" y="214" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:8" x="236" y="228" text-anchor="middle">2</text>
+<rect class="build f-loud-25" style="--t:8" x="228" y="191" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:8" x="244" y="205" text-anchor="middle">0</text>
+<rect class="build f-loud-25" style="--t:9" x="245" y="214" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:9" x="262" y="228" text-anchor="middle">1</text>
+<rect class="build f-acc-22" style="--t:9" x="245" y="237" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:9" x="253" y="251" text-anchor="middle">2</text>
+<rect class="build f-loud-25" style="--t:10" x="262" y="237" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:10" x="278" y="251" text-anchor="middle">2</text>
+<rect class="build f-acc-22" style="--t:10" x="262" y="191" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:10" x="270" y="205" text-anchor="middle">3</text>
+<rect class="build f-loud-25" style="--t:10" x="262" y="168" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:10" x="278" y="182" text-anchor="middle">0</text>
+<rect class="build f-loud-25" style="--t:11" x="279" y="191" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:11" x="296" y="205" text-anchor="middle">1</text>
+<rect class="build f-acc-22" style="--t:11" x="279" y="214" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:11" x="287" y="228" text-anchor="middle">3</text>
+<rect class="build f-loud-25" style="--t:12" x="296" y="214" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:12" x="312" y="228" text-anchor="middle">2</text>
+<rect class="build f-acc-22" style="--t:12" x="296" y="237" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:12" x="304" y="251" text-anchor="middle">3</text>
+<rect class="build f-acc-22" style="--t:12" x="296" y="168" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:12" x="304" y="182" text-anchor="middle">4</text>
+<rect class="build f-loud-25" style="--t:13" x="313" y="237" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:13" x="330" y="251" text-anchor="middle">3</text>
+<rect class="build f-loud-25" style="--t:13" x="313" y="168" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:13" x="330" y="182" text-anchor="middle">1</text>
+<rect class="build f-acc-22" style="--t:13" x="313" y="191" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:13" x="321" y="205" text-anchor="middle">4</text>
+<rect class="build f-loud-25" style="--t:14" x="330" y="191" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:14" x="346" y="205" text-anchor="middle">2</text>
+<rect class="build f-acc-22" style="--t:14" x="330" y="214" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:14" x="338" y="228" text-anchor="middle">4</text>
+<rect class="build f-acc-22" style="--t:15" x="347" y="168" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:15" x="355" y="182" text-anchor="middle">5</text>
+<rect class="build f-loud-25" style="--t:15" x="347" y="214" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:15" x="364" y="228" text-anchor="middle">3</text>
+<rect class="build f-acc-22" style="--t:15" x="347" y="237" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:15" x="355" y="251" text-anchor="middle">4</text>
+<rect class="build f-acc-22" style="--t:16" x="364" y="191" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:16" x="372" y="205" text-anchor="middle">5</text>
+<rect class="build f-loud-25" style="--t:16" x="364" y="237" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:16" x="380" y="251" text-anchor="middle">4</text>
+<rect class="build f-loud-25" style="--t:16" x="364" y="168" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:16" x="380" y="182" text-anchor="middle">2</text>
+<rect class="build f-acc-22" style="--t:17" x="381" y="214" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:17" x="389" y="228" text-anchor="middle">5</text>
+<rect class="build f-loud-25" style="--t:17" x="381" y="191" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:17" x="398" y="205" text-anchor="middle">3</text>
+<rect class="build f-acc-22" style="--t:18" x="398" y="237" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:18" x="406" y="251" text-anchor="middle">5</text>
+<rect class="build f-acc-22" style="--t:18" x="398" y="168" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:18" x="406" y="182" text-anchor="middle">6</text>
+<rect class="build f-loud-25" style="--t:18" x="398" y="214" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:18" x="414" y="228" text-anchor="middle">4</text>
+<rect class="build f-loud-25" style="--t:19" x="415" y="237" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:19" x="432" y="251" text-anchor="middle">5</text>
+<rect class="build f-acc-22" style="--t:19" x="415" y="191" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:19" x="423" y="205" text-anchor="middle">6</text>
+<rect class="build f-loud-25" style="--t:19" x="415" y="168" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:19" x="432" y="182" text-anchor="middle">3</text>
+<rect class="build f-acc-22" style="--t:20" x="432" y="214" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:20" x="440" y="228" text-anchor="middle">6</text>
+<rect class="build f-loud-25" style="--t:20" x="432" y="191" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:20" x="448" y="205" text-anchor="middle">4</text>
+<rect class="build f-loud-25" style="--t:21" x="449" y="214" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:21" x="466" y="228" text-anchor="middle">5</text>
+<rect class="build f-acc-22" style="--t:21" x="449" y="237" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:21" x="457" y="251" text-anchor="middle">6</text>
+<rect class="build f-acc-22" style="--t:21" x="449" y="168" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:21" x="457" y="182" text-anchor="middle">7</text>
+<rect class="build f-loud-25" style="--t:22" x="466" y="237" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:22" x="482" y="251" text-anchor="middle">6</text>
+<rect class="build f-acc-22" style="--t:22" x="466" y="191" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:22" x="474" y="205" text-anchor="middle">7</text>
+<rect class="build f-loud-25" style="--t:22" x="466" y="168" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:22" x="482" y="182" text-anchor="middle">4</text>
+<rect class="build f-loud-25" style="--t:23" x="483" y="191" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:23" x="500" y="205" text-anchor="middle">5</text>
+<rect class="build f-acc-22" style="--t:23" x="483" y="214" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:23" x="491" y="228" text-anchor="middle">7</text>
+<rect class="build f-loud-25" style="--t:24" x="500" y="214" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:24" x="516" y="228" text-anchor="middle">6</text>
+<rect class="build f-acc-22" style="--t:24" x="500" y="237" width="16" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:24" x="508" y="251" text-anchor="middle">7</text>
+<rect class="build f-loud-25" style="--t:25" x="517" y="237" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:25" x="534" y="251" text-anchor="middle">7</text>
+<rect class="build f-loud-25" style="--t:25" x="517" y="168" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:25" x="534" y="182" text-anchor="middle">5</text>
+<rect class="build f-loud-25" style="--t:26" x="534" y="191" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:26" x="550" y="205" text-anchor="middle">6</text>
+<rect class="build f-loud-25" style="--t:27" x="551" y="214" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:27" x="568" y="228" text-anchor="middle">7</text>
+<rect class="build f-loud-25" style="--t:28" x="568" y="168" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:28" x="584" y="182" text-anchor="middle">6</text>
+<rect class="build f-loud-25" style="--t:29" x="585" y="191" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:29" x="602" y="205" text-anchor="middle">7</text>
+<rect class="build f-loud-25" style="--t:31" x="619" y="168" width="33" height="20" rx="2"/>
+<text class="t-s9 build" style="--t:31" x="636" y="182" text-anchor="middle">7</text>
+<text class="t-mut" x="92" y="274">peak activations in flight per stage: p = 4 — the schedule&#8217;s real win</text>
+<rect class="f-acc-22" x="92" y="288" width="14" height="12" rx="2"/><text class="t-mut" x="112" y="298">forward (1 unit)</text>
+<rect class="f-loud-25" x="222" y="288" width="14" height="12" rx="2"/><text class="t-mut" x="242" y="298">backward (2 units)</text>
+<rect class="f-hair" x="382" y="288" width="14" height="12" rx="2"/><text class="t-mut" x="402" y="298">bubble (stage idle)</text>
+</g>
+</svg></div>
+<p class="vz-cap">Four stages, eight microbatches, backward drawn at twice forward's cost — both schedules simulated exactly. The two pay the same warmup-and-drain bubble, (p−1)(F+B); 1F1B's win is memory, holding at most p microbatches of activations in flight against GPipe's m. What shrinks the bubble is interleaving: r = (p−1)/(v·m), which is why Ch18's Layout 2 (p=8, v=4) needs m≥18 microbatches to hold r under 10% — and the steady B–F cadence in the lower panel is the compute window Megatron-Core's 1F1B-based all-to-all overlap scheme (§4.2.3) hides EP dispatch behind.</p>
+</figure>
+
 **Dropless MoE and CUDA Graphs — the least-publicized section.** Dropless MoE has per-expert token counts known only on-device; host-initiated kernels need a device→host sync to read shapes, blocking CUDA Graph capture. Three mechanisms close this gap, none widely discussed elsewhere (§4.3.7). Device-initiated Grouped GEMM (cuBLASLt with device-array shapes, CUDA 13.1+; cuteDSL with SwiGLU/FP8 fused into the epilogue) plus a sync-free HybridEP dispatch mode. **ECHO** (Elastic Cloning for Hot Experts, PR #2368, merged Feb 2026): a bin-packing planner identifies overloaded experts per forward pass, clones their weights onto underutilized ranks via sync-free comm, redirects overflow tokens, and reduces clone gradients back to the home expert on backward — architecturally distinct from DeepSeek's EPLB (inference-time replica redistribution); ECHO is training-time and gradient-aware. **Paged Stashing** (PR #2690): replaces per-layer worst-case CUDA-Graph buffers (O(layers×worst_case), often an order of magnitude above actual usage) with one shared `tmp` buffer plus a paged buffer storing only actual per-layer token counts, cutting memory to O(worst_case+actual_total), overlapped on dedicated streams. Both PRs are merged into `dev`, but the 2026-Q2 roadmap (issue #4815) still lists "sync-free, full-iteration CUDA-Graph MoE training" as long-term — full integration is not yet default as of July 2026.
 
 **Memory and compute-efficiency.** At PP4×VPP4×EP64 on 256 GPUs, BF16, DeepSeek-V3 measures 199.5 GB/GPU (36.4 weights+grads, 32.1 optimizer, 131.0 activations); the full optimization stack (FP8, fine-grained recompute, memory-efficient permutation, offloading) claims to bring this under 80 GB (Table 3, §4.1.1, §11). GEMMs account for ~70% of layer time in dense Llama-3-405B but under 50% in DeepSeek-V3 — MoE structurally halves GEMM's share of the timeline before communication is even counted (§1.2).

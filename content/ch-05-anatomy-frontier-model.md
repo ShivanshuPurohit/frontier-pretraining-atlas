@@ -12,6 +12,72 @@ What has genuinely *left* the architecture is worth listing once, because absenc
 
 The most useful mental model for everything below is the **residual stream**: the d_model-wide vector highway running the depth of the network, which every sublayer reads from (through its norm) and writes to (through its output projection). Attention heads write retrieved context into it; experts write transformations into it; the unembedding reads the final state. Depth-L training stability is, mechanically, the problem of keeping this stream's statistics sane through 2L consecutive additive writes.
 
+<figure class="vz">
+<div class="scroll"><svg style="min-width:620px" viewBox="0 0 748 545" role="img" aria-label="The 2026 frontier block: a residual stream through L blocks, with the token-mixer and channel-mixer slots and the substitutions each lab ships in them">
+<defs><marker id="ch5arr" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5.5" markerHeight="5.5" orient="auto"><path d="M0 0 L8 4 L0 8 z" fill="var(--mut)"/></marker></defs>
+<path class="s-acc flow f-none" d="M110 486 L110 44" stroke-width="3.5"/>
+<text class="t-mut" transform="rotate(-90 96 330)" x="96" y="330">the residual stream, d_model wide</text>
+<rect class="f-ink-06 s-line" x="25" y="490" width="170" height="38" rx="4" stroke-width="1"/>
+<text x="37" y="513">token id &#8594; embedding</text>
+<rect class="f-bg s-line" x="66" y="128" width="88" height="24" rx="3" stroke-width="1"/>
+<text class="t-s9" x="78" y="144">final norm</text>
+<rect class="f-ink-06 s-line" x="25" y="64" width="170" height="40" rx="4" stroke-width="1"/>
+<text x="37" y="88">unembed &#8594; logits</text>
+<rect class="f-none s-mut" x="270" y="64" width="170" height="40" rx="4" stroke-width="1" stroke-dasharray="4 3"/>
+<text x="282" y="82">MTP head</text>
+<text class="t-mut" x="282" y="96">predicts t+2 alongside t+1</text>
+<path class="s-mut f-none" d="M110 118 C 214 118, 252 104, 268 96" stroke-width="1" stroke-dasharray="4 3" marker-end="url(#ch5arr)"/>
+<line class="s-mut" x1="110" y1="420" x2="148" y2="420" stroke-width="1.2" marker-end="url(#ch5arr)"/>
+<rect class="f-bg s-line" x="150" y="408" width="86" height="24" rx="3" stroke-width="1"/>
+<text class="t-s9" x="160" y="424">RMSNorm</text>
+<line class="s-mut" x1="236" y1="420" x2="268" y2="420" stroke-width="1.2" marker-end="url(#ch5arr)"/>
+<rect class="f-acc-10 s-acc" x="270" y="392" width="180" height="56" rx="4" stroke-width="1.2"/>
+<text class="t-num" x="282" y="414">token mixer</text>
+<text class="t-mut" x="282" y="430">moves info between positions</text>
+<path class="s-mut f-none" d="M360 392 L360 356 L118 356" stroke-width="1.2" marker-end="url(#ch5arr)"/>
+<circle class="f-bg s-ink2" cx="110" cy="356" r="7" stroke-width="1.2"/>
+<text class="t-s9" x="106.5" y="360">+</text>
+<line class="s-mut" x1="110" y1="300" x2="148" y2="300" stroke-width="1.2" marker-end="url(#ch5arr)"/>
+<rect class="f-bg s-line" x="150" y="288" width="86" height="24" rx="3" stroke-width="1"/>
+<text class="t-s9" x="160" y="304">RMSNorm</text>
+<line class="s-mut" x1="236" y1="300" x2="268" y2="300" stroke-width="1.2" marker-end="url(#ch5arr)"/>
+<rect class="f-acc-10 s-acc" x="270" y="222" width="180" height="100" rx="4" stroke-width="1.2"/>
+<text class="t-num" x="282" y="242">channel mixer: MoE</text>
+<rect class="f-bg s-line" x="282" y="250" width="64" height="18" rx="3" stroke-width="1"/>
+<text class="t-s9" x="292" y="263">router</text>
+<rect class="f-loud-25" x="282" y="278" width="16" height="16" rx="2"/><text class="t-s9" x="286" y="290">S</text>
+<rect class="f-acc" x="302" y="278" width="16" height="16" rx="2"/>
+<rect class="f-acc-10" x="322" y="278" width="16" height="16" rx="2"/>
+<rect class="f-acc" x="342" y="278" width="16" height="16" rx="2"/>
+<rect class="f-acc-10" x="362" y="278" width="16" height="16" rx="2"/>
+<rect class="f-acc-10" x="382" y="278" width="16" height="16" rx="2"/>
+<text class="t-num" x="404" y="290">&#8230;n</text>
+<text class="t-s9" x="282" y="306">consult k of n + 1 shared</text>
+<text class="t-s9" x="282" y="318">params &#8733; n, FLOPs &#8733; k</text>
+<path class="s-mut f-none" d="M360 222 L360 190 L118 190" stroke-width="1.2" marker-end="url(#ch5arr)"/>
+<circle class="f-bg s-ink2" cx="110" cy="190" r="7" stroke-width="1.2"/>
+<text class="t-s9" x="106.5" y="194">+</text>
+<path class="s-line f-none" d="M56 180 L48 180 L48 448 L56 448" stroke-width="1"/>
+<text class="t-num" x="18" y="310">&#215;L</text>
+<text class="t-num" x="480" y="404">the mixer slot</text>
+<text class="t-mut" x="480" y="420">MLA / Gated MLA &#8212; V3, K3 globals</text>
+<text class="t-mut" x="480" y="434">selected: DSA, CSA+HCA, MSA &#8212; V4, GLM-5, M3</text>
+<text class="t-mut" x="480" y="448">linear: KDA, GDN, Mamba-2 &#8212; K3, Nemotron-3</text>
+<text class="t-num" x="480" y="240">the channel-mixer slot</text>
+<text class="t-mut" x="480" y="256">V3: 256+1 shared, top-8 &#8212; 5.5% active</text>
+<text class="t-mut" x="480" y="270">K3: 896 experts, 16 active &#8212; ~1.8%</text>
+<text class="t-mut" x="480" y="284">gates: sigmoid &#8594; &#8730;softplus (V4)</text>
+<text class="t-mut" x="480" y="298">balance: aux-free bias &#8594; Quantile Balancing</text>
+<text class="t-mut" x="480" y="312">LatentMoE: route in a compressed latent</text>
+<text class="t-num" x="480" y="164">the residual writes</text>
+<text class="t-mut" x="480" y="180">add &#8212; or mHC / AttnRes mix streams (V4, K3)</text>
+<text class="t-num" x="480" y="500">the norms</text>
+<text class="t-mut" x="480" y="516">pre-norm keeps the identity path clean;</text>
+<text class="t-mut" x="480" y="530">QK-Norm/QK-Clip guard the attention hotspot</text>
+</svg></div>
+<p class="vz-cap">The skeleton every 2026 frontier model still is, and where each lab's acronyms plug in. A token's vector rides the residual stream through L blocks; each block reads the stream through a norm, computes an update in one of two slots — the token mixer (between positions) or the channel mixer (within position, now almost always an MoE) — and writes it back. K3, V4, M3, and Nemotron-3 are substitutions in these slots, not new skeletons: mixers from MLA to KDA to Mamba-2, gates from sigmoid to &#8730;softplus, balancing from aux-free bias to Quantile Balancing, residual additions upgraded to mHC or AttnRes mixing, an MTP head beside the unembedding. Spec anchors as in the text: DeepSeek-V3 at 256+1 experts top-8 (5.5% active), K3 at 896/16 (~1.8%, launch coverage).</p>
+</figure>
+
 The 2019-2023 answers are now fixed infrastructure. **Pre-norm** (normalize before each sublayer, not after) keeps a clean identity path from layer 0 to the loss, which is why 61-to-108-layer models train at all. **RMSNorm** replaced LayerNorm — dropping mean-centering costs nothing measurable and saves a reduction. **QK-Norm** (an extra RMSNorm applied to queries and keys before their dot product, used by Qwen3, GLM-4.5, and V4) is the same medicine applied to a hotspot: attention logits are the network's most explosion-prone scalars, since they are dot products of two learned, unnormalized vector families whose scales can co-inflate. Ch9 covers the failure mode this prevents (MaxLogit blowups) and the alternative treatment Kimi K2 chose (QK-Clip, a weight-space intervention chosen precisely because MLA's absorbed-matrix inference trick makes materializing per-head Q/K — which QK-Norm needs — awkward; mechanism in Ch6). The router z-loss (penalizing large router logits) is the same idea a third time, applied to the MoE gate.
 
 What's new in 2025-2026 is that the frontier stopped treating the *stream itself* as fixed plumbing. Three generations of one idea: ByteDance's **Hyper-Connections** ([arXiv:2409.19606](https://arxiv.org/abs/2409.19606), Sep 2024) widens the single stream into n parallel streams with learned, dynamic mixing matrices deciding how each sublayer reads from and writes to each stream — trading the fixed identity shortcut for a learned routing of residual signal, at the cost of raw stability. DeepSeek-V4's **mHC (Manifold-Constrained Hyper-Connections)** makes that safe at 1.6T scale by projecting the mixing matrices onto the Birkhoff polytope (the set of doubly-stochastic matrices — rows and columns each summing to 1) via 20 Sinkhorn-Knopp normalization iterations, so mixing can *redistribute* signal among streams but never amplify it; disclosed cost is 6.7% wall-clock overhead on an overlapped pipeline stage ([DeepSeek-V4](https://arxiv.org/abs/2606.19348), 2026; kexue.fm walkthrough). And Moonshot's **Attention Residuals (AttnRes)**, per the GTC 2026 keynote and the pre-GTC paper release, replaces the fixed *add* entirely: instead of each layer receiving exactly the running sum of all previous writes, it computes a softmax-attention read-out over previous layers' outputs — "on-demand reading" of depth, in Yang Zhilin's framing, with launch coverage of K3 quoting roughly 25% training-efficiency gain at under 2% added cost (GTC keynote coverage, Mar 2026, and K3 launch coverage, Jul 2026 — both secondhand, pending the K3 report).

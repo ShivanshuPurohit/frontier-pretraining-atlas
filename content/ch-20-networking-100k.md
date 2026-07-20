@@ -69,6 +69,86 @@ The practical budgeting question is whether EP all-to-all traffic and DP/PP AllR
 
 One more piece of arithmetic belongs here, because it determines whether the bandwidth-budgeting frame of this whole section even applies to this run. (The arithmetic is ours, from Ch18's Layout 2 and the Megatron measurements above.) Check the Megatron dispatch-latency table's own regime first: at its benchmark shape (4,096 tokens per GPU, hidden 7168, top-8, BF16), each GPU's dispatch payload is ~470 MB, whose pure wire time at 900 GB/s is ~520 µs — close to the measured 675 µs, so that benchmark is genuinely bandwidth-dominated and the "bandwidth budgeting" frame is honest *at fat microbatches*. Now substitute the microbatch sizes Ch18's Layout 2 actually produces under expert-batch starvation: a few thousand tokens per microbatch per *domain* — roughly 55 per GPU — collapses the per-GPU dispatch payload to single-digit megabytes (wire time: microseconds) and the per-source-destination message to **~56–113 KB (FP8/BF16)**, sitting at the bottom of the very 16 KB–1 MB range across which AWS documents all-to-all efficiency degrading badly. In that regime the collective's cost is fixed overhead — kernel launch, barrier synchronization, per-message and per-hop latency — not bytes on wires, and the measured "EP is ~20% of iteration time inside NVL72" figures, all taken at fat microbatches, do not extrapolate. The design consequence stacks on top of Ch17/Ch18's grouped-GEMM finding: the same thin microbatches that starve the expert GEMMs also push the dispatch collectives from the bandwidth-bound regime into the latency-bound one, so the two costs degrade *together*, and every remedy that fattens per-expert GEMM batches (larger global batch, fewer microbatches) simultaneously restores the dispatch collective to the regime the published measurements describe. Budgeting this network by bytes alone would miss the failure mode entirely; message-size accounting is where the actual risk lives.
 
+<figure class="vz">
+<div class="scroll"><svg style="min-width:620px" viewBox="0 0 680 372" role="img" aria-label="Expert-parallel dispatch and combine inside the NVL72 domain, and the per-message-size axis that decides whether the collective is bandwidth- or latency-bound">
+<rect class="f-acc-10 s-acc" x="60" y="30" width="90" height="38" rx="3" stroke-width="1"/>
+<text class="t-num" x="70" y="48">rank 0</text>
+<text class="t-mut" x="70" y="62">tokens</text>
+<rect class="f-ink-06 s-line" x="60" y="216" width="90" height="38" rx="3" stroke-width="1"/>
+<text class="t-num" x="70" y="234">rank 0</text>
+<text class="t-mut" x="70" y="248">8 experts</text>
+<rect class="f-acc-10 s-acc" x="210" y="30" width="90" height="38" rx="3" stroke-width="1"/>
+<text class="t-num" x="220" y="48">rank 1</text>
+<text class="t-mut" x="220" y="62">tokens</text>
+<rect class="f-ink-06 s-line" x="210" y="216" width="90" height="38" rx="3" stroke-width="1"/>
+<text class="t-num" x="220" y="234">rank 1</text>
+<text class="t-mut" x="220" y="248">8 experts</text>
+<rect class="f-acc-10 s-acc" x="360" y="30" width="90" height="38" rx="3" stroke-width="1"/>
+<text class="t-num" x="370" y="48">rank 2</text>
+<text class="t-mut" x="370" y="62">tokens</text>
+<rect class="f-ink-06 s-line" x="360" y="216" width="90" height="38" rx="3" stroke-width="1"/>
+<text class="t-num" x="370" y="234">rank 2</text>
+<text class="t-mut" x="370" y="248">8 experts</text>
+<rect class="f-acc-10 s-acc" x="510" y="30" width="90" height="38" rx="3" stroke-width="1"/>
+<text class="t-num" x="520" y="48">rank 3</text>
+<text class="t-mut" x="520" y="62">tokens</text>
+<rect class="f-ink-06 s-line" x="510" y="216" width="90" height="38" rx="3" stroke-width="1"/>
+<text class="t-num" x="520" y="234">rank 3</text>
+<text class="t-mut" x="520" y="248">8 experts</text>
+<g class="ph-a">
+<line class="s-acc flow f-none" x1="105" y1="68" x2="105" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="105" y1="68" x2="255" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="105" y1="68" x2="405" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="105" y1="68" x2="555" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="255" y1="68" x2="105" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="255" y1="68" x2="255" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="255" y1="68" x2="405" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="255" y1="68" x2="555" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="405" y1="68" x2="105" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="405" y1="68" x2="255" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="405" y1="68" x2="405" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="405" y1="68" x2="555" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="555" y1="68" x2="105" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="555" y1="68" x2="255" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="555" y1="68" x2="405" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="555" y1="68" x2="555" y2="216" stroke-width="1.3" opacity="0.75"/>
+</g>
+<g class="ph-b">
+<line class="s-loud flow f-none" x1="105" y1="216" x2="105" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="105" y1="216" x2="255" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="105" y1="216" x2="405" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="105" y1="216" x2="555" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="255" y1="216" x2="105" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="255" y1="216" x2="255" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="255" y1="216" x2="405" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="255" y1="216" x2="555" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="405" y1="216" x2="105" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="405" y1="216" x2="255" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="405" y1="216" x2="405" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="405" y1="216" x2="555" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="555" y1="216" x2="105" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="555" y1="216" x2="255" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="555" y1="216" x2="405" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="555" y1="216" x2="555" y2="68" stroke-width="1.3" opacity="0.75"/>
+</g>
+<g class="ph-a"><text class="t-acc" x="0" y="130">dispatch</text><text class="t-mut" x="0" y="146">tokens &#8594; their</text><text class="t-mut" x="0" y="160">top-8 experts</text></g>
+<g class="ph-b"><text class="t-loud" x="620" y="130">combine</text><text class="t-mut" x="620" y="146">outputs &#8594;</text><text class="t-mut" x="620" y="160">home ranks</text></g>
+<text class="t-mut" x="60" y="278">2 &#215; per MoE layer, forward and backward &#8212; all routes stay inside the NVL72 crossbar at EP &#8804; 72</text>
+<text class="t-num" x="60" y="298">per-message size decides the regime</text>
+<rect class="f-hair" x="82" y="316" width="198" height="18"/>
+<rect class="f-loud-25" x="142" y="316" width="34" height="18"/>
+<line class="s-acc" x1="574" y1="312" x2="574" y2="338" stroke-width="2"/>
+<line class="s-mut" x1="60" y1="334" x2="610" y2="334" stroke-width="1"/>
+<text class="t-mut" x="60" y="352">10 KB</text>
+<text class="t-mut" x="266" y="352">1 MB</text>
+<text class="t-mut" x="586" y="352">1 GB</text>
+<text class="t-mut" x="78" y="368">16 KB&#8211;1 MB: documented all-to-all degradation window</text>
+<text class="t-loud t-s9" x="112" y="312">starved: 56&#8211;113 KB</text>
+<text class="t-mut" x="368" y="298">fat microbatch: ~470 MB/GPU, 675 &#181;s &#8594;</text>
+</svg></div>
+<p class="vz-cap">Top: the collective itself — every rank exchanges tokens with every rank, twice per MoE layer, dispatch then combine. Bottom: the axis that decides its cost model. At the Megatron benchmark&#8217;s fat microbatches (~470 MB per GPU) the collective is bandwidth-bound and the measured 675 &#181;s is mostly wire time; at Layout 2&#8217;s starved microbatches the per-pair message collapses to 56&#8211;113 KB — inside the 16 KB&#8211;1 MB window where all-to-all efficiency is documented to degrade — and the cost becomes launch, barrier, and per-hop latency instead of bytes. The same thin microbatches starve the expert GEMMs (Ch18), so both costs degrade together and every remedy that fattens one fixes the other.</p>
+</figure>
+
 Batching discipline generalizes directly to MoE communication design: Stas Bekman's `all_reduce_latency_comp.py` shows one 4 GB reduction dramatically outperforms 1,000× 4 MB reductions, arguing for batching expert-gradient or router-logit reductions rather than firing one collective per expert. `NCCL_DEBUG_SUBSYS=COLL` call-counting — grepping `NCCL INFO AllToAll`/`AllGather` counts per iteration — is an underused verification method for confirming actual all-to-all volume matches theoretical per-layer prediction.
 
 ## Multi-Datacenter Training: Where the Physics Bites

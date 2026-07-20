@@ -48,6 +48,32 @@ Essential-Web sits inside a crowded 2024-26 field of crawl-to-corpus pipelines, 
 | HPLT v2 / v3 | 8T tokens/193 langs (v2, confirmed); ~30T tokens (v3, secondary-sourced) | 4.5PB Internet Archive + CC source; CC0-licensed (more permissive than ODC-By) | v2: [arXiv:2503.10267](https://arxiv.org/abs/2503.10267), Mar 2025; v3 figure: aggregator-sourced, unconfirmed |
 | Essential-Web v1.0 | 24T tokens / 23.6B docs | 12-field taxonomy + EAI-Distill-0.5b (see above) | [arXiv:2506.14111](https://arxiv.org/abs/2506.14111), Jun 2025 |
 
+<figure class="vz">
+<div class="scroll"><svg style="min-width:620px" viewBox="0 0 680 262" role="img" aria-label="The curation cliff: from a 240-trillion-token crawl pool to the 1.3 to 3.8 trillion tokens that survive quality filtering, drawn on a linear scale">
+<text class="t-ttl" x="0" y="16">The curation cliff, linear scale</text>
+<text x="0" y="51">raw Common Crawl pool</text>
+<rect class="build f-hair s-line" style="--t:0" x="188" y="38" width="480" height="16" rx="2" stroke-width="1"/>
+<text class="t-mut build" style="--t:0" x="196" y="51">240T &#8212; DCLM&#8217;s starting pool</text>
+<text x="0" y="84">Essential-Web v1.0</text>
+<rect class="build f-acc-10 s-acc" style="--t:1" x="188" y="71" width="48" height="16" rx="2" stroke-width="1"/>
+<text class="t-mut build" style="--t:1" x="244" y="84">24T &#8212; tagged, not filtered: filtering is a SQL query</text>
+<text x="0" y="117">Nemotron-CC</text>
+<rect class="build f-acc-22" style="--t:2" x="188" y="104" width="13" height="16" rx="2"/>
+<text class="t-mut build" style="--t:2" x="209" y="117">6.3T (2.0T of it synthetic)</text>
+<text x="0" y="150">DCLM-Baseline, filtered</text>
+<rect class="build f-acc-22" style="--t:3" x="188" y="137" width="8" height="16" rx="2"/>
+<text class="t-mut build" style="--t:3" x="204" y="150">3.8T &#8212; 1.6% survives the fastText gate</text>
+<text x="0" y="183">DCLM, actually trained on</text>
+<rect class="build f-acc" style="--t:4" x="188" y="170" width="6" height="16" rx="2"/>
+<text class="t-mut build" style="--t:4" x="202" y="183">2.6T &#8212; 1.1%</text>
+<text x="0" y="216">FineWeb-Edu</text>
+<rect class="build f-acc" style="--t:5" x="188" y="203" width="3" height="16" rx="2"/>
+<text class="t-mut build" style="--t:5" x="199" y="216">1.3T &#8212; 0.54%</text>
+<text class="t-mut" x="0" y="254">the scale is linear on purpose &#8212; the cliff is the finding</text>
+</svg></div>
+<p class="vz-cap">What survives crawl-to-corpus curation, on one linear axis. DCLM starts from a 240T-token pool and keeps 3.8T after its fastText gate, training on 2.6T; FineWeb-Edu keeps 1.3T; Nemotron-CC reaches 6.3T only by synthesizing 2T of it. Essential-Web&#8217;s 24T is the different bet: tag everything with a 12-field taxonomy and let filtering be a SQL query per use case instead of a frozen pipeline decision. Against a 25&#8211;50T-token training appetite (Ch23), no single filtered corpus suffices — the multi-source mixes, repetition budgets, and synthetic routes of Ch12 and Ch14 are arithmetic necessities, not stylistic choices.</p>
+</figure>
+
 Three of these deserve comment beyond the table. **FinePDFs** is the sharpest 2025-26 evidence that document *source format*, not just filtering quality, is a first-order lever: PDF-derived documents run roughly 2x the median character length of HTML-derived web text with a much heavier tail (95th percentile ~68k characters vs. ~11-13k), and a 1.67B-parameter/36B-token ablation shows a FinePDFs/FineWeb-Edu/DCLM blend at just a 0.25 mixing ratio beating the current public-SOTA baseline, Nemotron-CC-v2 ([huggingfacefw-finepdfsblog.hf.space](https://huggingfacefw-finepdfsblog.hf.space), Sept 2025). **Common Pile v0.1** has a real, mechanistically-explained quality gap rather than a generic one: at 7B/1T tokens Comma beats budget-matched Pile/OSCAR/FineWeb baselines on knowledge and code tasks but is specifically worse on HellaSwag, PIQA, and CommonSenseQA — the paper's own diagnosis is that openly-licensed sources systematically under-represent personal blogs, tutorials, hobby content, and sports writing, exactly the register those benchmarks draw from, and the gap persists as a structural signature of the source mix rather than closing with scale ([arXiv:2506.05209](https://arxiv.org/abs/2506.05209), Jun 2025). **Institutional Books 1.0** is architecturally unlike everything else in the table — pre-2006 institutional library-scan OCR rather than crawl-derived text — but its non-commercial initial license, driven by unresolved uncertainty around non-Harvard re-digitizations of the same public-domain works, means a commercial 10T-parameter run cannot ingest it without a separate licensing conversation ([arXiv:2506.08300](https://arxiv.org/abs/2506.08300), Jun 2025).
 
 One upstream lever sits underneath every entry in this table and is easy to under-weight: text extraction itself is not a solved commodity. February 2026 work found HTML extractors (resiliparse/trafilatura/jusText) keep substantially different pages from the same WARC pool — only 39% of surviving pages are retained by more than one extractor — and taking the union increases DCLM-Baseline token yield by up to 71% at fixed benchmark quality (arXiv:2602.19548); a November 2025 Shanghai AI Lab paper (AICC, arXiv:2511.16397) replaces heuristic extraction with a 0.6B sequence-labeling model and lifts ROUGE-F1 content-match from trafilatura's 63.6% to 81.8%. This is Ch12's territory in full, but it bears directly on curation SOTA: every classifier and dedup number in this chapter is computed downstream of an extraction step that the 2025-26 literature has only just started treating as its own model-training problem rather than a regex.

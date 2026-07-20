@@ -19,6 +19,48 @@ GB200 NVL72 and HGX B200 are the same reticle-limited Blackwell die — 208B tra
 
 Sources: the [datasheet](https://openzeka.com/wp-content/uploads/2025/02/blackwell-datasheet.pdf) above, cross-validated against NVIDIA's [GB200 NVL72](https://www.nvidia.com/en-us/data-center/gb200-nvl72/) and [DGX B200](https://www.nvidia.com/en-us/data-center/dgx-b200/) product pages (fetched July 2026) and independently reconstructed by Glenn K. Lockwood's ["NVIDIA B200" wiki page](https://www.glennklockwood.com/garden/processors/b200) (Apr 2026).
 
+<figure class="vz">
+<div class="scroll"><svg style="min-width:620px" viewBox="0 0 680 312" role="img" aria-label="One GB200 GPU's bandwidth ladder: HBM, NVLink domain, scale-out fabric, and the Grace host pool">
+<text class="t-ttl" x="8" y="16">One GPU&#8217;s world, to bandwidth scale</text>
+<rect class="f-ink-06 s-line" x="8" y="66" width="100" height="78" rx="4" stroke-width="1"/>
+<text class="t-num" x="20" y="90">HBM3e</text>
+<text x="20" y="108">186 GB</text>
+<text class="t-mut" x="20" y="126">8.0 TB/s</text>
+<line class="s-acc flow" x1="108" y1="105" x2="192" y2="105" stroke-width="14"/>
+<text class="t-num" x="112" y="88">8.0 TB/s</text>
+<rect class="f-acc-10 s-acc" x="192" y="56" width="120" height="98" rx="4" stroke-width="1.2"/>
+<text class="t-num" x="204" y="82">Blackwell GPU</text>
+<text x="204" y="102">5.0 PFLOPS</text>
+<text class="t-mut" x="204" y="118">dense FP8</text>
+<text class="t-mut" x="204" y="136">1,200 W liquid</text>
+<line class="s-acc flow" x1="312" y1="105" x2="402" y2="105" stroke-width="5"/>
+<text class="t-num" x="316" y="88">0.9 TB/s</text>
+<text class="t-mut" x="316" y="126">per direction</text>
+<rect class="f-ink-06 s-line" x="402" y="46" width="140" height="118" rx="4" stroke-width="1"/>
+<rect class="f-acc-22" x="414" y="60" width="16" height="12" rx="2"/><rect class="f-acc-22" x="434" y="60" width="16" height="12" rx="2"/><rect class="f-acc-22" x="454" y="60" width="16" height="12" rx="2"/><rect class="f-acc-22" x="474" y="60" width="16" height="12" rx="2"/>
+<rect class="f-acc-22" x="414" y="76" width="16" height="12" rx="2"/><rect class="f-acc-22" x="434" y="76" width="16" height="12" rx="2"/><rect class="f-acc-22" x="454" y="76" width="16" height="12" rx="2"/><text class="t-num" x="478" y="86">&#8230;&#215;71</text>
+<text x="414" y="112">NVLink-5 peers</text>
+<text class="t-mut" x="414" y="128">one NVL72 domain,</text>
+<text class="t-mut" x="414" y="142">non-blocking</text>
+<line class="s-mut flow-slow" x1="542" y1="105" x2="600" y2="105" stroke-width="2"/>
+<text class="t-num" x="536" y="88">~0.1 TB/s</text>
+<rect class="f-ink-06 s-line" x="600" y="66" width="74" height="78" rx="4" stroke-width="1"/>
+<text x="608" y="90">scale-out</text>
+<text class="t-mut" x="608" y="106">CX-8, 800G</text>
+<text class="t-mut" x="608" y="122">~1,364 other</text>
+<text class="t-mut" x="608" y="136">domains</text>
+<line class="s-acc flow" x1="252" y1="154" x2="252" y2="212" stroke-width="5"/>
+<text class="t-num" x="262" y="180">NVLink-C2C</text>
+<text class="t-mut" x="262" y="196">0.9 TB/s, coherent</text>
+<rect class="f-ink-06 s-line" x="192" y="212" width="150" height="62" rx="4" stroke-width="1"/>
+<text class="t-num" x="204" y="234">Grace CPU</text>
+<text x="204" y="252">480 GB LPDDR5X</text>
+<text class="t-mut" x="204" y="268">~0.5 TB/s</text>
+<text class="t-mut" x="8" y="296">&#215;72 GPUs + 36 Grace per rack &#8594; 13.4 TB HBM + 17.3 TB host LPDDR: the host pool is bigger than HBM</text>
+</svg></div>
+<p class="vz-cap">Link thickness scales with the square root of bandwidth. The cliff the whole book designs around sits between the second and third links: 71 NVLink-5 peers at 0.9 TB/s per direction inside the non-blocking domain, then ~0.1 TB/s of ConnectX-8 toward everything else — which is why EP lives inside the domain and only PP/DP traffic crosses it (Ch18, Ch20). The Grace host pool one coherent hop away is what turns 17.3 TB of rack LPDDR — more than the rack's HBM — into a checkpoint and offload tier (Ch21). Numbers per the reconciled spec table above and NVIDIA's superchip specs.</p>
+</figure>
+
 The correction across every tensor-core precision is a clean, uniform +11.1% (5,000/4,500 = 2,500/2,250 = 10,000/9,000 = 10/9 exactly), but the vector-ALU path (FP32/FP64) only gains 6.7–8.1%. Back-calculating an implied clock from the vector path (≈1.98 GHz HGX vs ≈2.1 GHz NVL72 GB200) predicts only a ~4,770 TFLOPS dense-FP8 GB200 figure if the same ~6% gap applied uniformly to tensor cores — not the actual 5,000. NVIDIA publishes no official clock speed for either SKU, and the gap between the tensor-core ratio and the vector-ALU ratio is unexplained in any source we could locate. The likely mechanism is a more aggressive sustained-clock floor specifically under Tensor-Core-saturated load at 1,200W — but that is our inference, not a cited fact.
 
 The distinction matters practically because it is genuinely easy to get wrong, and good sources get it wrong. The JAX Scaling Book's undifferentiated "B200" FLOPs table is unambiguously the HGX dense figure (2.3e15 BF16, 4.5e15 FP8, 9.0e15 FP4 — matching HGX within rounding), and dropping those numbers into a GB200 NVL72 cluster analysis silently understates the machine; Ch18's critical-batch and EP-viability thresholds are computed against the corrected figure. The same trap produces wrong MFU numbers: a 46.6% GB200 MFU for DeepSeek-V3-scale training circulates from dividing a measured 1,048 TFLOPS/GPU by the HGX 2,250-TFLOPS BF16 denominator — but the measurement is MXFP8 per the Megatron report's own Table 11, so the correct denominator is the 5,000-TFLOPS FP8/MXFP8 peak, giving 21.0% (Ch17 and Ch18 carry the corrected number). The scaling book's own text is internally inconsistent on this point — its main FLOPs table uses HGX-class numbers while a worked example three sections later reasons from an 80-TFLOPS FP32 figure that is unambiguously the GB200 number, without ever flagging the SKU switch ([jax-ml/scaling-book, gpus.md](https://github.com/jax-ml/scaling-book/blob/main/gpus.md)). Every GB200 FLOPs figure from here on uses the corrected 5,000/2,500/10,000 TFLOPS dense FP8/BF16/FP4 figures above; any number tracing to an un-disambiguated "B200" citation should be treated as suspect.

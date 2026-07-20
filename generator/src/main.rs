@@ -195,7 +195,7 @@ fn main() {
     });
 
     // ---- word count for the cover meta line ----
-    let words: usize = docs.iter().map(|d| d.body_md.split_whitespace().count()).sum();
+    let words: usize = docs.iter().map(|d| prose_words(&d.body_md)).sum();
     let words_disp = format!("≈{}k words", (words + 500) / 1000);
 
     // ---- emit chapter pages ----
@@ -500,7 +500,13 @@ fn vitals(sections: &[(String, String)], body_html: &str, body_md: &str) -> Stri
     } else if tables > 1 {
         parts.push(format!("{} tables", tables));
     }
-    let words = body_md.split_whitespace().count();
+    let figs = body_html.matches("<figcaption class=\"fig-no\"").count();
+    if figs == 1 {
+        parts.push("1 figure".into());
+    } else if figs > 1 {
+        parts.push(format!("{} figures", figs));
+    }
+    let words = prose_words(body_md);
     parts.push(format!("≈{:.1}k words", words as f64 / 1000.0));
     parts.join(" · ")
 }
@@ -541,7 +547,52 @@ fn md_to_html(md: &str, id_prefix: &str, tprefix: &str) -> (String, Vec<(String,
     let (out, sections) = add_heading_ids(&out, id_prefix);
     let out = wrap_tables(&out, tprefix);
     let out = chipify(&out);
+    let out = number_figs(&out, tprefix);
     (out, sections)
+}
+
+/// Number hand-authored figure blocks (`<figure class="vz…">`) the way tables
+/// are numbered: inject an id and a "Figure N.M" figcaption after the tag.
+fn number_figs(html: &str, tprefix: &str) -> String {
+    if tprefix.is_empty() {
+        return html.to_string();
+    }
+    let mut out = String::with_capacity(html.len() + 512);
+    let mut n = 0;
+    let mut rest = html;
+    while let Some(pos) = rest.find("<figure class=\"vz") {
+        n += 1;
+        let tag_end = rest[pos..].find('>').map(|e| pos + e + 1).unwrap_or(rest.len());
+        out.push_str(&rest[..pos]);
+        out.push_str(&format!("<figure id=\"fig-{}-{}\" class=\"vz", tprefix.to_lowercase(), n));
+        out.push_str(&rest[pos + "<figure class=\"vz".len()..tag_end]);
+        out.push_str(&format!(
+            "<figcaption class=\"fig-no\">Figure {}.{}</figcaption>",
+            tprefix, n
+        ));
+        rest = &rest[tag_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Word count for display lines: raw-HTML figure blocks (SVG markup) are not
+/// prose and stay out of the count.
+fn prose_words(md: &str) -> usize {
+    let mut n = 0;
+    let mut in_fig = false;
+    for line in md.lines() {
+        if !in_fig && line.trim_start().starts_with("<figure class=\"vz") {
+            in_fig = true;
+        }
+        if !in_fig {
+            n += line.split_whitespace().count();
+        }
+        if in_fig && line.contains("</figure>") {
+            in_fig = false;
+        }
+    }
+    n
 }
 
 /// Wrap every table in a numbered figure with a horizontal-scroll container.

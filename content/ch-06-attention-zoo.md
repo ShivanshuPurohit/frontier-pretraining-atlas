@@ -2,6 +2,408 @@
 
 Attention is the block the 2026 frontier has fractured furthest, and the fracture lines are hidden behind an acronym wall: MLA, NSA, MoBA, DSA, CSA, HCA, MSA, GDN, KDA, SSD. This chapter teaches the zoo as three families with one enemy. The enemy is the **KV cache**. The families are: keep softmax and compress what it reads (latent compression); keep softmax and *select* what it reads (trainable sparsity); or delete softmax and keep a fixed-size recurrent state instead (linear attention). Every acronym above is one of these three moves plus engineering. Ch7 argues which family a 10T/200B host should bet on; this chapter is the mechanism layer, and by its end each family's characteristic failure mode — and the telemetry that would catch it — should be obvious rather than folkloric.
 
+<figure class="vz">
+<div class="scroll"><svg style="min-width:620px" viewBox="0 0 690 290" role="img" aria-label="The three attention families: full softmax reads everything, selection reads a learned subset exactly, linear attention reads a fixed-size state">
+<defs><marker id="f6arr" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0 L8 4 L0 8 z" fill="var(--mut)"/></marker></defs>
+<text class="t-ttl" x="0" y="14">Full softmax</text>
+<text class="t-ttl" x="240" y="14">Trainable selection</text>
+<text class="t-ttl" x="480" y="14">Linear / recurrent</text>
+<rect class="f-acc-22" x="0" y="34" width="8" height="8"/>
+<rect class="f-acc-22" x="0" y="43" width="8" height="8"/>
+<rect class="f-acc-22" x="9" y="43" width="8" height="8"/>
+<rect class="f-acc-22" x="0" y="52" width="8" height="8"/>
+<rect class="f-acc-22" x="9" y="52" width="8" height="8"/>
+<rect class="f-acc-22" x="18" y="52" width="8" height="8"/>
+<rect class="f-acc-22" x="0" y="61" width="8" height="8"/>
+<rect class="f-acc-22" x="9" y="61" width="8" height="8"/>
+<rect class="f-acc-22" x="18" y="61" width="8" height="8"/>
+<rect class="f-acc-22" x="27" y="61" width="8" height="8"/>
+<rect class="f-acc-22" x="0" y="70" width="8" height="8"/>
+<rect class="f-acc-22" x="9" y="70" width="8" height="8"/>
+<rect class="f-acc-22" x="18" y="70" width="8" height="8"/>
+<rect class="f-acc-22" x="27" y="70" width="8" height="8"/>
+<rect class="f-acc-22" x="36" y="70" width="8" height="8"/>
+<rect class="f-acc-22" x="0" y="79" width="8" height="8"/>
+<rect class="f-acc-22" x="9" y="79" width="8" height="8"/>
+<rect class="f-acc-22" x="18" y="79" width="8" height="8"/>
+<rect class="f-acc-22" x="27" y="79" width="8" height="8"/>
+<rect class="f-acc-22" x="36" y="79" width="8" height="8"/>
+<rect class="f-acc-22" x="45" y="79" width="8" height="8"/>
+<rect class="f-acc-22" x="0" y="88" width="8" height="8"/>
+<rect class="f-acc-22" x="9" y="88" width="8" height="8"/>
+<rect class="f-acc-22" x="18" y="88" width="8" height="8"/>
+<rect class="f-acc-22" x="27" y="88" width="8" height="8"/>
+<rect class="f-acc-22" x="36" y="88" width="8" height="8"/>
+<rect class="f-acc-22" x="45" y="88" width="8" height="8"/>
+<rect class="f-acc-22" x="54" y="88" width="8" height="8"/>
+<rect class="f-acc-22" x="0" y="97" width="8" height="8"/>
+<rect class="f-acc-22" x="9" y="97" width="8" height="8"/>
+<rect class="f-acc-22" x="18" y="97" width="8" height="8"/>
+<rect class="f-acc-22" x="27" y="97" width="8" height="8"/>
+<rect class="f-acc-22" x="36" y="97" width="8" height="8"/>
+<rect class="f-acc-22" x="45" y="97" width="8" height="8"/>
+<rect class="f-acc-22" x="54" y="97" width="8" height="8"/>
+<rect class="f-acc-22" x="63" y="97" width="8" height="8"/>
+<rect class="f-acc-22" x="0" y="106" width="8" height="8"/>
+<rect class="f-acc-22" x="9" y="106" width="8" height="8"/>
+<rect class="f-acc-22" x="18" y="106" width="8" height="8"/>
+<rect class="f-acc-22" x="27" y="106" width="8" height="8"/>
+<rect class="f-acc-22" x="36" y="106" width="8" height="8"/>
+<rect class="f-acc-22" x="45" y="106" width="8" height="8"/>
+<rect class="f-acc-22" x="54" y="106" width="8" height="8"/>
+<rect class="f-acc-22" x="63" y="106" width="8" height="8"/>
+<rect class="f-acc-22" x="72" y="106" width="8" height="8"/>
+<rect class="f-acc-22" x="0" y="115" width="8" height="8"/>
+<rect class="f-acc-22" x="9" y="115" width="8" height="8"/>
+<rect class="f-acc-22" x="18" y="115" width="8" height="8"/>
+<rect class="f-acc-22" x="27" y="115" width="8" height="8"/>
+<rect class="f-acc-22" x="36" y="115" width="8" height="8"/>
+<rect class="f-acc-22" x="45" y="115" width="8" height="8"/>
+<rect class="f-acc-22" x="54" y="115" width="8" height="8"/>
+<rect class="f-acc-22" x="63" y="115" width="8" height="8"/>
+<rect class="f-acc-22" x="72" y="115" width="8" height="8"/>
+<rect class="f-acc-22" x="81" y="115" width="8" height="8"/>
+<rect class="f-acc-22" x="0" y="124" width="8" height="8"/>
+<rect class="f-acc-22" x="9" y="124" width="8" height="8"/>
+<rect class="f-acc-22" x="18" y="124" width="8" height="8"/>
+<rect class="f-acc-22" x="27" y="124" width="8" height="8"/>
+<rect class="f-acc-22" x="36" y="124" width="8" height="8"/>
+<rect class="f-acc-22" x="45" y="124" width="8" height="8"/>
+<rect class="f-acc-22" x="54" y="124" width="8" height="8"/>
+<rect class="f-acc-22" x="63" y="124" width="8" height="8"/>
+<rect class="f-acc-22" x="72" y="124" width="8" height="8"/>
+<rect class="f-acc-22" x="81" y="124" width="8" height="8"/>
+<rect class="f-acc-22" x="90" y="124" width="8" height="8"/>
+<rect class="f-acc-22" x="0" y="133" width="8" height="8"/>
+<rect class="f-acc-22" x="9" y="133" width="8" height="8"/>
+<rect class="f-acc-22" x="18" y="133" width="8" height="8"/>
+<rect class="f-acc-22" x="27" y="133" width="8" height="8"/>
+<rect class="f-acc-22" x="36" y="133" width="8" height="8"/>
+<rect class="f-acc-22" x="45" y="133" width="8" height="8"/>
+<rect class="f-acc-22" x="54" y="133" width="8" height="8"/>
+<rect class="f-acc-22" x="63" y="133" width="8" height="8"/>
+<rect class="f-acc-22" x="72" y="133" width="8" height="8"/>
+<rect class="f-acc-22" x="81" y="133" width="8" height="8"/>
+<rect class="f-acc-22" x="90" y="133" width="8" height="8"/>
+<rect class="f-acc-22" x="99" y="133" width="8" height="8"/>
+<rect class="f-acc-22" x="0" y="142" width="8" height="8"/>
+<rect class="f-acc-22" x="9" y="142" width="8" height="8"/>
+<rect class="f-acc-22" x="18" y="142" width="8" height="8"/>
+<rect class="f-acc-22" x="27" y="142" width="8" height="8"/>
+<rect class="f-acc-22" x="36" y="142" width="8" height="8"/>
+<rect class="f-acc-22" x="45" y="142" width="8" height="8"/>
+<rect class="f-acc-22" x="54" y="142" width="8" height="8"/>
+<rect class="f-acc-22" x="63" y="142" width="8" height="8"/>
+<rect class="f-acc-22" x="72" y="142" width="8" height="8"/>
+<rect class="f-acc-22" x="81" y="142" width="8" height="8"/>
+<rect class="f-acc-22" x="90" y="142" width="8" height="8"/>
+<rect class="f-acc-22" x="99" y="142" width="8" height="8"/>
+<rect class="f-acc-22" x="108" y="142" width="8" height="8"/>
+<rect class="f-acc-22" x="0" y="151" width="8" height="8"/>
+<rect class="f-acc-22" x="9" y="151" width="8" height="8"/>
+<rect class="f-acc-22" x="18" y="151" width="8" height="8"/>
+<rect class="f-acc-22" x="27" y="151" width="8" height="8"/>
+<rect class="f-acc-22" x="36" y="151" width="8" height="8"/>
+<rect class="f-acc-22" x="45" y="151" width="8" height="8"/>
+<rect class="f-acc-22" x="54" y="151" width="8" height="8"/>
+<rect class="f-acc-22" x="63" y="151" width="8" height="8"/>
+<rect class="f-acc-22" x="72" y="151" width="8" height="8"/>
+<rect class="f-acc-22" x="81" y="151" width="8" height="8"/>
+<rect class="f-acc-22" x="90" y="151" width="8" height="8"/>
+<rect class="f-acc-22" x="99" y="151" width="8" height="8"/>
+<rect class="f-acc-22" x="108" y="151" width="8" height="8"/>
+<rect class="f-acc-22" x="117" y="151" width="8" height="8"/>
+<rect class="f-acc-22" x="0" y="160" width="8" height="8"/>
+<rect class="f-acc-22" x="9" y="160" width="8" height="8"/>
+<rect class="f-acc-22" x="18" y="160" width="8" height="8"/>
+<rect class="f-acc-22" x="27" y="160" width="8" height="8"/>
+<rect class="f-acc-22" x="36" y="160" width="8" height="8"/>
+<rect class="f-acc-22" x="45" y="160" width="8" height="8"/>
+<rect class="f-acc-22" x="54" y="160" width="8" height="8"/>
+<rect class="f-acc-22" x="63" y="160" width="8" height="8"/>
+<rect class="f-acc-22" x="72" y="160" width="8" height="8"/>
+<rect class="f-acc-22" x="81" y="160" width="8" height="8"/>
+<rect class="f-acc-22" x="90" y="160" width="8" height="8"/>
+<rect class="f-acc-22" x="99" y="160" width="8" height="8"/>
+<rect class="f-acc-22" x="108" y="160" width="8" height="8"/>
+<rect class="f-acc-22" x="117" y="160" width="8" height="8"/>
+<rect class="f-acc-22" x="126" y="160" width="8" height="8"/>
+<rect class="f-acc-22" x="0" y="169" width="8" height="8"/>
+<rect class="f-acc-22" x="9" y="169" width="8" height="8"/>
+<rect class="f-acc-22" x="18" y="169" width="8" height="8"/>
+<rect class="f-acc-22" x="27" y="169" width="8" height="8"/>
+<rect class="f-acc-22" x="36" y="169" width="8" height="8"/>
+<rect class="f-acc-22" x="45" y="169" width="8" height="8"/>
+<rect class="f-acc-22" x="54" y="169" width="8" height="8"/>
+<rect class="f-acc-22" x="63" y="169" width="8" height="8"/>
+<rect class="f-acc-22" x="72" y="169" width="8" height="8"/>
+<rect class="f-acc-22" x="81" y="169" width="8" height="8"/>
+<rect class="f-acc-22" x="90" y="169" width="8" height="8"/>
+<rect class="f-acc-22" x="99" y="169" width="8" height="8"/>
+<rect class="f-acc-22" x="108" y="169" width="8" height="8"/>
+<rect class="f-acc-22" x="117" y="169" width="8" height="8"/>
+<rect class="f-acc-22" x="126" y="169" width="8" height="8"/>
+<rect class="f-acc-22" x="135" y="169" width="8" height="8"/>
+<rect class="f-acc-22" x="0" y="178" width="8" height="8"/>
+<rect class="f-acc-22" x="9" y="178" width="8" height="8"/>
+<rect class="f-acc-22" x="18" y="178" width="8" height="8"/>
+<rect class="f-acc-22" x="27" y="178" width="8" height="8"/>
+<rect class="f-acc-22" x="36" y="178" width="8" height="8"/>
+<rect class="f-acc-22" x="45" y="178" width="8" height="8"/>
+<rect class="f-acc-22" x="54" y="178" width="8" height="8"/>
+<rect class="f-acc-22" x="63" y="178" width="8" height="8"/>
+<rect class="f-acc-22" x="72" y="178" width="8" height="8"/>
+<rect class="f-acc-22" x="81" y="178" width="8" height="8"/>
+<rect class="f-acc-22" x="90" y="178" width="8" height="8"/>
+<rect class="f-acc-22" x="99" y="178" width="8" height="8"/>
+<rect class="f-acc-22" x="108" y="178" width="8" height="8"/>
+<rect class="f-acc-22" x="117" y="178" width="8" height="8"/>
+<rect class="f-acc-22" x="126" y="178" width="8" height="8"/>
+<rect class="f-acc-22" x="135" y="178" width="8" height="8"/>
+<rect class="f-acc-22" x="144" y="178" width="8" height="8"/>
+<rect class="f-acc-22" x="0" y="187" width="8" height="8"/>
+<rect class="f-acc-22" x="9" y="187" width="8" height="8"/>
+<rect class="f-acc-22" x="18" y="187" width="8" height="8"/>
+<rect class="f-acc-22" x="27" y="187" width="8" height="8"/>
+<rect class="f-acc-22" x="36" y="187" width="8" height="8"/>
+<rect class="f-acc-22" x="45" y="187" width="8" height="8"/>
+<rect class="f-acc-22" x="54" y="187" width="8" height="8"/>
+<rect class="f-acc-22" x="63" y="187" width="8" height="8"/>
+<rect class="f-acc-22" x="72" y="187" width="8" height="8"/>
+<rect class="f-acc-22" x="81" y="187" width="8" height="8"/>
+<rect class="f-acc-22" x="90" y="187" width="8" height="8"/>
+<rect class="f-acc-22" x="99" y="187" width="8" height="8"/>
+<rect class="f-acc-22" x="108" y="187" width="8" height="8"/>
+<rect class="f-acc-22" x="117" y="187" width="8" height="8"/>
+<rect class="f-acc-22" x="126" y="187" width="8" height="8"/>
+<rect class="f-acc-22" x="135" y="187" width="8" height="8"/>
+<rect class="f-acc-22" x="144" y="187" width="8" height="8"/>
+<rect class="f-acc-22" x="153" y="187" width="8" height="8"/>
+<rect class="f-acc" x="240" y="34" width="8" height="8"/>
+<rect class="f-acc" x="240" y="43" width="8" height="8"/>
+<rect class="f-acc" x="249" y="43" width="8" height="8"/>
+<rect class="f-acc" x="240" y="52" width="8" height="8"/>
+<rect class="f-acc" x="249" y="52" width="8" height="8"/>
+<rect class="f-acc" x="258" y="52" width="8" height="8"/>
+<rect class="f-acc" x="240" y="61" width="8" height="8"/>
+<rect class="f-acc" x="249" y="61" width="8" height="8"/>
+<rect class="f-acc" x="258" y="61" width="8" height="8"/>
+<rect class="f-acc" x="267" y="61" width="8" height="8"/>
+<rect class="f-hair" x="240" y="70" width="8" height="8"/>
+<rect class="f-acc" x="249" y="70" width="8" height="8"/>
+<rect class="f-acc" x="258" y="70" width="8" height="8"/>
+<rect class="f-acc" x="267" y="70" width="8" height="8"/>
+<rect class="f-acc" x="276" y="70" width="8" height="8"/>
+<rect class="f-loud" x="240" y="79" width="8" height="8"/>
+<rect class="f-hair" x="249" y="79" width="8" height="8"/>
+<rect class="f-acc" x="258" y="79" width="8" height="8"/>
+<rect class="f-acc" x="267" y="79" width="8" height="8"/>
+<rect class="f-acc" x="276" y="79" width="8" height="8"/>
+<rect class="f-acc" x="285" y="79" width="8" height="8"/>
+<rect class="f-hair" x="240" y="88" width="8" height="8"/>
+<rect class="f-hair" x="249" y="88" width="8" height="8"/>
+<rect class="f-loud" x="258" y="88" width="8" height="8"/>
+<rect class="f-acc" x="267" y="88" width="8" height="8"/>
+<rect class="f-acc" x="276" y="88" width="8" height="8"/>
+<rect class="f-acc" x="285" y="88" width="8" height="8"/>
+<rect class="f-acc" x="294" y="88" width="8" height="8"/>
+<rect class="f-hair" x="240" y="97" width="8" height="8"/>
+<rect class="f-hair" x="249" y="97" width="8" height="8"/>
+<rect class="f-hair" x="258" y="97" width="8" height="8"/>
+<rect class="f-hair" x="267" y="97" width="8" height="8"/>
+<rect class="f-acc" x="276" y="97" width="8" height="8"/>
+<rect class="f-acc" x="285" y="97" width="8" height="8"/>
+<rect class="f-acc" x="294" y="97" width="8" height="8"/>
+<rect class="f-acc" x="303" y="97" width="8" height="8"/>
+<rect class="f-hair" x="240" y="106" width="8" height="8"/>
+<rect class="f-loud" x="249" y="106" width="8" height="8"/>
+<rect class="f-hair" x="258" y="106" width="8" height="8"/>
+<rect class="f-hair" x="267" y="106" width="8" height="8"/>
+<rect class="f-hair" x="276" y="106" width="8" height="8"/>
+<rect class="f-acc" x="285" y="106" width="8" height="8"/>
+<rect class="f-acc" x="294" y="106" width="8" height="8"/>
+<rect class="f-acc" x="303" y="106" width="8" height="8"/>
+<rect class="f-acc" x="312" y="106" width="8" height="8"/>
+<rect class="f-hair" x="240" y="115" width="8" height="8"/>
+<rect class="f-hair" x="249" y="115" width="8" height="8"/>
+<rect class="f-hair" x="258" y="115" width="8" height="8"/>
+<rect class="f-loud" x="267" y="115" width="8" height="8"/>
+<rect class="f-hair" x="276" y="115" width="8" height="8"/>
+<rect class="f-hair" x="285" y="115" width="8" height="8"/>
+<rect class="f-acc" x="294" y="115" width="8" height="8"/>
+<rect class="f-acc" x="303" y="115" width="8" height="8"/>
+<rect class="f-acc" x="312" y="115" width="8" height="8"/>
+<rect class="f-acc" x="321" y="115" width="8" height="8"/>
+<rect class="f-hair" x="240" y="124" width="8" height="8"/>
+<rect class="f-hair" x="249" y="124" width="8" height="8"/>
+<rect class="f-hair" x="258" y="124" width="8" height="8"/>
+<rect class="f-hair" x="267" y="124" width="8" height="8"/>
+<rect class="f-hair" x="276" y="124" width="8" height="8"/>
+<rect class="f-hair" x="285" y="124" width="8" height="8"/>
+<rect class="f-hair" x="294" y="124" width="8" height="8"/>
+<rect class="f-acc" x="303" y="124" width="8" height="8"/>
+<rect class="f-acc" x="312" y="124" width="8" height="8"/>
+<rect class="f-acc" x="321" y="124" width="8" height="8"/>
+<rect class="f-acc" x="330" y="124" width="8" height="8"/>
+<rect class="f-hair" x="240" y="133" width="8" height="8"/>
+<rect class="f-hair" x="249" y="133" width="8" height="8"/>
+<rect class="f-loud" x="258" y="133" width="8" height="8"/>
+<rect class="f-hair" x="267" y="133" width="8" height="8"/>
+<rect class="f-hair" x="276" y="133" width="8" height="8"/>
+<rect class="f-hair" x="285" y="133" width="8" height="8"/>
+<rect class="f-hair" x="294" y="133" width="8" height="8"/>
+<rect class="f-hair" x="303" y="133" width="8" height="8"/>
+<rect class="f-acc" x="312" y="133" width="8" height="8"/>
+<rect class="f-acc" x="321" y="133" width="8" height="8"/>
+<rect class="f-acc" x="330" y="133" width="8" height="8"/>
+<rect class="f-acc" x="339" y="133" width="8" height="8"/>
+<rect class="f-hair" x="240" y="142" width="8" height="8"/>
+<rect class="f-hair" x="249" y="142" width="8" height="8"/>
+<rect class="f-hair" x="258" y="142" width="8" height="8"/>
+<rect class="f-hair" x="267" y="142" width="8" height="8"/>
+<rect class="f-loud" x="276" y="142" width="8" height="8"/>
+<rect class="f-hair" x="285" y="142" width="8" height="8"/>
+<rect class="f-hair" x="294" y="142" width="8" height="8"/>
+<rect class="f-hair" x="303" y="142" width="8" height="8"/>
+<rect class="f-loud" x="312" y="142" width="8" height="8"/>
+<rect class="f-acc" x="321" y="142" width="8" height="8"/>
+<rect class="f-acc" x="330" y="142" width="8" height="8"/>
+<rect class="f-acc" x="339" y="142" width="8" height="8"/>
+<rect class="f-acc" x="348" y="142" width="8" height="8"/>
+<rect class="f-hair" x="240" y="151" width="8" height="8"/>
+<rect class="f-hair" x="249" y="151" width="8" height="8"/>
+<rect class="f-hair" x="258" y="151" width="8" height="8"/>
+<rect class="f-hair" x="267" y="151" width="8" height="8"/>
+<rect class="f-hair" x="276" y="151" width="8" height="8"/>
+<rect class="f-hair" x="285" y="151" width="8" height="8"/>
+<rect class="f-hair" x="294" y="151" width="8" height="8"/>
+<rect class="f-hair" x="303" y="151" width="8" height="8"/>
+<rect class="f-hair" x="312" y="151" width="8" height="8"/>
+<rect class="f-hair" x="321" y="151" width="8" height="8"/>
+<rect class="f-acc" x="330" y="151" width="8" height="8"/>
+<rect class="f-acc" x="339" y="151" width="8" height="8"/>
+<rect class="f-acc" x="348" y="151" width="8" height="8"/>
+<rect class="f-acc" x="357" y="151" width="8" height="8"/>
+<rect class="f-hair" x="240" y="160" width="8" height="8"/>
+<rect class="f-hair" x="249" y="160" width="8" height="8"/>
+<rect class="f-hair" x="258" y="160" width="8" height="8"/>
+<rect class="f-loud" x="267" y="160" width="8" height="8"/>
+<rect class="f-hair" x="276" y="160" width="8" height="8"/>
+<rect class="f-hair" x="285" y="160" width="8" height="8"/>
+<rect class="f-hair" x="294" y="160" width="8" height="8"/>
+<rect class="f-hair" x="303" y="160" width="8" height="8"/>
+<rect class="f-hair" x="312" y="160" width="8" height="8"/>
+<rect class="f-hair" x="321" y="160" width="8" height="8"/>
+<rect class="f-hair" x="330" y="160" width="8" height="8"/>
+<rect class="f-acc" x="339" y="160" width="8" height="8"/>
+<rect class="f-acc" x="348" y="160" width="8" height="8"/>
+<rect class="f-acc" x="357" y="160" width="8" height="8"/>
+<rect class="f-acc" x="366" y="160" width="8" height="8"/>
+<rect class="f-hair" x="240" y="169" width="8" height="8"/>
+<rect class="f-hair" x="249" y="169" width="8" height="8"/>
+<rect class="f-hair" x="258" y="169" width="8" height="8"/>
+<rect class="f-hair" x="267" y="169" width="8" height="8"/>
+<rect class="f-hair" x="276" y="169" width="8" height="8"/>
+<rect class="f-loud" x="285" y="169" width="8" height="8"/>
+<rect class="f-hair" x="294" y="169" width="8" height="8"/>
+<rect class="f-hair" x="303" y="169" width="8" height="8"/>
+<rect class="f-hair" x="312" y="169" width="8" height="8"/>
+<rect class="f-loud" x="321" y="169" width="8" height="8"/>
+<rect class="f-hair" x="330" y="169" width="8" height="8"/>
+<rect class="f-hair" x="339" y="169" width="8" height="8"/>
+<rect class="f-acc" x="348" y="169" width="8" height="8"/>
+<rect class="f-acc" x="357" y="169" width="8" height="8"/>
+<rect class="f-acc" x="366" y="169" width="8" height="8"/>
+<rect class="f-acc" x="375" y="169" width="8" height="8"/>
+<rect class="f-hair" x="240" y="178" width="8" height="8"/>
+<rect class="f-hair" x="249" y="178" width="8" height="8"/>
+<rect class="f-hair" x="258" y="178" width="8" height="8"/>
+<rect class="f-hair" x="267" y="178" width="8" height="8"/>
+<rect class="f-hair" x="276" y="178" width="8" height="8"/>
+<rect class="f-hair" x="285" y="178" width="8" height="8"/>
+<rect class="f-hair" x="294" y="178" width="8" height="8"/>
+<rect class="f-hair" x="303" y="178" width="8" height="8"/>
+<rect class="f-hair" x="312" y="178" width="8" height="8"/>
+<rect class="f-hair" x="321" y="178" width="8" height="8"/>
+<rect class="f-hair" x="330" y="178" width="8" height="8"/>
+<rect class="f-loud" x="339" y="178" width="8" height="8"/>
+<rect class="f-hair" x="348" y="178" width="8" height="8"/>
+<rect class="f-acc" x="357" y="178" width="8" height="8"/>
+<rect class="f-acc" x="366" y="178" width="8" height="8"/>
+<rect class="f-acc" x="375" y="178" width="8" height="8"/>
+<rect class="f-acc" x="384" y="178" width="8" height="8"/>
+<rect class="f-loud" x="240" y="187" width="8" height="8"/>
+<rect class="f-hair" x="249" y="187" width="8" height="8"/>
+<rect class="f-hair" x="258" y="187" width="8" height="8"/>
+<rect class="f-hair" x="267" y="187" width="8" height="8"/>
+<rect class="f-loud" x="276" y="187" width="8" height="8"/>
+<rect class="f-hair" x="285" y="187" width="8" height="8"/>
+<rect class="f-hair" x="294" y="187" width="8" height="8"/>
+<rect class="f-hair" x="303" y="187" width="8" height="8"/>
+<rect class="f-hair" x="312" y="187" width="8" height="8"/>
+<rect class="f-hair" x="321" y="187" width="8" height="8"/>
+<rect class="f-hair" x="330" y="187" width="8" height="8"/>
+<rect class="f-hair" x="339" y="187" width="8" height="8"/>
+<rect class="f-hair" x="348" y="187" width="8" height="8"/>
+<rect class="f-hair" x="357" y="187" width="8" height="8"/>
+<rect class="f-acc" x="366" y="187" width="8" height="8"/>
+<rect class="f-acc" x="375" y="187" width="8" height="8"/>
+<rect class="f-acc" x="384" y="187" width="8" height="8"/>
+<rect class="f-acc" x="393" y="187" width="8" height="8"/>
+<rect class="f-ink-12" x="480" y="34" width="8" height="8"/>
+<rect class="f-ink-12" x="480" y="43" width="8" height="8"/>
+<rect class="f-ink-12" x="480" y="52" width="8" height="8"/>
+<rect class="f-ink-12" x="480" y="61" width="8" height="8"/>
+<rect class="f-ink-12" x="480" y="70" width="8" height="8"/>
+<rect class="f-ink-12" x="480" y="79" width="8" height="8"/>
+<rect class="f-ink-12" x="480" y="88" width="8" height="8"/>
+<rect class="f-ink-12" x="480" y="97" width="8" height="8"/>
+<rect class="f-ink-12" x="480" y="106" width="8" height="8"/>
+<rect class="f-ink-12" x="480" y="115" width="8" height="8"/>
+<rect class="f-ink-12" x="480" y="124" width="8" height="8"/>
+<rect class="f-ink-12" x="480" y="133" width="8" height="8"/>
+<rect class="f-ink-12" x="480" y="142" width="8" height="8"/>
+<rect class="f-ink-12" x="480" y="151" width="8" height="8"/>
+<rect class="f-ink-12" x="480" y="160" width="8" height="8"/>
+<rect class="f-ink-12" x="480" y="169" width="8" height="8"/>
+<rect class="f-ink-12" x="480" y="178" width="8" height="8"/>
+<rect class="f-ink-12" x="480" y="187" width="8" height="8"/>
+<path class="s-mut f-none" d="M 492 38 C 520 38, 512 112, 530 112" stroke-width="1" marker-end="url(#f6arr)"/>
+<path class="s-mut f-none" d="M 492 190 C 520 190, 512 116, 530 116" stroke-width="1" marker-end="url(#f6arr)"/>
+<rect class="f-acc-22 pulse" x="536" y="86" width="8" height="8"/>
+<rect class="f-acc-22 pulse" x="536" y="95" width="8" height="8"/>
+<rect class="f-acc-22 pulse" x="536" y="104" width="8" height="8"/>
+<rect class="f-acc-22 pulse" x="536" y="113" width="8" height="8"/>
+<rect class="f-acc-22 pulse" x="545" y="86" width="8" height="8"/>
+<rect class="f-acc-22 pulse" x="545" y="95" width="8" height="8"/>
+<rect class="f-acc-22 pulse" x="545" y="104" width="8" height="8"/>
+<rect class="f-acc-22 pulse" x="545" y="113" width="8" height="8"/>
+<rect class="f-acc-22 pulse" x="554" y="86" width="8" height="8"/>
+<rect class="f-acc-22 pulse" x="554" y="95" width="8" height="8"/>
+<rect class="f-acc-22 pulse" x="554" y="104" width="8" height="8"/>
+<rect class="f-acc-22 pulse" x="554" y="113" width="8" height="8"/>
+<rect class="f-acc-22 pulse" x="563" y="86" width="8" height="8"/>
+<rect class="f-acc-22 pulse" x="563" y="95" width="8" height="8"/>
+<rect class="f-acc-22 pulse" x="563" y="104" width="8" height="8"/>
+<rect class="f-acc-22 pulse" x="563" y="113" width="8" height="8"/>
+<rect class="f-none s-acc" x="532" y="82" width="43" height="43" rx="3" stroke-width="1"/>
+<text class="t-mut" x="532" y="74">fixed-size state S</text>
+<text class="t-mut" x="478" y="210">every token writes;</text>
+<text class="t-mut" x="478" y="223">nothing is re-read</text>
+<text class="t-num" x="0" y="244">reads O(L&#178;)</text>
+<text class="t-mut" x="0" y="259">cache O(L)</text>
+<text class="t-num" x="240" y="244">reads O(L&#183;k)</text>
+<text class="t-mut" x="240" y="259">cache O(L) stored, k read</text>
+<text class="t-num" x="480" y="244">reads O(1)</text>
+<text class="t-mut" x="480" y="259">state only; hybrids re-add full attn</text>
+<rect class="f-acc" x="240" y="268" width="10" height="10"/><text class="t-mut" x="256" y="278">sliding window</text>
+<rect class="f-loud" x="352" y="268" width="10" height="10"/><text class="t-mut" x="368" y="278">indexer-selected</text>
+<rect class="f-hair" x="484" y="268" width="10" height="10"/><text class="t-mut" x="500" y="278">stored, unread</text>
+<text class="t-mut" x="0" y="278">queries &#8595; &#215; keys &#8594;</text>
+</svg></div>
+<p class="vz-cap">What each family reads when predicting one token deep into a long context (queries down, keys across). Full softmax reads every stored key — exact retrieval, O(L²) compute, O(L) cache. Trainable selection (NSA, DSA, MoBA, MSA) keeps softmax exact but only over a learned subset: a sliding window for the recent past plus indexer-selected entries from anywhere in history — the rest stays stored but unread, collapsing cost toward O(L·k) at the price of silent misses when the indexer is wrong. Linear/recurrent layers (KDA, GDN, Mamba-2) delete the cache entirely: every token writes into a fixed-size state and nothing is ever re-read — which is why every frontier deployment interleaves full-attention layers back in (3:1 in K3 and Qwen3-Next) to restore exact retrieval.</p>
+</figure>
+
 ## The Enemy: KV-Cache Arithmetic
 
 Softmax attention writes nothing down during training that it can reuse at inference, so serving replays it: to generate token t, each layer needs the keys and values of all t−1 predecessors, cached in HBM. The bill is per-token, per-layer: 2 × n_kv_heads × d_head × bytes. For a Llama-3.1-405B-shaped MHA/GQA model that is ~516 KB per token; a 128K-token agent session costs ~66 GB *per sequence* — before weights. Worse, decode arithmetic is **GEMV-shaped**: one query vector against t cached keys is a matrix-*vector* product, arithmetic intensity ~O(1) FLOPs per byte, pinned to the memory-bandwidth roof of the roofline (Ch16), not the FLOPs roof. DeepSeek's hardware-reflections paper states the consequence plainly: decode "shifts from GEMM to GEMV, which has a much lower compute-to-memory ratio" — the GPU idles while HBM streams cache ([arXiv:2505.09343](https://arxiv.org/abs/2505.09343), May 2025). Prefill and training, by contrast, are compute-bound GEMMs. So every attention design serves two masters with opposite preferences — train/prefill wants maximum expressivity per FLOP, decode wants minimum bytes per token — and the three families are three theories of how to satisfy both. Quadratic *training* cost (attention FLOPs ∝ L² per layer) is the secondary enemy, decisive only at very long context; at a 4-8K pretraining sequence length, attention is 30-40% of FLOPs (Ch7) and the cache, not the square, is what hurts.

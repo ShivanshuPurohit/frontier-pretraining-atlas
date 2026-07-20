@@ -10,7 +10,7 @@
 <title>Networking at 100k: NVL72 Domains, Fabrics, MRC, and Collectives · The Frontier Pretraining Atlas</title>
 <meta name="description" content="Maps the network fabric from the NVL72 scale-up domain outward: the reference-architecture gap above ~10,000 GPUs, MRC against UEC/Falcon/EFA, NCCL's evolution, and multi-datacenter training's physical limits.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23245f4f'/%3E%3Cg fill='%23f6f4ec'%3E%3Ccircle cx='16' cy='16' r='5' opacity='.32'/%3E%3Ccircle cx='32' cy='16' r='5'/%3E%3Ccircle cx='48' cy='16' r='5' opacity='.32'/%3E%3Ccircle cx='16' cy='32' r='5' opacity='.32'/%3E%3Ccircle cx='32' cy='32' r='5' opacity='.32'/%3E%3Ccircle cx='48' cy='32' r='5' opacity='.32'/%3E%3Ccircle cx='16' cy='48' r='5'/%3E%3Ccircle cx='32' cy='48' r='5' opacity='.32'/%3E%3Ccircle cx='48' cy='48' r='5' opacity='.32'/%3E%3C/g%3E%3C/svg%3E">
-<link rel="stylesheet" href="style.css?v=781c36ad">
+<link rel="stylesheet" href="style.css?v=3592c610">
 </head>
 <body>
 <div class="frame">
@@ -62,7 +62,7 @@
 <header class="chapter-head">
 <p class="eyebrow">Chapter 20 · Part IV — The Machine</p>
 <h1 class="chapter-title">Networking at 100k: NVL72 Domains, Fabrics, MRC, and Collectives</h1>
-<p class="vitals">8 sections · 1 table · ≈5.2k words</p>
+<p class="vitals">8 sections · 1 table · 1 figure · ≈5.2k words</p>
 </header>
 <details class="contents"><summary>Contents</summary><ol>
 <li><a href="#the-nvl72-domain-mechanics-and-what-it-changes">The NVL72 Domain: Mechanics and What It Changes</a></li>
@@ -112,6 +112,85 @@
 <p>External validation for “all-to-all needs a switched fabric, not a torus” comes from AWS’s own roadmap. Trainium2, deployed at Project Rainier, uses a pure 3D-torus mesh (4×4×4 = 64 chips, no switches) for NeuronLink scale-up; Trainium3 abandons this for an all-to-all switched fabric, with AWS stating explicitly that torus topologies “are not optimized for frontier MoE models which require all-to-all collectives,” with oversubscription degrading badly as EP message sizes grow from 16 KB to 1 MB (per SemiAnalysis’s Trainium3 coverage, Dec 2025). AWS discloses a concrete decision rule: its 64-chip switched topology suffices for MoE models with 2–3T total parameters, while models above roughly 4T benefit from a larger 144-chip domain — independent, cross-vendor confirmation that EP bandwidth-boundedness shapes hardware roadmaps directly, not a detail that falls out of generic provisioning.</p>
 <p>The practical budgeting question is whether EP all-to-all traffic and DP/PP AllReduce genuinely overlap rather than compete for the same wires. Inside NVL72, both Meta’s NCCLX paper and DeepSeek’s DeepEP kernel answer yes by construction — EP rides NVLink, DP/PP AllReduce rides RDMA, independent unless a specific layout forces cross-traffic. NVIDIA’s Megatron-Core MoE “Parallel Folding” technique matters directly: decoupling attention-layer and MoE-layer parallelism configs breaks the traditional EP≤DP constraint, freeing the layout to keep EP inside NVL72 while DP spans further out (arXiv:2603.07685, Mar 2026). The same report discloses per-GPU throughput for a real 685B/37B-active MoE — 1,233 TFLOPS/GPU on GB300, 1,048 on GB200 — a citable, framework-vendor MFU-class anchor (full derivation is Ch23’s territory). ByteDance’s MegaScale-MoE adds a caution: on a 352B-parameter MoE across 1,440 Hopper GPUs it achieves 1.65–1.88× speedup over Megatron-LM through per-layer-type overlap, but MFU still declines from 32.48% to 27.89% as GPU count scales (arXiv:2505.11432, May 2025) — even a purpose-built MoE communication system doesn’t solve weak-scaling MFU decay, only shifts the curve up.</p>
 <p>One more piece of arithmetic belongs here, because it determines whether the bandwidth-budgeting frame of this whole section even applies to this run. (The arithmetic is ours, from Ch18’s Layout 2 and the Megatron measurements above.) Check the Megatron dispatch-latency table’s own regime first: at its benchmark shape (4,096 tokens per GPU, hidden 7168, top-8, BF16), each GPU’s dispatch payload is ~470 MB, whose pure wire time at 900 GB/s is ~520 µs — close to the measured 675 µs, so that benchmark is genuinely bandwidth-dominated and the “bandwidth budgeting” frame is honest <em>at fat microbatches</em>. Now substitute the microbatch sizes Ch18’s Layout 2 actually produces under expert-batch starvation: a few thousand tokens per microbatch per <em>domain</em> — roughly 55 per GPU — collapses the per-GPU dispatch payload to single-digit megabytes (wire time: microseconds) and the per-source-destination message to <strong>~56–113 KB (FP8/BF16)</strong>, sitting at the bottom of the very 16 KB–1 MB range across which AWS documents all-to-all efficiency degrading badly. In that regime the collective’s cost is fixed overhead — kernel launch, barrier synchronization, per-message and per-hop latency — not bytes on wires, and the measured “EP is ~20% of iteration time inside NVL72” figures, all taken at fat microbatches, do not extrapolate. The design consequence stacks on top of Ch17/Ch18’s grouped-GEMM finding: the same thin microbatches that starve the expert GEMMs also push the dispatch collectives from the bandwidth-bound regime into the latency-bound one, so the two costs degrade <em>together</em>, and every remedy that fattens per-expert GEMM batches (larger global batch, fewer microbatches) simultaneously restores the dispatch collective to the regime the published measurements describe. Budgeting this network by bytes alone would miss the failure mode entirely; message-size accounting is where the actual risk lives.</p>
+<figure id="fig-20-1" class="vz"><figcaption class="fig-no">Figure 20.1</figcaption>
+<div class="scroll"><svg style="min-width:620px" viewBox="0 0 680 372" role="img" aria-label="Expert-parallel dispatch and combine inside the NVL72 domain, and the per-message-size axis that decides whether the collective is bandwidth- or latency-bound">
+<rect class="f-acc-10 s-acc" x="60" y="30" width="90" height="38" rx="3" stroke-width="1"/>
+<text class="t-num" x="70" y="48">rank 0</text>
+<text class="t-mut" x="70" y="62">tokens</text>
+<rect class="f-ink-06 s-line" x="60" y="216" width="90" height="38" rx="3" stroke-width="1"/>
+<text class="t-num" x="70" y="234">rank 0</text>
+<text class="t-mut" x="70" y="248">8 experts</text>
+<rect class="f-acc-10 s-acc" x="210" y="30" width="90" height="38" rx="3" stroke-width="1"/>
+<text class="t-num" x="220" y="48">rank 1</text>
+<text class="t-mut" x="220" y="62">tokens</text>
+<rect class="f-ink-06 s-line" x="210" y="216" width="90" height="38" rx="3" stroke-width="1"/>
+<text class="t-num" x="220" y="234">rank 1</text>
+<text class="t-mut" x="220" y="248">8 experts</text>
+<rect class="f-acc-10 s-acc" x="360" y="30" width="90" height="38" rx="3" stroke-width="1"/>
+<text class="t-num" x="370" y="48">rank 2</text>
+<text class="t-mut" x="370" y="62">tokens</text>
+<rect class="f-ink-06 s-line" x="360" y="216" width="90" height="38" rx="3" stroke-width="1"/>
+<text class="t-num" x="370" y="234">rank 2</text>
+<text class="t-mut" x="370" y="248">8 experts</text>
+<rect class="f-acc-10 s-acc" x="510" y="30" width="90" height="38" rx="3" stroke-width="1"/>
+<text class="t-num" x="520" y="48">rank 3</text>
+<text class="t-mut" x="520" y="62">tokens</text>
+<rect class="f-ink-06 s-line" x="510" y="216" width="90" height="38" rx="3" stroke-width="1"/>
+<text class="t-num" x="520" y="234">rank 3</text>
+<text class="t-mut" x="520" y="248">8 experts</text>
+<g class="ph-a">
+<line class="s-acc flow f-none" x1="105" y1="68" x2="105" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="105" y1="68" x2="255" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="105" y1="68" x2="405" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="105" y1="68" x2="555" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="255" y1="68" x2="105" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="255" y1="68" x2="255" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="255" y1="68" x2="405" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="255" y1="68" x2="555" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="405" y1="68" x2="105" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="405" y1="68" x2="255" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="405" y1="68" x2="405" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="405" y1="68" x2="555" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="555" y1="68" x2="105" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="555" y1="68" x2="255" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="555" y1="68" x2="405" y2="216" stroke-width="1.3" opacity="0.75"/>
+<line class="s-acc flow f-none" x1="555" y1="68" x2="555" y2="216" stroke-width="1.3" opacity="0.75"/>
+</g>
+<g class="ph-b">
+<line class="s-loud flow f-none" x1="105" y1="216" x2="105" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="105" y1="216" x2="255" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="105" y1="216" x2="405" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="105" y1="216" x2="555" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="255" y1="216" x2="105" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="255" y1="216" x2="255" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="255" y1="216" x2="405" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="255" y1="216" x2="555" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="405" y1="216" x2="105" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="405" y1="216" x2="255" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="405" y1="216" x2="405" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="405" y1="216" x2="555" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="555" y1="216" x2="105" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="555" y1="216" x2="255" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="555" y1="216" x2="405" y2="68" stroke-width="1.3" opacity="0.75"/>
+<line class="s-loud flow f-none" x1="555" y1="216" x2="555" y2="68" stroke-width="1.3" opacity="0.75"/>
+</g>
+<g class="ph-a"><text class="t-acc" x="0" y="130">dispatch</text><text class="t-mut" x="0" y="146">tokens &#8594; their</text><text class="t-mut" x="0" y="160">top-8 experts</text></g>
+<g class="ph-b"><text class="t-loud" x="620" y="130">combine</text><text class="t-mut" x="620" y="146">outputs &#8594;</text><text class="t-mut" x="620" y="160">home ranks</text></g>
+<text class="t-mut" x="60" y="278">2 &#215; per MoE layer, forward and backward &#8212; all routes stay inside the NVL72 crossbar at EP &#8804; 72</text>
+<text class="t-num" x="60" y="298">per-message size decides the regime</text>
+<rect class="f-hair" x="82" y="316" width="198" height="18"/>
+<rect class="f-loud-25" x="142" y="316" width="34" height="18"/>
+<line class="s-acc" x1="574" y1="312" x2="574" y2="338" stroke-width="2"/>
+<line class="s-mut" x1="60" y1="334" x2="610" y2="334" stroke-width="1"/>
+<text class="t-mut" x="60" y="352">10 KB</text>
+<text class="t-mut" x="266" y="352">1 MB</text>
+<text class="t-mut" x="586" y="352">1 GB</text>
+<text class="t-mut" x="78" y="368">16 KB&#8211;1 MB: documented all-to-all degradation window</text>
+<text class="t-loud t-s9" x="112" y="312">starved: 56&#8211;113 KB</text>
+<text class="t-mut" x="368" y="298">fat microbatch: ~470 MB/GPU, 675 &#181;s &#8594;</text>
+</svg></div>
+<p class="vz-cap">Top: the collective itself — every rank exchanges tokens with every rank, twice per MoE layer, dispatch then combine. Bottom: the axis that decides its cost model. At the Megatron benchmark&#8217;s fat microbatches (~470 MB per GPU) the collective is bandwidth-bound and the measured 675 &#181;s is mostly wire time; at Layout 2&#8217;s starved microbatches the per-pair message collapses to 56&#8211;113 KB — inside the 16 KB&#8211;1 MB window where all-to-all efficiency is documented to degrade — and the cost becomes launch, barrier, and per-hop latency instead of bytes. The same thin microbatches starve the expert GEMMs (Ch18), so both costs degrade together and every remedy that fattens one fixes the other.</p>
+</figure>
 <p>Batching discipline generalizes directly to MoE communication design: Stas Bekman’s <code>all_reduce_latency_comp.py</code> shows one 4 GB reduction dramatically outperforms 1,000× 4 MB reductions, arguing for batching expert-gradient or router-logit reductions rather than firing one collective per expert. <code>NCCL_DEBUG_SUBSYS=COLL</code> call-counting — grepping <code>NCCL INFO AllToAll</code>/<code>AllGather</code> counts per iteration — is an underused verification method for confirming actual all-to-all volume matches theoretical per-layer prediction.</p>
 <h2 id="multi-datacenter-training-where-the-physics-bites">Multi-Datacenter Training: Where the Physics Bites</h2>
 <p>Synchronous, single-building-or-single-campus training remains the dominant frontier paradigm as of mid-2026 — OpenAI/Microsoft, Google, and Anthropic all report synchronous gradient descent for flagship runs. Google is the earliest confirmed instance of crossing a DC boundary at all: Gemini 1.0’s technical report and Google Cloud CEO Thomas Kurian’s statements confirm Gemini Ultra was trained “across multiple sites, and multiple clusters within those sites,” though whether this means true multi-campus WAN training or multi-building-within-one-campus is undisclosed. SemiAnalysis’s “Multi-Datacenter Training” analysis is the most detailed public treatment: roughly 5 Pbit/s of inter-campus bandwidth within a region and roughly 1 Pbit/s between regions for a 100T+-parameter-class model, at which line rate exchanging a 400 TB weight payload takes only 0.64 seconds. The hard physical floor is speed-of-light-in-fiber latency — a US east-west coast RTT floor of 43.2 ms that improves with neither better silicon nor cleverer software, only fewer syncs or shorter distances. DWDM capacity is not the bottleneck — 400ZR gives 25.5 Tbps per fiber pair, long-haul systems up to 121.6 Tbps. The proposed mitigation generalizes the NVL72→AI-Zone→cross-DC hop hierarchy one level further: hierarchical synchronous gradient descent, syncing every step within a building-scale domain and less often across regions.</p>
